@@ -67,3 +67,16 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Python / node
+.venv/
+node_modules/
+dist/
+
+# Audio fixtures. 364 MB, and it includes a commercial track — this repo is
+# public, so the samples live on disk only. Regenerate the derived clips from
+# the source with ffmpeg if they are needed.
+samples/
+
+# Symlink into D:\mini-omni — machine-local, not portable.
+mini-omni

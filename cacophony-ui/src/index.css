@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+@theme {
+  --color-vic: oklch(0.72 0.19 45);
+  --color-marisol: oklch(0.75 0.16 195);
+}
+
+html, body, #root { height: 100%; }
+body { font-family: ui-sans-serif, system-ui, "Segoe UI", sans-serif; }
+
+@keyframes pulse-ring {
+  0%   { box-shadow: 0 0 0 0 currentColor; opacity: .8; }
+  70%  { box-shadow: 0 0 0 22px transparent; opacity: 0; }
+  100% { box-shadow: 0 0 0 0 transparent; opacity: 0; }
+}
+.ring-speak::after {
+  content: ''; position: absolute; inset: 0; border-radius: 9999px;
+  animation: pulse-ring 1.4s cubic-bezier(.22,.61,.36,1) infinite;
+}
