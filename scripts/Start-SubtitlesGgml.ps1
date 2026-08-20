@@ -39,6 +39,12 @@ param(
     [switch]$Separate,
     [int]$Device = -1,
     [double]$VolumeBoost = 1.5,
+    # Cue shaping. Without -ml the ASR emits ONE cue for the whole file (a 179 s
+    # video came back as a single 163 s subtitle), which is unusable in a
+    # player. 42 chars is the usual single-line subtitle width; -sow keeps the
+    # split on word boundaries instead of mid-word.
+    [int]$MaxLen = 42,
+    [switch]$NoSplitOnWord,
     [string[]]$Extensions = @(".mp4",".mkv",".avi",".mov",".webm",".mp3",".wav",".flac",".m4a",".aac",".ogg"),
     [string]$CrispAsr,
     [string]$Python
@@ -51,7 +57,7 @@ if (-not $Python)   { $Python   = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 $Translator = Join-Path $PSScriptRoot "translate_srt.py"
 
 foreach ($p in @($CrispAsr, $Python, $Translator)) {
-    if (-not (Test-Path $p)) { Write-Error "missing: $p"; exit 1 }
+    if (-not (Test-Path -LiteralPath $p)) { Write-Error "missing: $p"; exit 1 }
 }
 if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) { Write-Error "ffmpeg not on PATH"; exit 1 }
 
@@ -79,9 +85,9 @@ $files = Get-ChildItem -Path $TargetDir -File -Recurse:$Recurse |
          Where-Object { $Extensions -contains $_.Extension.ToLower() }
 if (-not $files) { Write-Host "no media files under $TargetDir"; exit 0 }
 
-Write-Host ("`n  {0} file(s) | separate={1} | langs={2} | device={3}`n" -f `
+Write-Host ("`n  {0} file(s) | separate={1} | langs={2} | device={3} | max-len={4}`n" -f `
     $files.Count, $Separate.IsPresent, $(if($Langs){$Langs}else{"none"}), `
-    $(if($Device -ge 0){$Device}else{"auto"})) -ForegroundColor Cyan
+    $(if($Device -ge 0){$Device}else{"auto"}), $MaxLen) -ForegroundColor Cyan
 
 $devArgs = @(); if ($Device -ge 0) { $devArgs = @("--device", "$Device") }
 $done = 0; $skipped = 0; $failed = 0
@@ -90,32 +96,49 @@ foreach ($f in $files) {
     $base    = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
     $srtPath = Join-Path $OutputDir "$base.srt"
 
-    if ($SkipExisting -and (Test-Path $srtPath)) {
+    # -LiteralPath throughout: media filenames routinely contain [ and ], which
+    # PowerShell's path cmdlets treat as wildcard character classes. Without it
+    # "Movie [HD].mp4" makes Test-Path return False for a file that exists, and
+    # the pipeline throws on its own output.
+    if ($SkipExisting -and (Test-Path -LiteralPath $srtPath)) {
         Write-Host "  = $($f.Name) (exists)" -ForegroundColor DarkGray; $skipped++; continue
     }
     Write-Host "  > $($f.Name)" -ForegroundColor White
     $t0 = Get-Date
     try {
+        # crispasr cannot open non-ASCII paths on Windows: given "frères.wav" it
+        # exits 2 and prints usage even though the file exists (narrow argv +
+        # ANSI-codepage fopen). Media filenames are routinely accented, so every
+        # path handed to crispasr is an ASCII-safe stem in $Tmp, and results are
+        # moved back to the real name afterwards. ffmpeg handles UTF-8 fine, so
+        # only the crispasr-facing half needs this.
+        $safe = "job_" + [System.BitConverter]::ToString(
+            [System.Security.Cryptography.MD5]::Create().ComputeHash(
+                [System.Text.Encoding]::UTF8.GetBytes($f.FullName))).Replace("-","").Substring(0,12)
+
         # 1. audio — 16 kHz mono is what the ASR wants; boost helps quiet dialogue.
-        $wav = Join-Path $Tmp "$base.wav"
+        $wav = Join-Path $Tmp "$safe.wav"
         & ffmpeg -hide_banner -loglevel error -nostdin -y -i $f.FullName `
                  -vn -ac 1 -ar 16000 -af "volume=$VolumeBoost" $wav 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $wav)) { throw "ffmpeg failed" }
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $wav)) { throw "ffmpeg failed" }
 
         # 2. optional vocal isolation
         $asrInput = $wav
         if ($Separate) {
             & $CrispAsr --separate --stems vocals -m auto --backend htdemucs `
                         --sep-output-dir $Tmp -f $wav @devArgs 2>&1 | Out-Null
-            $vocals = Join-Path $Tmp "${base}_vocals.wav"
-            if (Test-Path $vocals) { $asrInput = $vocals }
+            $vocals = Join-Path $Tmp "${safe}_vocals.wav"
+            if (Test-Path -LiteralPath $vocals) { $asrInput = $vocals }
             else { Write-Warning "    separation produced no stem; using the raw audio" }
         }
 
-        # 3. ASR -> SRT
-        $ofBase = Join-Path $OutputDir $base
-        & $CrispAsr --backend parakeet -m auto -osrt -f $asrInput -of $ofBase @devArgs 2>&1 | Out-Null
-        if (-not (Test-Path $srtPath)) { throw "ASR produced no .srt" }
+        # 3. ASR -> SRT, written under the safe stem then moved to the real name.
+        $tmpSrt = Join-Path $Tmp "$safe.srt"
+        if (Test-Path -LiteralPath $tmpSrt) { Remove-Item -LiteralPath $tmpSrt -Force }
+        $cueArgs = @("-ml", "$MaxLen"); if (-not $NoSplitOnWord) { $cueArgs += "-sow" }
+        & $CrispAsr --backend parakeet -m auto -osrt -f $asrInput -of (Join-Path $Tmp $safe) @cueArgs @devArgs 2>&1 | Out-Null
+        if (-not (Test-Path -LiteralPath $tmpSrt)) { throw "ASR produced no .srt" }
+        Move-Item -LiteralPath $tmpSrt -Destination $srtPath -Force
 
         # 4. translations
         if ($Langs) { & $Python $Translator --srt $srtPath --langs $Langs }
@@ -128,7 +151,9 @@ foreach ($f in $files) {
         Write-Host "    [!] $($_.Exception.Message)" -ForegroundColor Red
     }
     finally {
-        Remove-Item (Join-Path $Tmp "$base*.wav") -ErrorAction SilentlyContinue
+        foreach ($leftover in @((Join-Path $Tmp "$safe.wav"), (Join-Path $Tmp "${safe}_vocals.wav"))) {
+            if (Test-Path -LiteralPath $leftover) { Remove-Item -LiteralPath $leftover -ErrorAction SilentlyContinue }
+        }
     }
 }
 
