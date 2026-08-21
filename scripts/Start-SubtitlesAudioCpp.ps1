@@ -38,6 +38,14 @@ param(
     [switch]$NoSeparate,
     [double]$VolumeBoost = 1.5,
     [double]$Gap = 0.6,
+    # parakeet's offline_mode defaults to full_context, which encodes the whole
+    # utterance and asks for O(T^2) attention memory: an 18-minute file requested
+    # a 21 GB CUDA buffer and failed outright. auto switches to bounded
+    # overlapping windows past this threshold. 300 s is deliberately
+    # conservative -- extrapolating that measurement it needs ~1.7 GB -- and it
+    # keeps the better full-context quality for short clips, where long_form
+    # measurably loses context ("6 mois" instead of "17 mois de différence").
+    [double]$LongFormThreshold = 300,
     [int]$MaxChars = 76,
     [double]$MaxDur = 6.0,
     [int]$Width = 42,
@@ -125,8 +133,12 @@ foreach ($f in $files) {
         if (-not (Test-Path -LiteralPath $asrWav)) { throw "no 16 kHz audio for ASR" }
 
         $words = Join-Path $Tmp "$safe.words.json"
+        # --out is for audio outputs and writes nothing for ASR; the transcript
+        # goes to stdout and the timings to --words-out, which is all we need.
         & $Cli --task asr --family parakeet_tdt --model $AsrModel --backend cuda `
-               --audio $asrWav --words-out $words --out (Join-Path $Tmp "$safe.txt") 2>&1 | Out-Null
+               --session-option "parakeet_tdt.offline_mode=auto" `
+               --session-option "parakeet_tdt.audio_chunk_threshold_sec=$LongFormThreshold" `
+               --audio $asrWav --words-out $words 2>&1 | Out-Null
         if (-not (Test-Path -LiteralPath $words)) { throw "ASR produced no words JSON" }
 
         $tmpSrt = Join-Path $Tmp "$safe.srt"
@@ -142,7 +154,7 @@ foreach ($f in $files) {
     }
     catch { $failed++; Write-Host "    [!] $($_.Exception.Message)" -ForegroundColor Red }
     finally {
-        foreach ($x in @("$safe.16k.wav","$safe.44k.wav","$safe.words.json","$safe.txt")) {
+        foreach ($x in @("$safe.16k.wav","$safe.44k.wav","$safe.words.json")) {
             $p = Join-Path $Tmp $x
             if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue }
         }
