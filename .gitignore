@@ -80,3 +80,6 @@ samples/
 
 # Symlink into D:\mini-omni — machine-local, not portable.
 mini-omni
+
+# Python bytecode from the subtitle helper scripts
+__pycache__/

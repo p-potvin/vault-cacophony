@@ -222,8 +222,10 @@ function Join-VocalStems {
     Invoke-Native ffmpeg $ffArgs "vocal stitch"
 }
 
-if (-not $OutputDir) { $OutputDir = $TargetDir }
-New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
+# Without -OutputDir each .srt lands beside its own video, which is where every
+# player looks for it and the only arrangement that survives -Recurse: a flat
+# output directory collides the moment two seasons both hold an "Episode 1".
+if ($OutputDir) { New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null }
 $Tmp = Join-Path ([System.IO.Path]::GetTempPath()) "subs-audiocpp"
 New-Item -ItemType Directory -Force -Path $Tmp | Out-Null
 
@@ -238,7 +240,7 @@ Write-Host ("`n  {0} file(s) | separate={1} | chunk={2} | langs={3} | gap={4}s`n
 $done = 0; $skipped = 0; $failed = 0
 foreach ($f in $files) {
     $base    = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
-    $srtPath = Join-Path $OutputDir "$base.srt"
+    $srtPath = Join-Path $(if ($OutputDir) { $OutputDir } else { $f.DirectoryName }) "$base.srt"
 
     # -LiteralPath everywhere: media names routinely contain [ and ], which
     # PowerShell path cmdlets treat as wildcard character classes, so Test-Path
