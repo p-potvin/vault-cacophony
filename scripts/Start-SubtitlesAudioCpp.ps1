@@ -229,9 +229,18 @@ if ($OutputDir) { New-Item -ItemType Directory -Force -Path $OutputDir | Out-Nul
 $Tmp = Join-Path ([System.IO.Path]::GetTempPath()) "subs-audiocpp"
 New-Item -ItemType Directory -Force -Path $Tmp | Out-Null
 
-$files = Get-ChildItem -LiteralPath $TargetDir -File -Recurse:$Recurse |
-         Where-Object { $Extensions -contains $_.Extension.ToLower() }
-if (-not $files) { Write-Host "no media files under $TargetDir"; exit 0 }
+# -TargetDir takes one file as readily as a directory. Callers that have a single
+# path in hand -- a player asking for one sidecar, a context menu on one file --
+# would otherwise have to hand over its parent and hope the extension filter
+# spared the rest of the folder.
+if (-not (Test-Path -LiteralPath $TargetDir)) { Write-Error "not found: $TargetDir"; exit 1 }
+if ((Get-Item -LiteralPath $TargetDir) -is [System.IO.DirectoryInfo]) {
+    $files = Get-ChildItem -LiteralPath $TargetDir -File -Recurse:$Recurse |
+             Where-Object { $Extensions -contains $_.Extension.ToLower() }
+    if (-not $files) { Write-Host "no media files under $TargetDir"; exit 0 }
+} else {
+    $files = @(Get-Item -LiteralPath $TargetDir)
+}
 
 $chunkLabel = if ($NoSeparate) { "n/a" } elseif ($SepChunkMinutes -gt 0) { "$SepChunkMinutes min" } else { "whole file" }
 Write-Host ("`n  {0} file(s) | separate={1} | chunk={2} | langs={3} | gap={4}s`n" -f `
