@@ -11,13 +11,19 @@
         ffmpeg          44.1 kHz stereo (separation) / 16 kHz mono (ASR)
         [-Separate]     audiocpp --family htdemucs --task sep   ~10.6x realtime
                         in -SepChunkMinutes slices, crossfaded back together
-        audiocpp        --task asr --family parakeet_tdt --words-out
-        words_to_srt.py cues from word gaps
+        audiocpp        --task asr --family nemotron_asr --mode streaming
+                        --language auto, sub-word timings + language tags
+        words_to_srt.py cues from word gaps, <lang> tags -> .tags.json
         translate_srt.py deep_translator
 
     Separation is ON by default here, unlike the CrispASR version: at 10.6x
     realtime a 16-minute video costs ~90 s, against ~2.5 hours on CrispASR's
     CPU path and ~35 min for PyTorch demucs at shifts=1.
+
+    The ASR is nemotron-3.5-asr-streaming-0.6b (-Engine parakeet for the old
+    one). It writes <base>.tags.json beside the .srt: the language it decoded
+    each cue in, which is the first entry in what will hold speaker, emotion and
+    the rest.
 
 .PARAMETER Gap
     Seconds of silence that starts a new cue. Cue boundaries come from gaps
@@ -64,6 +70,25 @@ param(
     # conservative -- extrapolating that measurement it needs ~1.7 GB -- and it
     # keeps the better full-context quality for short clips, where long_form
     # measurably loses context ("6 mois" instead of "17 mois de différence").
+    # nemotron replaced parakeet as the default on word recovery, not on WER.
+    # Across two LibriSpeech sets parakeet scored 3.41% and 6.77% against
+    # nemotron's 3.71% and 2.61% -- but the second set is the tell: parakeet
+    # returned 3998 of 4212 words and nemotron 4207. Parakeet-TDT predicts a
+    # duration per token and a bad one jumps the decoder forward, so whole
+    # sentences vanish; nemotron does not do it. It costs ~31x realtime against
+    # parakeet's ~110x, still thirty times faster than the audio, and it detects
+    # the language it is decoding. parakeet stays for the live path, where 90 ms
+    # a window against 119 ms is worth something.
+    [ValidateSet("nemotron","parakeet")][string]$Engine = "nemotron",
+    # Attribute each cue to a speaker and write the speaker track. Clusters CAM++
+    # embeddings of 2 s windows: 98.1% of speech landed on the right person on a
+    # two-speaker test. Names come from the voice store when a cluster matches
+    # something enrolled there, and the cluster stays SPEAKER_00 when it does not.
+    [switch]$Speakers,
+    [string]$Voices,
+    # nemotron only. auto makes it announce the language per segment, which is
+    # what fills the .tags.json beside the .srt.
+    [string]$Language = "auto",
     [double]$LongFormThreshold = 300,
     # Past the threshold, parakeet re-encodes bounded windows and keeps only the
     # centre of each. That centre defaults to audio_chunk_duration_sec = 2, a
@@ -92,9 +117,14 @@ if (-not $Python)   { $Python   = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 
 $Cli      = Join-Path $AudioCpp "audiocpp_cli.exe"
 $SepModel = Join-Path $AudioCpp "models\htdemucs-f16.gguf"
-$AsrModel = Join-Path $AudioCpp "models\Parakeet-TDT-0.6B-v3-GGUF\parakeet-tdt-0.6b-v3-q8_0.gguf"
+$AsrModel = if ($Engine -eq "nemotron") {
+    Join-Path $AudioCpp "models\Nemotron-3.5-ASR-Streaming-0.6B-GGUF"
+} else {
+    Join-Path $AudioCpp "models\Parakeet-TDT-0.6B-v3-GGUF\parakeet-tdt-0.6b-v3-q8_0.gguf"
+}
 $ToSrt    = Join-Path $PSScriptRoot "words_to_srt.py"
 $ToLang   = Join-Path $PSScriptRoot "translate_srt.py"
+$ToSpeakers = Join-Path $PSScriptRoot "speakers.py"
 
 foreach ($p in @($Cli, $AsrModel, $Python, $ToSrt, $ToLang)) {
     if (-not (Test-Path -LiteralPath $p)) { Write-Error "missing: $p"; exit 1 }
@@ -287,14 +317,27 @@ foreach ($f in $files) {
         if (-not (Test-Path -LiteralPath $asrWav)) { throw "no 16 kHz audio for ASR" }
 
         $words = Join-Path $Tmp "$safe.words.json"
+        $tagged = Join-Path $Tmp "$safe.tagged.txt"
         # --out is for audio outputs and writes nothing for ASR; the transcript
         # goes to stdout and the timings to --words-out, which is all we need.
-        Invoke-Native $Cli @(
-            '--task','asr','--family','parakeet_tdt','--model',$AsrModel,'--backend','cuda',
-            '--session-option','parakeet_tdt.offline_mode=auto',
-            '--session-option',"parakeet_tdt.audio_chunk_threshold_sec=$(Format-Num $LongFormThreshold)",
-            '--session-option',"parakeet_tdt.audio_chunk_duration_sec=$(Format-Num $AsrWindow)",
-            '--audio',$asrWav,'--words-out',$words) "ASR"
+        if ($Engine -eq "nemotron") {
+            # Streaming, not offline: nemotron's offline encoder attends over the
+            # whole utterance and asked for 51 GB on 22 minutes. Streaming costs
+            # ~31x realtime and 5.5 GB, and loses nothing -- 4207 of 4212 words
+            # on the set where parakeet returned 3998.
+            Invoke-Native $Cli @(
+                '--task','asr','--family','nemotron_asr','--model',$AsrModel,'--backend','cuda',
+                '--mode','streaming','--language',$Language,
+                '--request-option','keep_language_tags=true',
+                '--audio',$asrWav,'--words-out',$words,'--text-out',$tagged) "ASR"
+        } else {
+            Invoke-Native $Cli @(
+                '--task','asr','--family','parakeet_tdt','--model',$AsrModel,'--backend','cuda',
+                '--session-option','parakeet_tdt.offline_mode=auto',
+                '--session-option',"parakeet_tdt.audio_chunk_threshold_sec=$(Format-Num $LongFormThreshold)",
+                '--session-option',"parakeet_tdt.audio_chunk_duration_sec=$(Format-Num $AsrWindow)",
+                '--audio',$asrWav,'--words-out',$words) "ASR"
+        }
         if (-not (Test-Path -LiteralPath $words)) { throw "ASR produced no words JSON" }
 
         # The two Python steps keep their console output -- cue and translation
@@ -302,10 +345,31 @@ foreach ($f in $files) {
         # directly. Unredirected native stderr is not turned into error records,
         # so their warnings do not abort the file either.
         $tmpSrt = Join-Path $Tmp "$safe.srt"
-        & $Python $ToSrt --words $words --out $tmpSrt --gap (Format-Num $Gap) `
-                  --max-chars $MaxChars --max-dur (Format-Num $MaxDur) --width $Width
+        $srtArgs = @('--words',$words,'--out',$tmpSrt,'--gap',(Format-Num $Gap),
+                     '--max-chars',$MaxChars,'--max-dur',(Format-Num $MaxDur),'--width',$Width)
+        if ($Engine -eq "nemotron") {
+            # nemotron times sub-word pieces and announces the language it decoded
+            # each segment in; the tags land in the transcript rather than the
+            # token stream, so the cue builder gets both and lines them up.
+            $tagsPath = Join-Path $(if ($OutputDir) { $OutputDir } else { $f.DirectoryName }) "$base.tags.json"
+            $srtArgs += @('--merge-tokens','--tagged-text',$tagged,'--tags-out',$tagsPath,
+                          '--media',$f.FullName,'--model-name','nemotron-3.5-asr-streaming-0.6b')
+        }
+        & $Python $ToSrt @srtArgs
         if (-not (Test-Path -LiteralPath $tmpSrt)) { throw "cue builder produced no .srt" }
         Move-Item -LiteralPath $tmpSrt -Destination $srtPath -Force
+
+        # The speaker pass reads the cues the line above just wrote, so it runs
+        # here rather than as a separate command: the 16 kHz wav it needs is
+        # still on disk, and re-extracting it later would cost more than the
+        # pass itself.
+        if ($Speakers -and $Engine -eq "nemotron") {
+            $spkArgs = @($ToSpeakers, '--audio', $asrWav, '--tags', $tagsPath)
+            if ($Voices) { $spkArgs += @('--voices', $Voices) }
+            & $Python @spkArgs
+        } elseif ($Speakers) {
+            Write-Host "    [!] -Speakers needs the tag store, which only -Engine nemotron writes" -ForegroundColor Yellow
+        }
 
         if ($Langs) { & $Python $ToLang --srt $srtPath --langs $Langs }
 
