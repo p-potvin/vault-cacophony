@@ -80,6 +80,12 @@ param(
     # the language it is decoding. parakeet stays for the live path, where 90 ms
     # a window against 119 ms is worth something.
     [ValidateSet("nemotron","parakeet")][string]$Engine = "nemotron",
+    # Attribute each cue to a speaker and write the speaker track. Clusters CAM++
+    # embeddings of 2 s windows: 98.1% of speech landed on the right person on a
+    # two-speaker test. Names come from the voice store when a cluster matches
+    # something enrolled there, and the cluster stays SPEAKER_00 when it does not.
+    [switch]$Speakers,
+    [string]$Voices,
     # nemotron only. auto makes it announce the language per segment, which is
     # what fills the .tags.json beside the .srt.
     [string]$Language = "auto",
@@ -118,6 +124,7 @@ $AsrModel = if ($Engine -eq "nemotron") {
 }
 $ToSrt    = Join-Path $PSScriptRoot "words_to_srt.py"
 $ToLang   = Join-Path $PSScriptRoot "translate_srt.py"
+$ToSpeakers = Join-Path $PSScriptRoot "speakers.py"
 
 foreach ($p in @($Cli, $AsrModel, $Python, $ToSrt, $ToLang)) {
     if (-not (Test-Path -LiteralPath $p)) { Write-Error "missing: $p"; exit 1 }
@@ -351,6 +358,18 @@ foreach ($f in $files) {
         & $Python $ToSrt @srtArgs
         if (-not (Test-Path -LiteralPath $tmpSrt)) { throw "cue builder produced no .srt" }
         Move-Item -LiteralPath $tmpSrt -Destination $srtPath -Force
+
+        # The speaker pass reads the cues the line above just wrote, so it runs
+        # here rather than as a separate command: the 16 kHz wav it needs is
+        # still on disk, and re-extracting it later would cost more than the
+        # pass itself.
+        if ($Speakers -and $Engine -eq "nemotron") {
+            $spkArgs = @($ToSpeakers, '--audio', $asrWav, '--tags', $tagsPath)
+            if ($Voices) { $spkArgs += @('--voices', $Voices) }
+            & $Python @spkArgs
+        } elseif ($Speakers) {
+            Write-Host "    [!] -Speakers needs the tag store, which only -Engine nemotron writes" -ForegroundColor Yellow
+        }
 
         if ($Langs) { & $Python $ToLang --srt $srtPath --langs $Langs }
 
