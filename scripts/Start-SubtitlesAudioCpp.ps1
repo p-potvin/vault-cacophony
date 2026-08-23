@@ -345,7 +345,8 @@ foreach ($f in $files) {
             # each segment in; the tags land in the transcript rather than the
             # token stream, so the cue builder gets both and lines them up.
             $tagsPath = Join-Path $(if ($OutputDir) { $OutputDir } else { $f.DirectoryName }) "$base.tags.json"
-            $srtArgs += @('--merge-tokens','--tagged-text',$tagged,'--tags-out',$tagsPath)
+            $srtArgs += @('--merge-tokens','--tagged-text',$tagged,'--tags-out',$tagsPath,
+                          '--media',$f.FullName,'--model-name','nemotron-3.5-asr-streaming-0.6b')
         }
         & $Python $ToSrt @srtArgs
         if (-not (Test-Path -LiteralPath $tmpSrt)) { throw "cue builder produced no .srt" }

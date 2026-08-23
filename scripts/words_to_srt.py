@@ -18,7 +18,12 @@ import re
 import json
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tagstore
+
 SR = 16000
+# Sub-word pieces further apart than this belong to different words.
+PIECE_GAP_S = 0.5
 
 
 def ts(seconds: float) -> str:
@@ -65,7 +70,20 @@ def merge_tokens(tokens):
                 words.append(cur)
                 cur = None
             continue
-        if piece.startswith(" ") or cur is None:
+        # A piece that lands far from the one before it usually belongs to the
+        # next word: the space that would have separated them went missing at a
+        # streaming seam. Letting it extend the current word instead stretches
+        # that word -- and the cue holding it -- across the whole gap; one file
+        # had "mother." on screen for nineteen seconds.
+        stranded = cur is not None and (
+            t["start_sample"] - cur["end_sample"]) / SR > PIECE_GAP_S
+        if stranded and not any(c.isalnum() for c in piece):
+            # Trailing punctuation is the exception: it belongs to the word it
+            # follows, so take the character and leave the timing alone, or the
+            # transcript reads "welcome his gospel" / ". He had written".
+            cur["word"] += piece
+            continue
+        if piece.startswith(" ") or cur is None or stranded:
             if cur:
                 words.append(cur)
             cur = {"word": piece.strip(),
@@ -102,6 +120,30 @@ def languages_by_word(tagged_text, word_count):
     seen += len(tagged_text[pos:].split())
     drift = abs(seen - word_count) / max(word_count, 1)
     return marks, drift
+
+
+def readable(cues, fill, min_dur, cps, cue_gap):
+    """Hold a cue long enough to read it, and never past the next one.
+
+    Nemotron reports one 80 ms frame per token, so a cue ending on a one-token
+    word "ends" 80 ms after that word began however long it was really spoken:
+    "No" flashes for 80 ms and is gone. Two corrections, in order. `fill` gives
+    back the time the frame grid truncated. Then the cue is held for at least
+    `min_dur`, and for however long its characters take to read at `cps` -- the
+    subtitle convention rather than a guess.
+
+    The next cue's start always wins, so nothing overlaps and no time is
+    invented inside real speech. This runs after cue boundaries are decided:
+    growing an end before that would shrink the measured pause and silently
+    merge a cue with its neighbour.
+    """
+    out = []
+    for i, (start, end, text, first) in enumerate(cues):
+        want = max(end + fill, start + max(min_dur, len(text.replace("\n", " ")) / cps))
+        if i + 1 < len(cues):
+            want = min(want, max(end, cues[i + 1][0] - cue_gap))
+        out.append((start, want, text, first))
+    return out
 
 
 def build(words, gap, max_chars, max_dur, width):
@@ -150,8 +192,19 @@ def main():
     ap.add_argument("--width", type=int, default=42, help="characters per displayed line")
     ap.add_argument("--merge-tokens", action="store_true",
                     help="input times sub-word pieces rather than words (nemotron)")
+    ap.add_argument("--fill", type=float, default=0.25,
+                    help="seconds given back to a cue whose end the model's frame grid "
+                         "truncated; 0 disables")
+    ap.add_argument("--min-dur", type=float, default=0.9,
+                    help="shortest time a cue stays on screen, unless the next cue starts sooner")
+    ap.add_argument("--cps", type=float, default=17.0,
+                    help="reading speed in characters per second; a cue is held at least this long")
+    ap.add_argument("--cue-gap", type=float, default=0.08,
+                    help="gap kept between one cue and the next when a cue is extended")
     ap.add_argument("--tagged-text", help="transcript with <lang> tags, from --language auto")
-    ap.add_argument("--tags-out", help="write per-cue language to this JSON")
+    ap.add_argument("--tags-out", help="tag store to write the language track and cues into")
+    ap.add_argument("--media", help="media path recorded in the tag store")
+    ap.add_argument("--model-name", help="model credited for the language track")
     args = ap.parse_args()
 
     with open(args.words, encoding="utf-8") as f:
@@ -168,31 +221,41 @@ def main():
         return 1
 
     cues = build(words, args.gap, args.max_chars, args.max_dur, args.width)
+    cues = readable(cues, args.fill, args.min_dur, args.cps, args.cue_gap)
     with open(args.out, "w", encoding="utf-8") as f:
         for i, (start, end, text, _) in enumerate(cues, 1):
             f.write(f"{i}\n{ts(start)} --> {ts(end)}\n{text}\n\n")
 
-    langs = None
+    spans = []
     if args.tagged_text and os.path.exists(args.tagged_text):
         with open(args.tagged_text, encoding="utf-8") as f:
             marks, drift = languages_by_word(f.read(), len(words))
         if marks and drift <= 0.05:
-            langs = []
             for start, end, text, first in cues:
-                lang = next((code for at, code in reversed(marks) if at <= first), marks[0][1])
-                langs.append({"start": round(start, 3), "end": round(end, 3), "language": lang})
+                code = next((c for at, c in reversed(marks) if at <= first), marks[0][1])
+                spans.append({"start": round(start, 3), "end": round(end, 3), "value": code})
         elif marks:
             # Counting words in the transcript and counting merged tokens
             # disagreed, so per-cue placement would be fiction. The file-level
             # answer is still worth keeping.
-            langs = [{"start": 0.0, "end": cues[-1][1], "language": marks[0][1], "whole_file": True}]
+            spans = [{"start": 0.0, "end": round(cues[-1][1], 3), "value": marks[0][1]}]
             print(f"    [!] language tags drifted {drift:.0%} from the word stream; "
                   f"tagging the file, not the cues", file=sys.stderr)
-    if langs and args.tags_out:
-        with open(args.tags_out, "w", encoding="utf-8") as f:
-            json.dump(langs, f, ensure_ascii=False, indent=1)
 
-    spoken = sorted({l["language"] for l in langs}) if langs else []
+    if args.tags_out:
+        # Merge into whatever is already there: this pass owns the language
+        # track and the cues, and must not disturb a speaker track written
+        # before it or after it.
+        store = tagstore.load(args.tags_out)
+        tagstore.set_media(store, args.media, cues[-1][1] if cues else None)
+        # The store keeps cue text on one line; the wrapping is a display
+        # decision that belongs to the .srt, not to the annotations.
+        tagstore.put_cues(store, [(s, e, " ".join(t.split())) for s, e, t, _ in cues])
+        tagstore.put_track(store, "language", tagstore.collapse(spans), "asr",
+                           model=args.model_name)
+        tagstore.save(store, args.tags_out)
+
+    spoken = sorted({s["value"] for s in spans})
     extra = f", {'/'.join(spoken)}" if spoken else ""
     print(f"    {len(cues)} cues{extra} -> {args.out}")
     return 0
