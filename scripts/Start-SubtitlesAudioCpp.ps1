@@ -9,16 +9,21 @@
     binbcast kernel, leaving separation on a scalar CPU route).
 
         ffmpeg          44.1 kHz stereo (separation) / 16 kHz mono (ASR)
-        [-Separate]     audiocpp --family htdemucs --task sep   ~10.6x realtime
+        [-Separate]     audiocpp --family bs_roformer --task sep  ~8x realtime
                         in -SepChunkMinutes slices, crossfaded back together
         audiocpp        --task asr --family nemotron_asr --mode streaming
                         --language auto, sub-word timings + language tags
         words_to_srt.py cues from word gaps, <lang> tags -> .tags.json
         translate_srt.py deep_translator
 
-    Separation is ON by default here, unlike the CrispASR version: at 10.6x
-    realtime a 16-minute video costs ~90 s, against ~2.5 hours on CrispASR's
+    Separation is ON by default here, unlike the CrispASR version: at ~8x
+    realtime a 16-minute video costs ~2 min, against ~2.5 hours on CrispASR's
     CPU path and ~35 min for PyTorch demucs at shifts=1.
+
+    The separator is BS-RoFormer at one inference pass (-Separator htdemucs for
+    the old one). It beats htdemucs where separation actually matters -- speech
+    buried 5 dB under music, 54.3% WER against 57.6% -- and matches its speed
+    once the pass count is one rather than the packaged four.
 
     The ASR is nemotron-3.5-asr-streaming-0.6b (-Engine parakeet for the old
     one). It writes <base>.tags.json beside the .srt: the language it decoded
@@ -46,22 +51,36 @@ param(
     [string]$Langs = "",
     [switch]$SkipExisting,
     [switch]$NoSeparate,
+    # BS-RoFormer replaced htdemucs on the audio that is actually hard. Speech
+    # over music at 0 dB, WER after separation: htdemucs 26.4%, BS-RoFormer
+    # 27.1%. Push the music 5 dB louder and it inverts -- htdemucs 57.6%,
+    # BS-RoFormer 54.3%, and BS-RoFormer returns 226 of the words against 202.
+    # It writes two stems instead of four, so three quarters of the stem writing
+    # goes with them.
+    [ValidateSet("bs_roformer","htdemucs")][string]$Separator = "bs_roformer",
+    # RoFormer's overlapping inference passes, and the reason it can feel slow:
+    # time scales with this exactly -- 1.8x realtime at 4, 3.8x at 2, 8.0x at 1
+    # on a 2-minute clip -- while quality barely moves. At -5 dB four passes
+    # scored 53.9% WER against one pass at 54.3%. One pass, which also lands
+    # within a whisker of htdemucs's 8.6x.
+    [ValidateRange(1, 8)][int]$SepPasses = 1,
     [double]$VolumeBoost = 1.5,
     [double]$Gap = 0.6,
-    # htdemucs is flat on the GPU -- ~0.8 GB of VRAM whatever the file length,
-    # because the graph only ever sees one 7.8 s training segment. What grows
-    # with length is host RAM: the session holds the mix, an accumulator for all
-    # four stems and then the four output buffers, all at full length, which
-    # measures 0.28 GB per minute of audio on top of a 0.7 GB floor. That is the
-    # wall a feature-length file hits, not the 3060. Six minutes a chunk keeps a
-    # separation process near 2 GB, leaving room for parakeet (~2 GB VRAM,
-    # ~2.2 GB RSS), the ffmpeg workers and a third model.
+    # Both separators hold the whole mix and its stems in memory, so both grow
+    # with the length of what they are given: BS-RoFormer measured 0.76 GB of
+    # host RAM on 2 minutes and 2.95 GB on 8, about 0.37 GB a minute, with VRAM
+    # climbing 2.8 -> 4.3 GB over the same span. (htdemucs is 0.47 GB a minute
+    # and 2.0 -> 3.8 GB.) That is the wall a feature-length file hits, not the
+    # card. Six minutes a chunk keeps a separation process near 2 GB of RAM and
+    # under 4 GB of VRAM, leaving room for the ASR, the ffmpeg workers and a
+    # third model.
     [double]$SepChunkMinutes = 6,
     # Each chunk is read $SepOverlap seconds early and crossfaded (linear, so
-    # coherent content keeps its level) over that lead-in. Both edges of the
-    # fade are the parts htdemucs separates worst -- the first and last moments
-    # of an input -- and each sits at zero weight exactly where it is worst.
-    # 10 s covers a full 7.8 s training segment on either side.
+    # coherent content keeps its level) over that lead-in. Both edges of the fade
+    # are the parts a separator handles worst -- the first and last moments of an
+    # input, where it has no context on one side -- and each sits at zero weight
+    # exactly where it is worst. 10 s covers any of these models' windows twice
+    # over.
     [double]$SepOverlap = 10,
     # parakeet's offline_mode defaults to full_context, which encodes the whole
     # utterance and asks for O(T^2) attention memory: an 18-minute file requested
@@ -116,7 +135,11 @@ if (-not $AudioCpp) { $AudioCpp = Join-Path $RepoRoot "audio.cpp" }
 if (-not $Python)   { $Python   = Join-Path $RepoRoot ".venv\Scripts\python.exe" }
 
 $Cli      = Join-Path $AudioCpp "audiocpp_cli.exe"
-$SepModel = Join-Path $AudioCpp "models\htdemucs-f16.gguf"
+$SepModel = if ($Separator -eq "bs_roformer") {
+    Join-Path $AudioCpp "models\BS-RoFormer-ep368-GGUF\bs-roformer-ep368-q8_0.gguf"
+} else {
+    Join-Path $AudioCpp "models\htdemucs-f16.gguf"
+}
 $AsrModel = if ($Engine -eq "nemotron") {
     Join-Path $AudioCpp "models\Nemotron-3.5-ASR-Streaming-0.6B-GGUF"
 } else {
@@ -187,7 +210,7 @@ function Get-AudioSeconds([string]$Path) {
 function Invoke-Separation {
     param(
         [string]$Cli, [string]$Model, [string]$Mix, [string]$WorkDir,
-        [double]$ChunkSec, [double]$Overlap
+        [double]$ChunkSec, [double]$Overlap, [string]$Family, [int]$Passes
     )
     $total = Get-AudioSeconds $Mix
     $n = 1
@@ -218,16 +241,20 @@ function Invoke-Separation {
         }
 
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
-        Invoke-Native $Cli @(
-            '--family','htdemucs','--task','sep','--mode','offline','--model',$Model,
-            '--backend','cuda','--audio',$src,'--out-dir',$dir) "separation (chunk $($i + 1)/$n)"
+        $sepArgs = @('--family',$Family,'--task','sep','--mode','offline','--model',$Model,
+                     '--backend','cuda','--audio',$src,'--out-dir',$dir)
+        if ($Family -eq "bs_roformer") {
+            $sepArgs += @('--session-option', "bs_roformer.num_overlap=$Passes")
+        }
+        Invoke-Native $Cli $sepArgs "separation (chunk $($i + 1)/$n)"
         $stem = Join-Path $dir "vocals.wav"
         if (-not (Test-Path -LiteralPath $stem)) { throw "separation produced no vocals stem (chunk $($i + 1)/$n)" }
 
         $keep = Join-Path $WorkDir ("vocals{0:d3}.wav" -f $i)
         Move-Item -LiteralPath $stem -Destination $keep -Force
-        # The other three stems are dead weight; drop them before the next chunk
-        # so peak disk holds one chunk of them, not a whole film of them.
+        # The stems nobody asked for are dead weight -- one from BS-RoFormer,
+        # three from htdemucs -- so they go before the next chunk, and peak disk
+        # holds one chunk of them rather than a whole film.
         Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $part) { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
         $vocals += $keep
@@ -311,7 +338,8 @@ foreach ($f in $files) {
 
             New-Item -ItemType Directory -Force -Path $workDir | Out-Null
             $stems = Invoke-Separation -Cli $Cli -Model $SepModel -Mix $sepWav -WorkDir $workDir `
-                                       -ChunkSec ($SepChunkMinutes * 60) -Overlap $SepOverlap
+                                       -ChunkSec ($SepChunkMinutes * 60) -Overlap $SepOverlap `
+                                       -Family $Separator -Passes $SepPasses
             Join-VocalStems -Stems $stems -Out $asrWav -Overlap $SepOverlap -Volume $VolumeBoost
         }
         if (-not (Test-Path -LiteralPath $asrWav)) { throw "no 16 kHz audio for ASR" }
