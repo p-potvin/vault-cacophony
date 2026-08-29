@@ -20,12 +20,16 @@ from typing import Any, Iterator
 import pyarrow.parquet as pq
 
 
-def records(parquet_path: Path, limit: int) -> Iterator[dict[str, Any]]:
-    """Yield at most ``limit`` rows without loading an entire benchmark split."""
+def records(parquet_path: Path, limit: int, offset: int = 0) -> Iterator[dict[str, Any]]:
+    """Yield one bounded row range without loading an entire benchmark split."""
     emitted = 0
+    skipped = 0
     source = pq.ParquetFile(parquet_path)
     for batch in source.iter_batches(batch_size=min(limit, 32)):
         for record in batch.to_pylist():
+            if skipped < offset:
+                skipped += 1
+                continue
             yield record
             emitted += 1
             if emitted >= limit:
@@ -74,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--parquet", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--limit", type=int, default=5)
+    parser.add_argument("--offset", type=int, default=0, help="Rows to skip before the bounded slice")
     parser.add_argument("--runner-python", type=Path, default=root / ".venv" / "Scripts" / "python.exe")
     parser.add_argument("--af3-wrapper", type=Path, default=root / "scripts" / "audio_flamingo.py")
     parser.add_argument("--model", type=Path, default=Path("D:/HuggingFace/gguf/af3-Q4_K_M.gguf"))
@@ -82,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.limit < 1:
         parser.error("--limit must be positive")
+    if args.offset < 0:
+        parser.error("--offset must not be negative")
     return args
 
 
@@ -99,7 +106,7 @@ def main() -> int:
         prefix="openasr-af3-"
     ) as temporary:
         directory = Path(temporary)
-        for record in records(args.parquet, args.limit):
+        for record in records(args.parquet, args.limit, args.offset):
             prediction = transcribe(record, args, directory)
             result = {
                 "id": record.get("id"),
