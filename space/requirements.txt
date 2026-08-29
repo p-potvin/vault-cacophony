@@ -1,0 +1,10 @@
+gradio
+spaces
+torch
+numpy
+huggingface_hub
+sentencepiece
+sphn
+safetensors
+einops
+aiohttp
