@@ -131,11 +131,25 @@ class Embedder:
         happened to be in it rather than by the speaker, so it is refused rather
         than returned as something that looks usable.
         """
-        if audio is None or len(audio) < int(min_seconds * SR):
+        vectors = self.embed_windows(audio, min_seconds)
+        if not len(vectors):
             return None
+        mean = np.mean(vectors, axis=0)
+        norm = np.linalg.norm(mean)
+        return (mean / norm).astype(np.float32) if norm > 0 else None
+
+    def embed_windows(self, audio, min_seconds=0.5):
+        """The per-window vectors `embed` averages, as an (n, 512) array.
+
+        Kept separately because the windows are the evidence and the mean is
+        only the conclusion: the voice store records both, so a speaker whose
+        centroid later looks wrong can be examined rather than guessed at.
+        """
+        if audio is None or len(audio) < int(min_seconds * SR):
+            return np.zeros((0, EMB_DIM), dtype=np.float32)
         feats = self.fbank(audio)
         if feats.shape[0] < MIN_FRAMES:
-            return None
+            return np.zeros((0, EMB_DIM), dtype=np.float32)
         vectors = []
         for start in range(0, max(1, feats.shape[0] - WINDOW_FRAMES + 1), HOP_FRAMES):
             window = feats[start:start + WINDOW_FRAMES]
@@ -145,11 +159,8 @@ class Embedder:
             norm = np.linalg.norm(out)
             if norm > 0:
                 vectors.append(out / norm)
-        if not vectors:
-            return None
-        mean = np.mean(vectors, axis=0)
-        norm = np.linalg.norm(mean)
-        return (mean / norm).astype(np.float32) if norm > 0 else None
+        return (np.stack(vectors).astype(np.float32) if vectors
+                else np.zeros((0, EMB_DIM), dtype=np.float32))
 
     def embed_file(self, path, start=None, end=None, min_seconds=0.5):
         return self.embed(read_wav(path, start, end), min_seconds)

@@ -24,6 +24,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import prosody
 import tagstore
 import voices as voicestore
 from voiceprint import Embedder, read_wav
@@ -162,6 +163,109 @@ def drop_strays(spans, vectors, labels, min_windows=MIN_CLUSTER_WINDOWS):
             [order[l] for _, _, l in kept])
 
 
+def unit(vector):
+    norm = float(np.linalg.norm(vector))
+    return np.asarray(vector, dtype=np.float32) / norm if norm else np.asarray(vector, np.float32)
+
+
+# Prosody over a whole film's worth of one speaker buys nothing over a few
+# minutes of them, and the concatenation is the only thing here that grows with
+# file length. Past this, windows are sampled evenly across the file rather than
+# truncated, so the measurement still covers every scene the speaker is in.
+PROSODY_CAP_S = 180.0
+
+
+def gather(audio, spans, cap=PROSODY_CAP_S):
+    """The speaker's audio, back to back, bounded.
+
+    Overlapping spans are merged first. The windows overlap by half by
+    construction, so concatenating them raw plays every second of speech twice
+    -- which does not move a median but does make the reported duration a lie.
+    """
+    merged = []
+    for s in sorted(spans, key=lambda s: s["start"]):
+        if merged and s["start"] <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], s["end"])
+        else:
+            merged.append([s["start"], s["end"]])
+    if not merged:
+        return np.zeros(0, dtype=np.float32)
+    total = sum(e - s for s, e in merged)
+    step = max(1, int(np.ceil(total / cap))) if total > cap else 1
+    return np.concatenate([audio[int(s * 16000):int(e * 16000)] for s, e in merged[::step]])
+
+
+def record(known, store, audio, audio_path, tags_path, spans, vectors, labels, ordered,
+           members, centroids, names, scores, voted, threshold, match_threshold):
+    """Write one observation per cluster: the embedding, and why to believe it.
+
+    Two numbers say how much the cluster is worth, and they are the reason this
+    is stored rather than recomputed later. `cohesion` is the mean cosine of the
+    cluster's own windows to its centroid -- how much one person it is. It is
+    high for a real speaker and drops when clustering has merged two people who
+    sound alike. `separation` is the best cosine to any *other* cluster in the
+    same file -- how distinct it was from the competition it was actually judged
+    against. A centroid at 0.85 cohesion and 0.10 separation is a clean answer;
+    the same 0.85 against a 0.55 neighbour is a coin toss that happened to land,
+    and only the file it came from ever knew that.
+    """
+    media = store.get("media", {})
+    # The wav handed to this pass is a temp file the pipeline deletes on its way
+    # out, so recording it would leave the store pointing at nothing. The tag
+    # store sits beside the media it describes, and knows its name.
+    if media.get("path"):
+        media_path = os.path.abspath(os.path.join(os.path.dirname(tags_path), media["path"]))
+    else:
+        media_path = os.path.abspath(audio_path)
+    recorded = {}
+    for label in ordered:
+        languages = {}
+        mine = [sp for sp, l in zip(spans, labels) if l == label]
+        cues = [c for c, l in voted if l == label]
+        centroid = centroids[label]
+        cohesion = float(np.mean(np.dot(np.stack(members[label]), centroid)))
+        others = [float(np.dot(centroids[o], centroid)) for o in ordered if o != label]
+        text = " ".join(c["text"] for c in cues).strip()
+        spoken = sum(c["end"] - c["start"] for c in cues)
+        for c in cues:
+            code = tagstore.value_at(store, "language", (c["start"] + c["end"]) / 2)
+            if code:
+                languages[code] = languages.get(code, 0.0) + c["end"] - c["start"]
+
+        metrics = prosody.measure(gather(audio, mine))
+        metrics.update({
+            "words": len(text.split()),
+            "characters": len(text),
+            # Words per minute over time actually spoken, not wall clock: the
+            # pauses between this speaker's cues belong to whoever filled them.
+            "wpm": round(len(text.split()) / (spoken / 60.0), 1) if spoken > 0 else None,
+            "cues": len(cues),
+            "languages": sorted(languages, key=languages.get, reverse=True)[:3] or None,
+            "first_line": text[:120] or None,
+        })
+        recorded[label] = known.observe(
+            centroid, windows=np.stack(members[label]),
+            voice=names[label] if not names[label].startswith("SPEAKER_") else None,
+            label=names[label],
+            media=media.get("path") or os.path.basename(audio_path),
+            media_path=media_path,
+            media_duration=media.get("duration"),
+            start_s=min(c["start"] for c in cues) if cues else None,
+            end_s=max(c["end"] for c in cues) if cues else None,
+            speech_seconds=round(spoken, 3),
+            cohesion=round(cohesion, 4),
+            separation=round(max(others), 4) if others else None,
+            match_score=round(scores[label], 4),
+            matched=names[label] if not names[label].startswith("SPEAKER_") else None,
+            metrics={k: v for k, v in metrics.items() if v is not None},
+            source={"pass": "speaker", "model": "campplus-voxceleb-lm",
+                    "tags": os.path.basename(tags_path),
+                    "window_s": WINDOW_S, "hop_s": HOP_S,
+                    "cluster_threshold": threshold, "match_threshold": match_threshold,
+                    "speakers_in_file": len(ordered)})
+    return recorded
+
+
 def run(audio_path, tags_path, store_path=None, threshold=CLUSTER_THRESHOLD,
         match_threshold=voicestore.MATCH_THRESHOLD, min_span=MIN_SPAN_S, quiet=False):
     store = tagstore.load(tags_path)
@@ -188,14 +292,12 @@ def run(audio_path, tags_path, store_path=None, threshold=CLUSTER_THRESHOLD,
 
     # Name a cluster once, from its centroid, rather than per cue: a centroid is
     # built from every span the speaker said and is steadier than any one of them.
+    ordered = sorted(set(labels))
+    members = {l: [v for v, k in zip(vectors, labels) if k == l] for l in ordered}
+    centroids = {l: unit(np.mean(members[l], axis=0)) for l in ordered}
     names, scores = {}, {}
-    for label in sorted(set(labels)):
-        members = [v for v, l in zip(vectors, labels) if l == label]
-        centroid = np.mean(members, axis=0)
-        norm = np.linalg.norm(centroid)
-        if norm:
-            centroid = centroid / norm
-        name, score = voicestore.identify(known, centroid, match_threshold)
+    for label in ordered:
+        name, score = known.identify(centroids[label], match_threshold)
         names[label] = name or f"SPEAKER_{label:02d}"
         scores[label] = score
 
@@ -209,14 +311,30 @@ def run(audio_path, tags_path, store_path=None, threshold=CLUSTER_THRESHOLD,
                        clustered_at=round(threshold, 3))
     tagstore.save(store, tags_path)
 
+    # Deposit the evidence. This runs after the tag store is written, and its
+    # failure is caught below, because the subtitle pass calling this must not
+    # lose a finished speaker track to a locked database.
+    recorded = {}
+    try:
+        recorded = record(known, store, audio, audio_path, tags_path, usable, vectors,
+                          labels, ordered, members, centroids, names, scores, voted,
+                          threshold, match_threshold)
+    except Exception as exc:  # sqlite errors, a read-only store, a full disk
+        if not quiet:
+            print(f"    [!] voice store not updated: {exc}")
+
     if not quiet:
-        print(f"    {len(set(labels))} speaker(s) over {len(voted)} of {len(cues)} cues "
+        print(f"    {len(ordered)} speaker(s) over {len(voted)} of {len(cues)} cues "
               f"({len(usable)} windows) -> {tags_path}")
-        for label in sorted(set(labels)):
+        for label in ordered:
             spoken = sum(c["end"] - c["start"] for c, l in voted if l == label)
             named = not names[label].startswith("SPEAKER_")
             detail = f"matched {scores[label]:.2f}" if named else f"best {scores[label]:.2f}, unknown"
-            print(f"      {names[label]:16} {spoken:6.1f}s  ({detail})")
+            obs = f"  #{recorded[label]}" if label in recorded else ""
+            print(f"      {names[label]:16} {spoken:6.1f}s  ({detail}){obs}")
+        if recorded:
+            print(f"      {len(recorded)} observation(s) -> {known.path}")
+    known.close()
     return store
 
 

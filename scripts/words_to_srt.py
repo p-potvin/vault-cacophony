@@ -146,37 +146,131 @@ def readable(cues, fill, min_dur, cps, cue_gap):
     return out
 
 
+# Punctuation is the only clue in a word stream about where a sentence is
+# willing to be cut. Ranked: a full stop is a better break than a comma.
+_STRONG = (".", "!", "?", "…")
+_WEAK = (",", ";", ":", "—", "–")
+# Do not take a punctuation break so early that the first half is a stub; below
+# this fraction of the accumulated words, packing tightly reads better.
+_MIN_BREAK_FRACTION = 0.45
+
+
+def _break_at(cur):
+    """Where to cut an over-long run of words. Returns an index into `cur`.
+
+    Falling back to len(cur) reproduces the old behaviour -- cut exactly where
+    the budget ran out -- which is what produced cues ending mid-clause.
+    """
+    floor = max(1, int(len(cur) * _MIN_BREAK_FRACTION))
+    for marks in (_STRONG, _WEAK):
+        for i in range(len(cur) - 1, floor - 1, -1):
+            if cur[i - 1]["word"].rstrip().endswith(marks):
+                return i
+    return len(cur)
+
+
+def _length(group):
+    return len(" ".join(w["word"] for w in group))
+
+
+def _rebalance(a, b, max_chars):
+    """Redistribute two adjacent groups so neither is a stub.
+
+    Used when an orphan cannot simply be folded back because the combined text
+    would overflow. Splitting the pair evenly gives two readable cues where
+    merging would give one over-long one and doing nothing leaves a single word
+    flashing on screen. Punctuation still wins where it is close to the middle.
+    """
+    combined = a + b
+    best = None
+    for i in range(1, len(combined)):
+        left, right = _length(combined[:i]), _length(combined[i:])
+        if left > max_chars or right > max_chars:
+            continue
+        score = abs(left - right)
+        if combined[i - 1]["word"].rstrip().endswith(_STRONG + _WEAK):
+            score -= 25  # worth a fair imbalance to land on a clause boundary
+        if best is None or score < best[0]:
+            best = (score, i)
+    if best is None:
+        return None
+    return combined[:best[1]], combined[best[1]:]
+
+
+def _merge_orphans(groups, max_chars, min_words=2):
+    """Stop a stranded word or two from becoming a cue of its own.
+
+    A one-word cue is almost always the tail of a character-forced split that
+    happened to be followed by a real pause: 'thing,' alone on screen for half a
+    second. Measured on a two-agent conversation, 7 of 16 cues were split by the
+    character cap and three of those left an orphan.
+
+    Folding it back into the previous cue is the first choice; where that would
+    overflow, the pair is rebalanced instead. Only ever within a run -- these
+    groups are separated at real pauses, and a pause is a boundary worth keeping.
+    """
+    out = []
+    for group in groups:
+        if out and len(group) <= min_words:
+            if _length(out[-1] + group) <= max_chars:
+                out[-1] = out[-1] + group
+                continue
+            split = _rebalance(out[-1], group, max_chars)
+            if split:
+                out[-1], group = split
+        out.append(group)
+    return out
+
+
 def build(words, gap, max_chars, max_dur, width):
-    cues, cur = [], []
-    index = [0]
-
-    def flush():
-        if not cur:
-            return
-        start = cur[0]["start_sample"] / SR
-        end = cur[-1]["end_sample"] / SR
-        text = " ".join(w["word"] for w in cur).strip()
-        if text:
-            # The first word's index is what a language mark is matched against.
-            cues.append((start, end, wrap(text, width), index[0] - len(cur)))
-        cur.clear()
-
+    # A pause is the strongest signal of a natural break, and the only one that
+    # comes from the speaker rather than from a display budget. So runs are cut
+    # at pauses first and packed second; the char and duration caps only exist
+    # to stop a run-on stretch of speech becoming an unreadable wall, and where
+    # they have to cut they now look for a clause boundary to cut at.
+    runs, run = [], []
     for w in words:
+        if run and (w["start_sample"] - run[-1]["end_sample"]) / SR >= gap:
+            runs.append(run)
+            run = []
+        run.append(w)
+    if run:
+        runs.append(run)
+
+    cues, index = [], 0
+    for run in runs:
+        groups, cur = [], []
+        for w in run:
+            if cur:
+                # Project the length *including* this word: splitting once the
+                # cap is already exceeded overflows the last wrapped line.
+                length = len(" ".join(x["word"] for x in cur)) + 1 + len(w["word"])
+                dur = w["end_sample"] / SR - cur[0]["start_sample"] / SR
+                if length > max_chars or dur >= max_dur:
+                    at = _break_at(cur)
+                    groups.append(cur[:at])
+                    cur = cur[at:]
+            cur.append(w)
         if cur:
-            prev_end = cur[-1]["end_sample"] / SR
-            this_start = w["start_sample"] / SR
-            # Project the cue length *including* this word: splitting only once
-            # the cap is already exceeded overflows the last wrapped line.
-            length = len(" ".join(x["word"] for x in cur)) + 1 + len(w["word"])
-            dur = w["end_sample"] / SR - cur[0]["start_sample"] / SR
-            # A pause is the strongest signal of a natural break; the char and
-            # duration caps only exist to stop a run-on stretch of speech from
-            # becoming an unreadable wall.
-            if (this_start - prev_end) >= gap or length > max_chars or dur >= max_dur:
-                flush()
-        cur.append(w)
-        index[0] += 1
-    flush()
+            groups.append(cur)
+
+        for group in _merge_orphans([g for g in groups if g], max_chars):
+            text = " ".join(w["word"] for w in group).strip()
+            if text:
+                # The first word's index is what a language mark is matched against.
+                cues.append((group[0]["start_sample"] / SR,
+                             group[-1]["end_sample"] / SR,
+                             wrap(text, width), index))
+            index += len(group)
+
+    # Sub-word pieces sometimes share or cross timestamps, so a cue can end
+    # after the next one starts -- which players render as two subtitles on
+    # screen at once. The later cue's start always wins, because it is a real
+    # word onset while the overlap is an artefact of the frame grid.
+    for i in range(len(cues) - 1):
+        if cues[i][1] > cues[i + 1][0]:
+            start, _, text, first = cues[i]
+            cues[i] = (start, max(start, cues[i + 1][0]), text, first)
     return cues
 
 
