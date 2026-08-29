@@ -1,0 +1,97 @@
+name: Build Python Wheels
+
+on: [push, pull_request]
+
+jobs:
+  build_wheels:
+    name: Build wheels on ${{ matrix.os }} ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, windows-2022, macOS-12]
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      # Use a venv for macOS runners
+      - name: "Create Python virtual environment"
+        run: |
+          python3 -m venv _flashlight-text-env
+          source _flashlight-text-env/bin/activate
+          echo "PATH=$PATH" >> $GITHUB_ENV
+        if: runner.os == 'macOS'
+
+      - name: Install cibuildwheel
+        run: python -m pip install cibuildwheel==2.16.5
+      - name: Compute version
+        run: echo "$(python bindings/python/compute_version.py)" > BUILD_VERSION.txt
+      - name: Build wheels
+        run: python -m cibuildwheel --archs auto64 --output-dir wheelhouse
+        env:
+          CIBW_BEFORE_BUILD: pip install -v git+https://github.com/kpu/kenlm.git
+          CIBW_PRERELEASE_PYTHONS: 0
+          CIBW_BUILD_VERBOSITY: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          path: ./wheelhouse/*.whl
+          name: dist-${{ matrix.os }}
+
+  build_sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        run: echo "BUILD_VERSION=$(python bindings/python/compute_version.py)" >> $GITHUB_ENV
+
+      - name: Build sdist
+        run: pipx run build --sdist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          path: dist/*.tar.gz
+          name: dist
+
+  install_from_sdist:
+    needs: [build_sdist]
+    name: Install from source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist*
+          merge-multiple: true
+          path: dist
+
+      - name: Install KenLM
+        run: pip install -v git+https://github.com/kpu/kenlm.git
+
+      - name: Install from sdist (with KenLM)
+        run: ls && pip install -v dist/*.tar.gz
+
+  upload_pypi:
+    needs: [build_wheels, build_sdist]
+    runs-on: ubuntu-latest
+    # upload to PyPI on every commit to main. In the future, look for tags starting with v
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' # && startsWith(github.ref, 'refs/tags/v')
+    # in the future: publish on github releases:
+    # if: github.event_name == 'release' && github.event.action == 'published'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist*
+          merge-multiple: true
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@v1.8.12
+        with:
+          verbose: true
+          password: ${{ secrets.PYPI_PASSWORD }}

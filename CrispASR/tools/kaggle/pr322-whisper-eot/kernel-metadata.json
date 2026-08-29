@@ -1,0 +1,14 @@
+{
+  "id": "chr1str/crispasr-pr322-whisper-eot-verify",
+  "title": "CrispASR PR322 whisper eot verify",
+  "code_file": "pr322_whisper_eot.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "dataset_sources": ["chr1str/crispasr-hf-token", "chr1str/crispasr-ccache"],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

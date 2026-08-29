@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>CrispASR</RootNamespace>
+    <AssemblyName>CrispASR</AssemblyName>
+    <Description>C# bindings for CrispASR — multi-backend ASR/TTS inference via the unified Session C ABI.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="CrispASR.Tests" />
+  </ItemGroup>
+
+</Project>

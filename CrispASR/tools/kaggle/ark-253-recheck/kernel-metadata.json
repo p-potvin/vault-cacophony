@@ -1,0 +1,14 @@
+{
+  "id": "chr1str/ark-253-recheck",
+  "title": "ark-253-recheck",
+  "code_file": "ark_253_recheck.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "competition_sources": [],
+  "dataset_sources": ["chr1str/crispasr-hf-token", "chr1str/crispasr-ccache"],
+  "kernel_sources": [],
+  "model_sources": []
+}

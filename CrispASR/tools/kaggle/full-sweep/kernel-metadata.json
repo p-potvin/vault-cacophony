@@ -1,0 +1,17 @@
+{
+  "id": "chr1str/crispasr-full-backend-sweep",
+  "title": "CrispASR Full Backend Sweep",
+  "code_file": "kaggle-benchmark-all-backends.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "competition_sources": [],
+  "dataset_sources": [
+    "chr1str/crispasr-hf-token",
+    "chr1str/crispasr-ccache"
+  ],
+  "kernel_sources": [],
+  "model_sources": []
+}

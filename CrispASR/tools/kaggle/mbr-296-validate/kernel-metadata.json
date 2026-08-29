@@ -1,0 +1,9 @@
+{
+  "id": "chr1str/mbr-296-validate",
+  "title": "mbr 296 validate",
+  "code_file": "mbr-296-validate.py",
+  "language": "python", "kernel_type": "script", "is_private": "true",
+  "enable_gpu": "false", "enable_internet": "true",
+  "competition_sources": [], "dataset_sources": ["chr1str/crispasr-hf-token", "chr1str/crispasr-ccache"],
+  "kernel_sources": [], "model_sources": []
+}

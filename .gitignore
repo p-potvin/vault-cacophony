@@ -87,3 +87,40 @@ __pycache__/
 # Local Codex orchestration state. It records machine-local run activity and
 # must not be published with the speech tooling.
 .omx/
+
+# Vendored-engine local artifacts. Source under nested `src/models` and
+# `include/.../models` remains tracked; these entries are downloaded models,
+# fixtures, outputs, or local orchestration state.
+.omx/
+CrispASR/models/
+CrispASR/samples/
+NeMo-Speech.cpp/models/
+NeMo-Speech.cpp/llama.cpp/models/
+NeMo-Speech.cpp/llama.cpp/tools/mtmd/models/
+NeMo-Speech.cpp/test_files/
+audio.cpp/.htdemucs/
+audio.cpp/assets/
+audio.cpp/docs/models/
+audio.cpp/examples/docker/models/
+audio.cpp/webui/native/demo_voices/
+CrispASR/Testing/
+NeMo-Speech.cpp/third_party/cpp-httplib/test/www/
+README_*.md
+
+# Source trees may carry test fixtures, local reference media, or model files;
+# none belong in this repository's history.
+.env*
+**/.env*
+*.key
+*.pem
+*.pfx
+*.bin
+*.gguf
+*.safetensors
+*.wav
+*.mp3
+
+# One-off local downloader experiments; use the documented, bounded download
+# path rather than preserving machine-specific parallel fetch helpers.
+audio.cpp/tools/fast_download.py
+audio.cpp/tools/finish_download.py

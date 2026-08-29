@@ -1,0 +1,11 @@
+{
+  "id": "chr1s4/crispasr-issue-214-gpu-backend-selection-test",
+  "title": "crispasr-issue-214-gpu-backend-selection-test",
+  "code_file": "issue214_gpu_backend_test.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "dataset_sources": ["chr1s4/crispasr-hf-token", "chr1s4/crispasr-ccache"]
+}

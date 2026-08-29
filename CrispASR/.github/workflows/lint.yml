@@ -1,0 +1,314 @@
+name: Lint
+
+# Run on every push / PR that touches C++ source, headers, or the tooling
+# configuration files themselves.  This is the CI analogue of the Python
+# black + ruff + mypy + bandit stack.
+#
+#   clang-format --dry-run  →  black / ruff-format check (style)
+#   clang-tidy              →  ruff-lint + mypy + bandit (correctness + types + security)
+#   cppcheck                →  additional static analysis (fast, no compilation needed)
+
+on:
+  push:
+    branches: [main, master, integrated_cli]
+    paths:
+      - '**.cpp'
+      - '**.h'
+      - '**.c'
+      - '.clang-format'
+      - '.clang-tidy'
+      - '.github/workflows/lint.yml'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      # README language drift check (issue #50)
+      - 'README.md'
+      - 'tools/check-readme-langs.py'
+      # Release-tooling consistency (release-consistency job). A version bump
+      # touches NONE of the C++ paths above, so without these the check would
+      # never run on the commits it exists to guard.
+      - 'VERSION'
+      - 'scripts/sync-version.py'
+      - 'scripts/bump-version.sh'
+      - 'python/pyproject.toml'
+      - 'python/crispasr/__init__.py'
+      - 'flutter/crispasr/pubspec.yaml'
+      - 'flutter/crispasr/CHANGELOG.md'
+      - 'bindings/javascript/package.json'
+      - 'crispasr/Cargo.toml'
+      - 'crispasr-sys/Cargo.toml'
+      # kaggle_harness bundled-copy sync. Without these the job could only ever
+      # fire incidentally, on some unrelated .cpp push: editing the canonical
+      # harness did not trigger it (so drift went unnoticed — 6503430b sat
+      # broken), and neither did the re-copy that fixes it (so the job could not
+      # be observed going green again). A guard that cannot run on the commits
+      # it exists to guard is not a guard.
+      - 'tools/kaggle/**/kaggle_harness.py'
+      - 'tools/kaggle/kaggle_harness.py'
+      - 'tools/check-kaggle-harness-sync.py'
+  pull_request:
+    branches: [main, master]
+    paths:
+      - '**.cpp'
+      - '**.h'
+      - '**.c'
+      - '.clang-format'
+      - '.clang-tidy'
+      - '.github/workflows/lint.yml'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      # README language drift check (issue #50)
+      - 'README.md'
+      - 'tools/check-readme-langs.py'
+      # Release-tooling consistency (release-consistency job). A version bump
+      # touches NONE of the C++ paths above, so without these the check would
+      # never run on the commits it exists to guard.
+      - 'VERSION'
+      - 'scripts/sync-version.py'
+      - 'scripts/bump-version.sh'
+      - 'python/pyproject.toml'
+      - 'python/crispasr/__init__.py'
+      - 'flutter/crispasr/pubspec.yaml'
+      - 'flutter/crispasr/CHANGELOG.md'
+      - 'bindings/javascript/package.json'
+      - 'crispasr/Cargo.toml'
+      - 'crispasr-sys/Cargo.toml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # clang-format: style check (equivalent to black / ruff-format --check)
+  # ---------------------------------------------------------------------------
+  clang-format:
+    name: clang-format (style)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install clang-format
+        # Pin the version so the same formatting verdict is produced here and
+        # when contributors run `clang-format -i` locally. Version bumps
+        # between 14 / 18 / 20 silently flip wrapping decisions and cause
+        # "it passed on my machine" drift.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-format-18
+          sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-18 100
+
+      - name: Check formatting
+        # --dry-run: report diffs without touching files.
+        # --Werror:  exit non-zero if any file would change.
+        # Scope: project-owned C++ only — skip ggml/ and bindings/ (third-party).
+        # On failure, print the offending file:line locations so contributors
+        # don't have to guess from a bare count.
+        run: |
+          clang-format --version
+          OUT=$(find src examples/cli crisp_audio \
+               \( -name '*.cpp' -o -name '*.h' -o -name '*.c' \) \
+               ! -name 'httplib.h' \
+               ! -name 'miniaudio.h' \
+               ! -name 'json.hpp' \
+               ! -name 'stb_vorbis.c' \
+               ! -path '*/coreml/*' \
+               ! -path '*/rnnoise/*' \
+               -print0 \
+          | xargs -0 clang-format --dry-run --Werror 2>&1 || true)
+          ERRORS=$(echo "$OUT" | grep -c 'error:.*clang-format' || true)
+          echo "Format violations: $ERRORS"
+          if [ "$ERRORS" -ne 0 ]; then
+            echo "--- violations ---"
+            echo "$OUT" | grep 'error:.*clang-format' | head -50
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # clang-tidy: lint + type-checking + security (ruff-lint + mypy + bandit)
+  #
+  # We run tidy via the CMake `tidy` preset so it uses the same compile flags
+  # and include paths as the real build — this prevents false positives from
+  # missing system headers or wrong C++ standard.
+  # ---------------------------------------------------------------------------
+  clang-tidy:
+    name: clang-tidy (lint / types / security)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install build tools + clang-tidy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build clang clang-tidy
+
+      - name: Configure (tidy preset)
+        # The `tidy` preset sets CMAKE_CXX_CLANG_TIDY so every TU is analysed
+        # during the build step.  We use Clang as the compiler so that clang-tidy
+        # gets the same diagnostics as the compiler it was built alongside.
+        run: |
+          cmake --preset tidy \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -G Ninja \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_BUILD_EXAMPLES=ON
+
+      - name: Build (clang-tidy fires on each TU)
+        # tee the output so the full tidy log is visible in the Actions UI even
+        # when the build succeeds; the step fails if cmake --build exits non-zero.
+        run: |
+          cmake --build build-tidy --target crispasr-lib 2>&1 | tee tidy.log
+          grep -q 'warning:' tidy.log && echo "::warning::clang-tidy warnings found" || true
+
+  # ---------------------------------------------------------------------------
+  # cppcheck: fast additional static analysis (no compilation required)
+  # Catches a complementary set of bugs vs clang-tidy.
+  # ---------------------------------------------------------------------------
+  cppcheck:
+    name: cppcheck (static analysis)
+    # Pin the runner image, not ubuntu-latest: cppcheck is apt-installed and its
+    # version tracks the image, so `ubuntu-latest` flipping (e.g. 22.04 -> 24.04)
+    # silently changes which findings fire and can turn Lint red with NO code
+    # change (clang-format is version-pinned for exactly this reason). 22.04
+    # ships cppcheck 2.7; bump this line deliberately when adopting a new version.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cppcheck
+          cppcheck --version   # record the pinned version in the log
+
+      - name: Run cppcheck
+        # --error-exitcode=1: fail on any error-level finding.
+        # --enable=warning,style,performance,portability: broad coverage.
+        # --suppress=*:ggml/*: skip third-party ggml code.
+        # --std=c++17: match the codebase standard.
+        run: |
+          cppcheck \
+            --error-exitcode=1 \
+            --enable=warning,performance,portability \
+            --inline-suppr \
+            --std=c++17 \
+            --suppress=missingIncludeSystem \
+            --suppress=unmatchedSuppression \
+            --suppress=duplicateAssignExpression \
+            -i ggml \
+            -i bindings \
+            --suppress='*:examples/server/*' \
+            --suppress='*:*httplib.h' \
+            --suppress='*:*json.hpp' \
+            --suppress='*:src/miniaudio.h' \
+            --suppress='*:*miniaudio.h' \
+            --suppress='*:*stb_vorbis.c' \
+            --suppress='*:*rnnoise/*' \
+            --suppress=unknownMacro \
+            --suppress=nullPointerOutOfMemory \
+            --suppress=nullPointerArithmeticOutOfMemory \
+            --suppress=toomanyconfigs \
+            --suppress=invalidFunctionArg \
+            --quiet \
+            src/ examples/cli/ crisp_audio/
+
+  # ---------------------------------------------------------------------------
+  # README language metadata vs upstream model cards (regression catcher
+  # for issue #50: granite-4.1-plus / -nar / -3.3-2b copy-pasted `ja` into
+  # the language column from a base row that DID support Japanese, and
+  # nothing in lint or test caught the drift). Fetches each HF model link
+  # in the README's model table and asserts our language column matches
+  # the upstream card's `language:` frontmatter.
+  # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Every tools/kaggle/<kernel>/ bundles its own kaggle_harness.py as the
+  # clone-failure fallback (CPU workers have no internet). Nothing kept them in
+  # sync: on 2026-07-20 there were 4 distinct versions across 53 files. The
+  # drift only bites when the in-kernel git clone fails, so it stays invisible
+  # until the one run that needs the fallback. Pure file hashing — no build.
+  # ---------------------------------------------------------------------------
+  kaggle-harness-sync:
+    name: kaggle_harness bundled-copy sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Check bundled harness copies match canonical
+        run: python tools/check-kaggle-harness-sync.py
+
+  # The wiring audit checks a registry ROW EXISTS; nothing checked the URL
+  # resolves. A registry entry naming a HuggingFace repo that had never been
+  # created shipped to main and `-m auto` would have 404'd (tabcnn, 2026-07-20).
+  # Network-dependent and third-party, so soft-fire like readme-langs: a flaky
+  # HF API should not block a PR.
+  registry-urls:
+    name: model-registry URLs resolve
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    # continue-on-error was REMOVED. It existed because the checker exited 1 on
+    # any unreachable URL, including a transient HF connection reset — but it
+    # also meant this job could never go red, so a genuinely deleted model would
+    # have been reported in a log nobody opens. check-registry-urls.py now fails
+    # only on 404/410 (a server that answered "gone") and downgrades timeouts,
+    # resets and 5xx to warnings, so the job can be strict without being flaky.
+    steps:
+      - uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: HEAD every registry download URL
+        run: python tools/check-registry-urls.py --jobs 8 --timeout 25
+
+  # Release tooling only ever ran at release time, so its bugs stayed invisible
+  # until a release was half-published: v0.8.24 was first tagged with
+  # crispasr.__version__ still reading 0.8.23 (bump-version.sh's staged file list
+  # had drifted from sync-version.py), and 0.8.23 never reached pub.dev at all
+  # because the Flutter CHANGELOG lacked its version. Both are now a red check on
+  # the commit that causes them. No network, no models — a few seconds.
+  release-consistency:
+    name: version files agree with VERSION
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Every versioned file matches VERSION
+        run: python scripts/sync-version.py --check
+
+  readme-langs:
+    name: README language metadata
+    runs-on: ubuntu-latest
+    # Soft-fire on schedule + push to main so a flaky HF API doesn't
+    # block PRs. The job is best-effort: missing upstream metadata or
+    # network errors degrade to "skip" without failing the lint.
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install huggingface_hub
+        run: pip install --quiet 'huggingface_hub>=0.20'
+
+      - name: Check README language columns vs HF cards
+        env:
+          # Authenticated requests get higher rate limits; the secret is
+          # optional — anonymous hits work for public repos.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python tools/check-readme-langs.py

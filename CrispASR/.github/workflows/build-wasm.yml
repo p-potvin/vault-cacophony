@@ -1,0 +1,81 @@
+name: Build WASM
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'ggml/**'
+      - 'bindings/javascript/**'
+      - 'crisp_audio/**'
+      - 'CMakeLists.txt'
+      - 'build-wasm.sh'
+      - '.github/workflows/build-wasm.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-wasm:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Multithreaded (SharedArrayBuffer). Works in Node; DEADLOCKS in a browser
+          # worker (pthread_join on the servicer thread) — kept for Node/parity.
+          - name: default
+            flag: ''
+          # Single-threaded: no pthreads, no COOP/COEP needed. Slower but always works.
+          - name: single-thread
+            flag: '--single-thread'
+          # PROXY_TO_PTHREAD: multithreaded AND browser-safe (compute runs on the
+          # proxied pthread; the servicer worker never blocks). The one to host.
+          - name: proxy-to-pthread
+            flag: '--proxy-to-pthread'
+    name: build-wasm (${{ matrix.name }})
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup emsdk
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          # Pin: emscripten 6.0.3 (2026-07-14) regressed the WASM backend — clang
+          # crashes in isKnownNeverNaN during WebAssembly ISel of
+          # voxtral_tts_synthesize (unchanged source). 6.0.2 is the last good one.
+          version: 6.0.2
+
+      - name: Build WASM (${{ matrix.name }})
+        run: ./build-wasm.sh --clean ${{ matrix.flag }}
+
+      - name: Verify output
+        run: |
+          ls -lh build-wasm/bin/libwhisper.js build-wasm/bin/libwhisper.wasm
+          echo "JS size:   $(wc -c < build-wasm/bin/libwhisper.js) bytes"
+          echo "WASM size: $(wc -c < build-wasm/bin/libwhisper.wasm) bytes"
+          # Sanity: WASM binary should be < 10 MB (all backends), JS < 200 KB
+          [ "$(wc -c < build-wasm/bin/libwhisper.wasm)" -lt 10485760 ] || (echo "WASM too large" && exit 1)
+          # The proxy build must export the async, deadlock-free synth entry.
+          if [ "${{ matrix.name }}" = "proxy-to-pthread" ]; then
+            grep -q "ttsSynthesizeAsync" build-wasm/bin/libwhisper.wasm || \
+              (echo "proxy build missing ttsSynthesizeAsync export" && exit 1)
+          fi
+          # §166 build-verify: the backend-agnostic ASR session surface
+          # (asrOpen/asrClose/asrSet*) must actually compile + export in the
+          # WASM binding — it was added by inspection only (emsdk was broken on
+          # the dev box) and never had a build gate. asrOpen is the entry point;
+          # its presence proves the whole asr* Embind surface built.
+          grep -q "asrOpen" build-wasm/bin/libwhisper.wasm || \
+            (echo "WASM build missing asrOpen export (§166 asr* session surface)" && exit 1)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: crispasr-wasm-${{ matrix.name }}
+          path: |
+            build-wasm/bin/libwhisper.js
+            build-wasm/bin/libwhisper.wasm
+          retention-days: 30

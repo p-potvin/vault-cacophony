@@ -1,0 +1,6 @@
+[submodule "ggml"]
+	path = ggml
+	url = https://github.com/CrispStrobe/ggml.git
+[submodule "third_party/c2pa-audio"]
+	path = third_party/c2pa-audio
+	url = https://github.com/CrispStrobe/c2pa-audio

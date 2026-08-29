@@ -1,0 +1,520 @@
+// phonemizer.cpp — pluggable text-to-phoneme backends.
+
+#include "phonemizer.h"
+#include "espeak_dlopen.h"
+#include "core/g2p_en.h"
+#include "core/g2p_inflect.h" // #316: pronounce regular inflections from their stems
+#include "core/g2p_de.h"
+#include "core/g2p_fr.h"
+#include "core/g2p_es.h"
+// Auto-download support — only when compiled as part of crispasr-lib.
+// Unit tests compile phonemizer.cpp standalone without the cache library.
+#ifdef CRISPASR_BUILD
+#include "crispasr_cache.h"
+#define CRISPASR_HAS_CACHE 1
+#endif
+
+// OLaPh (MIT) and open-dict-data (CC-BY-SA) URL templates.
+// CRISPASR_G2P_DICT_SOURCE env var selects provider:
+//   "olaph"      → OLaPh (MIT, iisys-hof/olaph) — default
+//   "open-dict"  → open-dict-data (CC-BY-SA, Wiktionary-sourced)
+struct g2p_dict_urls {
+    const char* olaph_file;
+    const char* olaph_url;
+    const char* opendict_file;
+    const char* opendict_url;
+};
+
+// Dict URLs: espeak-generated dicts (piper-compatible IPA, primary) +
+// OLaPh MIT dicts (fallback) + open-dict-data CC-BY-SA (alt fallback).
+// espeak dicts are pre-generated IPA from espeak-ng — factual phonetic data,
+// not GPL-covered (same as GCC output not being GPL).
+static const g2p_dict_urls G2P_URLS_DE = {
+    "espeak_de.tsv",
+    "https://huggingface.co/datasets/cstr/g2p-dicts/resolve/main/espeak_de.tsv",
+    "olaph_de.txt",
+    "https://huggingface.co/datasets/cstr/g2p-dicts/resolve/main/olaph_de.txt",
+};
+static const g2p_dict_urls G2P_URLS_FR = {
+    "espeak_fr.tsv",
+    "https://huggingface.co/datasets/cstr/g2p-dicts/resolve/main/espeak_fr.tsv",
+    "olaph_fr.txt",
+    "https://huggingface.co/datasets/cstr/g2p-dicts/resolve/main/olaph_fr.txt",
+};
+static const g2p_dict_urls G2P_URLS_ES = {
+    "espeak_es.tsv",
+    "https://huggingface.co/datasets/cstr/g2p-dicts/resolve/main/espeak_es.tsv",
+    "olaph_es.txt",
+    "https://huggingface.co/datasets/cstr/g2p-dicts/resolve/main/olaph_es.txt",
+};
+static const g2p_dict_urls G2P_URLS_IT = {
+    "olaph_it.txt",
+    "https://raw.githubusercontent.com/iisys-hof/olaph/main/src/olaph/dictionaries/it/it.txt",
+    nullptr,
+    nullptr,
+};
+static const g2p_dict_urls G2P_URLS_NL = {
+    "olaph_nl.txt",
+    "https://raw.githubusercontent.com/iisys-hof/olaph/main/src/olaph/dictionaries/nl/nl.txt",
+    nullptr,
+    nullptr,
+};
+static const g2p_dict_urls G2P_URLS_PT = {
+    nullptr,
+    nullptr,
+    "ipa_dict_pt.txt",
+    "https://raw.githubusercontent.com/open-dict-data/ipa-dict/refs/heads/master/data/pt.txt",
+};
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
+
+// Global dict source override (set by CLI --g2p-dict or env var)
+static std::string g_dict_source_override;
+
+void phonemizer_set_dict_source(const std::string& source) {
+    g_dict_source_override = source;
+}
+
+// Check if user prefers open-dict-data over OLaPh
+static bool prefer_opendict() {
+    if (!g_dict_source_override.empty())
+        return g_dict_source_override == "open-dict";
+    const char* src = std::getenv("CRISPASR_G2P_DICT_SOURCE");
+    return src && std::string(src) == "open-dict";
+}
+
+// Try loading a dict from cache, with auto-download fallback.
+// Returns number of entries loaded (0 = not found).
+template <typename Dict>
+static int try_load_dict(Dict& dict, const char* env_var, const g2p_dict_urls& urls,
+                         int (*loader)(Dict&, const std::string&)) {
+    // 1. Env var override
+    const char* env = std::getenv(env_var);
+    if (env && *env) {
+        int n = loader(dict, env);
+        if (n > 0)
+            return n;
+    }
+    // 2. Local cache (check both providers)
+    const char* home = std::getenv("HOME");
+    if (!home)
+        home = std::getenv("USERPROFILE");
+    if (home) {
+        std::string base = std::string(home) + "/.cache/crispasr/";
+        if (urls.olaph_file) {
+            int n = loader(dict, base + urls.olaph_file);
+            if (n > 0)
+                return n;
+        }
+        if (urls.opendict_file) {
+            int n = loader(dict, base + urls.opendict_file);
+            if (n > 0)
+                return n;
+        }
+    }
+#ifdef CRISPASR_HAS_CACHE
+    // 3. Auto-download
+    bool use_od = prefer_opendict();
+    const char* file = nullptr;
+    const char* url = nullptr;
+    if (use_od && urls.opendict_url) {
+        file = urls.opendict_file;
+        url = urls.opendict_url;
+    } else if (urls.olaph_url) {
+        file = urls.olaph_file;
+        url = urls.olaph_url;
+    } else if (urls.opendict_url) {
+        file = urls.opendict_file;
+        url = urls.opendict_url;
+    }
+    if (file && url) {
+        std::string path = crispasr_cache::ensure_cached_file(file, url, /*quiet=*/true, "crispasr", "");
+        if (!path.empty())
+            return loader(dict, path);
+    }
+#endif
+    return 0;
+}
+
+namespace crispasr {
+
+// ── Built-in English G2P (LTS rules + optional CMUdict/neural) ───────
+
+static g2p_en::context g_g2p_ctx;
+static std::mutex g_g2p_mu;
+static bool g_g2p_cmudict_tried = false;
+
+// Try to auto-load CMUdict on first use.
+static void ensure_neural_g2p_loaded() {
+    if (g_g2p_ctx.neural.loaded)
+        return;
+    const char* env = std::getenv("CRISPASR_G2P_MODEL_PATH");
+    if (env && *env) {
+        if (g2p_en::load_neural_g2p_file(g_g2p_ctx.neural, env))
+            fprintf(stderr, "g2p: loaded neural G2P model from %s\n", env);
+        return;
+    }
+    // Try cache dir
+    const char* home = std::getenv("HOME");
+    if (!home)
+        home = std::getenv("USERPROFILE");
+    if (home) {
+        std::string p = std::string(home) + "/.cache/crispasr/g2p_en.json";
+        if (g2p_en::load_neural_g2p_file(g_g2p_ctx.neural, p))
+            fprintf(stderr, "g2p: loaded neural G2P model from %s\n", p.c_str());
+    }
+}
+
+static void ensure_cmudict_loaded() {
+    if (g_g2p_ctx.dict.loaded || g_g2p_cmudict_tried)
+        return;
+    g_g2p_cmudict_tried = true;
+
+    // Check env var first
+    const char* env = std::getenv("CRISPASR_CMUDICT_PATH");
+    if (env && *env) {
+        int n = g2p_en::load_cmudict_file(g_g2p_ctx.dict, env);
+        if (n > 0) {
+            fprintf(stderr, "g2p: loaded CMUdict (%d entries) from %s\n", n, env);
+            return;
+        }
+    }
+
+    // Try local cache dir
+    const char* home = std::getenv("HOME");
+    if (!home)
+        home = std::getenv("USERPROFILE");
+    if (home) {
+        std::string cache_path = std::string(home) + "/.cache/crispasr/cmudict.dict";
+        int n = g2p_en::load_cmudict_file(g_g2p_ctx.dict, cache_path);
+        if (n > 0) {
+            fprintf(stderr, "g2p: loaded CMUdict (%d entries) from %s\n", n, cache_path.c_str());
+            return;
+        }
+    }
+#ifdef CRISPASR_HAS_CACHE
+    // Auto-download (BSD license, public domain data)
+    static const char* CMUDICT_URL =
+        "https://raw.githubusercontent.com/cmusphinx/cmudict/refs/heads/master/cmudict.dict";
+    std::string path = crispasr_cache::ensure_cached_file("cmudict.dict", CMUDICT_URL, /*quiet=*/true, "crispasr", "");
+    if (!path.empty()) {
+        int n = g2p_en::load_cmudict_file(g_g2p_ctx.dict, path);
+        if (n > 0) {
+            fprintf(stderr, "g2p: loaded CMUdict (%d entries) from %s\n", n, path.c_str());
+            return;
+        }
+    }
+#endif
+}
+
+// ── misaki lexicon (Kokoro) ──────────────────────────────────────────
+//
+// #316: Kokoro was trained on misaki's output, and our CMUdict-based G2P agrees
+// with misaki on only ~58% of words — not because the conversion is wrong but
+// because CMUdict makes different stress and unstressed-vowel choices. misaki
+// ships its own lexicon (Apache-2.0); loading it as Tier 0 of a SEPARATE
+// context takes agreement to ~94% on ordinary prose. Separate because piper
+// must keep the espeak pronunciations: same G2P, different consumer.
+//
+// Generate the file with tools/convert-misaki-lexicon.py.
+static g2p_en::context g_g2p_misaki_ctx;
+static std::mutex g_g2p_misaki_mu;
+static bool g_g2p_misaki_tried = false;
+
+static void ensure_misaki_lexicon_loaded() {
+    if (g_g2p_misaki_tried)
+        return;
+    g_g2p_misaki_tried = true;
+    std::string path;
+    if (const char* env = std::getenv("CRISPASR_MISAKI_DICT_PATH"); env && *env) {
+        path = env;
+    } else {
+        const char* home = std::getenv("HOME");
+        if (!home)
+            home = std::getenv("USERPROFILE");
+        if (home)
+            path = std::string(home) + "/.cache/crispasr/misaki-us.txt";
+    }
+    if (!path.empty()) {
+        // A .json path is misaki's own file; anything else is the TSV that
+        // tools/convert-misaki-lexicon.py emits.
+        const bool is_json = path.size() > 5 && path.compare(path.size() - 5, 5, ".json") == 0;
+        int n = is_json ? g2p_en::load_misaki_json(g_g2p_misaki_ctx.espeak_ipa, g_g2p_misaki_ctx.phrase_final, path)
+                        : g2p_en::load_ipa_dict_file(g_g2p_misaki_ctx.espeak_ipa, path);
+        if (n > 0) {
+            g_g2p_misaki_ctx.espeak_ipa.loaded = true;
+            g_g2p_misaki_ctx.phrase_final.loaded = !g_g2p_misaki_ctx.phrase_final.entries.empty();
+            fprintf(stderr, "g2p: loaded misaki lexicon (%d entries) from %s\n", n, path.c_str());
+        }
+    }
+#ifdef CRISPASR_HAS_CACHE
+    if (!g_g2p_misaki_ctx.espeak_ipa.loaded) {
+        // Fetch from UPSTREAM, not from a CrispASR mirror. The user receives the
+        // lexicon from hexgrad/misaki under hexgrad's own terms, so CrispASR
+        // redistributes nothing and no relicensing question arises — the same
+        // route ensure_cmudict_loaded() already uses for cmusphinx/cmudict.
+        //
+        // Pinned to a commit: `main` can change a pronunciation under us, and a
+        // G2P that shifts silently between runs is not reproducible.
+        //
+        // misaki is Apache-2.0. Its lexicon is largely espeak-ng-generated
+        // (measured 2026-07-28: silver 87% identical to espeak `en-us` output,
+        // gold 48%) — the same category as the espeak_*.tsv dicts above, which
+        // this file already treats as factual phonetic data rather than
+        // GPL-covered.
+        static const char* MISAKI_REV = "fba1236595f2d2bf21d414ba6e57d25256afada3";
+        const std::string base =
+            std::string("https://raw.githubusercontent.com/hexgrad/misaki/") + MISAKI_REV + "/misaki/data/";
+        int total = 0;
+        // gold FIRST so it wins: load_misaki_json keeps the first entry seen.
+        for (const char* which : {"us_gold.json", "us_silver.json"}) {
+            std::string p2 = crispasr_cache::ensure_cached_file(std::string("misaki-") + which, base + which,
+                                                                /*quiet=*/true, "crispasr", "");
+            if (p2.empty())
+                continue;
+            total += g2p_en::load_misaki_json(g_g2p_misaki_ctx.espeak_ipa, g_g2p_misaki_ctx.phrase_final, p2);
+        }
+        if (total > 0) {
+            g_g2p_misaki_ctx.espeak_ipa.loaded = true;
+            g_g2p_misaki_ctx.phrase_final.loaded = !g_g2p_misaki_ctx.phrase_final.entries.empty();
+            fprintf(stderr, "g2p: misaki lexicon %d entries (%zu phrase-final) from hexgrad/misaki@%.7s\n", total,
+                    g_g2p_misaki_ctx.phrase_final.entries.size(), MISAKI_REV);
+        }
+    }
+#endif
+    // #316: the lexicon stores STEMS — only 46% of inflected forms are listed
+    // verbatim (CMUdict lists 100%, which is why the espeak path does not need
+    // this). Without the fallback every plural and past tense dropped to
+    // CMUdict and lost the agreement with Kokoro's training data. Worth +9.7
+    // points of whole-word phoneme agreement with misaki.
+    g_g2p_misaki_ctx.inflect_fallback = [](const std::string& w) -> std::string {
+        core_g2p_inflect::Params p;
+        p.reduced_vowel = "ᵻ"; // misaki's reduced vowel
+        p.flap = "T";          // misaki's flap
+        return core_g2p_inflect::inflect(
+            w,
+            [](const std::string& stem) -> std::string {
+                auto it = g_g2p_misaki_ctx.espeak_ipa.entries.find(stem);
+                return it == g_g2p_misaki_ctx.espeak_ipa.entries.end() ? std::string() : it->second;
+            },
+            p);
+    };
+
+    // Words outside the lexicon still need SOME pronunciation; reuse the same
+    // CMUdict + LTS tiers the default path uses.
+    g2p_en::load_cmudict_file(g_g2p_misaki_ctx.dict, [] {
+        if (const char* e = std::getenv("CRISPASR_CMUDICT_PATH"); e && *e)
+            return std::string(e);
+        const char* home = std::getenv("HOME");
+        if (!home)
+            home = std::getenv("USERPROFILE");
+        return home ? std::string(home) + "/.cache/crispasr/cmudict.dict" : std::string();
+    }());
+}
+
+// True when the misaki lexicon is actually available — callers fall back to
+// phonemize_builtin_en() otherwise rather than silently using worse data.
+bool misaki_lexicon_available() {
+    std::lock_guard<std::mutex> g(g_g2p_misaki_mu);
+    ensure_misaki_lexicon_loaded();
+    return g_g2p_misaki_ctx.espeak_ipa.loaded;
+}
+
+bool phonemize_misaki_en(const std::string& lang, const std::string& text, std::string& out) {
+    if (!lang.empty() && lang.find("en") == std::string::npos && lang != "auto")
+        return false;
+    {
+        std::lock_guard<std::mutex> g(g_g2p_misaki_mu);
+        ensure_misaki_lexicon_loaded();
+        if (!g_g2p_misaki_ctx.espeak_ipa.loaded)
+            return false;
+        out = g2p_en::text_to_ipa(g_g2p_misaki_ctx, text);
+    }
+    return !out.empty();
+}
+
+bool phonemize_builtin_en(const std::string& lang, const std::string& text, std::string& out) {
+    // Only handles English
+    if (!lang.empty() && lang.find("en") == std::string::npos && lang != "auto")
+        return false;
+    {
+        std::lock_guard<std::mutex> g(g_g2p_mu);
+        ensure_cmudict_loaded();
+        ensure_neural_g2p_loaded();
+    }
+    out = g2p_en::text_to_ipa(g_g2p_ctx, text);
+    return !out.empty();
+}
+
+// ── Built-in German G2P (LTS rules + optional IPA dictionary) ────────
+
+static g2p_de::context g_g2p_de_ctx;
+static std::mutex g_g2p_de_mu;
+static bool g_g2p_de_tried = false;
+
+static void ensure_de_dict_loaded() {
+    if (g_g2p_de_ctx.dict.loaded || g_g2p_de_tried)
+        return;
+    g_g2p_de_tried = true;
+    int n = try_load_dict(g_g2p_de_ctx.dict, "CRISPASR_DE_DICT_PATH", G2P_URLS_DE, g2p_de::load_ipa_dict_file);
+    if (n > 0)
+        fprintf(stderr, "g2p: loaded German IPA dict (%d entries)\n", n);
+}
+
+bool phonemize_builtin_de(const std::string& lang, const std::string& text, std::string& out) {
+    if (!lang.empty() && lang.find("de") == std::string::npos)
+        return false;
+    {
+        std::lock_guard<std::mutex> g(g_g2p_de_mu);
+        ensure_de_dict_loaded();
+    }
+    out = g2p_de::text_to_ipa(g_g2p_de_ctx, text);
+    return !out.empty();
+}
+
+// ── Built-in French G2P (LTS rules + optional IPA dictionary) ────────
+
+static g2p_fr::context g_g2p_fr_ctx;
+static std::mutex g_g2p_fr_mu;
+static bool g_g2p_fr_tried = false;
+
+static void ensure_fr_dict_loaded() {
+    if (g_g2p_fr_ctx.dict.loaded || g_g2p_fr_tried)
+        return;
+    g_g2p_fr_tried = true;
+    int n = try_load_dict(g_g2p_fr_ctx.dict, "CRISPASR_FR_DICT_PATH", G2P_URLS_FR, g2p_fr::load_ipa_dict_file);
+    if (n > 0)
+        fprintf(stderr, "g2p: loaded French IPA dict (%d entries)\n", n);
+}
+
+bool phonemize_builtin_fr(const std::string& lang, const std::string& text, std::string& out) {
+    if (!lang.empty() && lang.find("fr") == std::string::npos)
+        return false;
+    {
+        std::lock_guard<std::mutex> g(g_g2p_fr_mu);
+        ensure_fr_dict_loaded();
+    }
+    out = g2p_fr::text_to_ipa(g_g2p_fr_ctx, text);
+    return !out.empty();
+}
+
+// ── Built-in Spanish G2P (LTS rules + optional IPA dictionary) ───────
+
+static g2p_es::context g_g2p_es_ctx;
+static std::mutex g_g2p_es_mu;
+static bool g_g2p_es_tried = false;
+
+static void ensure_es_dict_loaded() {
+    if (g_g2p_es_ctx.dict.loaded || g_g2p_es_tried)
+        return;
+    g_g2p_es_tried = true;
+    int n = try_load_dict(g_g2p_es_ctx.dict, "CRISPASR_ES_DICT_PATH", G2P_URLS_ES, g2p_es::load_ipa_dict_file);
+    if (n > 0)
+        fprintf(stderr, "g2p: loaded Spanish IPA dict (%d entries)\n", n);
+}
+
+bool phonemize_builtin_es(const std::string& lang, const std::string& text, std::string& out) {
+    if (!lang.empty() && lang.find("es") == std::string::npos)
+        return false;
+    {
+        std::lock_guard<std::mutex> g(g_g2p_es_mu);
+        ensure_es_dict_loaded();
+    }
+    out = g2p_es::text_to_ipa(g_g2p_es_ctx, text);
+    return !out.empty();
+}
+
+// ── espeak-ng via dlopen ─────────────────────────────────────────────
+
+static std::mutex g_espeak_mu;
+static bool g_espeak_inited = false;
+static bool g_espeak_init_failed = false;
+static std::string g_espeak_voice;
+
+bool phonemize_espeak_dlopen(const std::string& lang, const std::string& text, std::string& out) {
+    std::lock_guard<std::mutex> g(g_espeak_mu);
+    if (g_espeak_init_failed)
+        return false;
+
+    auto& dl = espeak_dl_get();
+    if (!g_espeak_inited) {
+        if (!dl.load())
+            return false;
+        const char* data_path = std::getenv("CRISPASR_ESPEAK_DATA_PATH");
+        int sr = dl.Initialize(CRISPASR_ESPEAK_AUDIO_OUTPUT_SYNCHRONOUS, 0, data_path,
+                               CRISPASR_ESPEAK_INITIALIZE_PHONEME_IPA | CRISPASR_ESPEAK_INITIALIZE_DONT_EXIT);
+        if (sr < 0) {
+            g_espeak_init_failed = true;
+            return false;
+        }
+        g_espeak_inited = true;
+    }
+    if (!dl.loaded)
+        return false;
+    if (g_espeak_voice != lang) {
+        if (dl.SetVoiceByName(lang.c_str()) != 0)
+            return false;
+        g_espeak_voice = lang;
+    }
+    out.clear();
+    const void* tp = text.c_str();
+    while (tp) {
+        const char* chunk = dl.TextToPhonemes(&tp, CRISPASR_ESPEAK_CHARS_UTF8, 0x02);
+        if (chunk && *chunk) {
+            if (!out.empty())
+                out += ' ';
+            out += chunk;
+        }
+    }
+    strip_espeak_lang_markers(out);
+    return !out.empty();
+}
+
+// ── espeak-ng via popen ──────────────────────────────────────────────
+
+bool phonemize_espeak_popen(const std::string& lang, const std::string& text, std::string& out) {
+#ifdef _WIN32
+#define PHON_POPEN _popen
+#define PHON_PCLOSE _pclose
+    const char* redir = " 2>NUL";
+#else
+#define PHON_POPEN popen
+#define PHON_PCLOSE pclose
+    const char* redir = " 2>/dev/null";
+#endif
+    std::string cmd = "espeak-ng -q --ipa=3 -v ";
+    cmd += lang;
+    cmd += " '";
+    for (char c : text) {
+        if (c == '\'')
+            cmd += "'\\''";
+        else
+            cmd += c;
+    }
+    cmd += "'";
+    cmd += redir;
+    FILE* fp = PHON_POPEN(cmd.c_str(), "r");
+    if (!fp)
+        return false;
+    out.clear();
+    char buf[256];
+    while (fgets(buf, sizeof(buf), fp)) {
+        size_t len = strlen(buf);
+        while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+            len--;
+        if (!out.empty() && len > 0)
+            out += ' ';
+        out.append(buf, len);
+    }
+    PHON_PCLOSE(fp);
+    strip_espeak_lang_markers(out);
+    return !out.empty();
+#undef PHON_POPEN
+#undef PHON_PCLOSE
+}
+
+} // namespace crispasr

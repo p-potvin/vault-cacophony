@@ -1,0 +1,47 @@
+# Fast, on-demand Windows CUDA compile probe (#302). Configures ggml-cuda with a
+# chosen CMAKE_CUDA_ARCHITECTURES and compiles a couple of ggml-cuda kernels —
+# just enough to hit (or clear) the `nvcc fatal: A single input file is required
+# for a non-link phase` that dropped crispasr-windows-x86_64-cuda from v0.8.23.
+# Dispatch with different arch strings to isolate whether Pascal/Volta (sm_60/61/70)
+# can go back on Windows now that /bigobj is guarded to C/CXX (not nvcc).
+name: Windows CUDA Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: CMAKE_CUDA_ARCHITECTURES
+        required: true
+        default: "60-real;61-real;70-real;75-real;86-real;89-real;120-real;120-virtual"
+
+jobs:
+  win-cuda-smoke:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install CUDA Toolkit 12.8.0
+        uses: Jimver/cuda-toolkit@v0.2.35
+        with:
+          cuda: '12.8.0'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev", "nvrtc", "nvrtc_dev", "nvtx", "cuda_profiler_api", "visual_studio_integration"]'
+      - name: Configure + compile 2 ggml-cuda kernels (verbose)
+        shell: cmd
+        run: |
+          for /f "tokens=*" %%i in ('"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath') do set VSINSTALL=%%i
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat"
+          echo === ARCH: ${{ inputs.arch }} ===
+          cmake -S . -B build -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="${{ inputs.arch }}" ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON ^
+            -DCRISPASR_OPUS_FETCH=ON || exit /b 1
+          echo === compiling acc.cu + add-id.cu (verbose shows the nvcc command) ===
+          cmake --build build --verbose -- ^
+            ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/acc.cu.obj ^
+            ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/add-id.cu.obj || exit /b 1
+          echo === WIN_CUDA_SMOKE_OK arch='${{ inputs.arch }}' ===

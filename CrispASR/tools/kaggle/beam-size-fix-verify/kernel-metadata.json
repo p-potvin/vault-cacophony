@@ -1,0 +1,14 @@
+{
+  "id": "chr1str/crispasr-beam-size-fix-verify",
+  "title": "CrispASR beam-size fix verify (issue 161)",
+  "code_file": "beam-size-fix-verify.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "dataset_sources": ["chr1str/crispasr-hf-token"],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

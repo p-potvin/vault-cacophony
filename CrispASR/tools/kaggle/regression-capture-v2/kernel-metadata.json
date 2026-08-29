@@ -1,0 +1,11 @@
+{
+  "id": "chr1s4/crispasr-regression-capture-v2",
+  "title": "crispasr-regression-capture-v2",
+  "code_file": "capture_v2.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "dataset_sources": ["chr1s4/crispasr-hf-token", "chr1s4/crispasr-ccache"]
+}

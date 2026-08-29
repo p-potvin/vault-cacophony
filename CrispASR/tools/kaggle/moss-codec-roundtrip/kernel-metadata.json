@@ -1,0 +1,14 @@
+{
+  "id": "chr1str/crispasr-moss-codec-roundtrip",
+  "title": "crispasr moss codec roundtrip",
+  "code_file": "crispasr-moss-codec-roundtrip.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_internet": "true",
+  "competition_sources": [],
+  "dataset_sources": ["chr1str/crispasr-hf-token", "chr1str/crispasr-ccache"],
+  "kernel_sources": [],
+  "model_sources": []
+}
