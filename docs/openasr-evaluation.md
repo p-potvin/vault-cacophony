@@ -56,6 +56,23 @@ from datasets import load_dataset
 dataset = load_dataset("hf-audio/open-asr-leaderboard", "librispeech", split="test", streaming=True)
 ```
 
+## Audio Flamingo smoke subset
+
+The first local model check is deliberately five serial rows from the downloaded
+LibriSpeech test-clean parquet. Each row is written to a temporary audio file
+and passed through `audio_flamingo.py`, preserving that wrapper's 29-second ASR
+chunk boundary. The runner stops immediately on a model error or empty output.
+
+```powershell
+G:\OpenASR\.venv\Scripts\python.exe scripts\run_openasr_af3_subset.py `
+  --parquet G:\OpenASR\open-asr-leaderboard\librispeech\test.clean-00000-of-00001.parquet `
+  --output G:\OpenASR\results\af3-librispeech-clean-smoke.jsonl `
+  --limit 5
+
+G:\OpenASR\.venv\Scripts\python.exe scripts\evaluate_openasr.py `
+  --input G:\OpenASR\results\af3-librispeech-clean-smoke.jsonl
+```
+
 ## Input manifest
 
 Provide UTF-8 JSONL. Every non-empty row requires `reference` and `prediction`.
