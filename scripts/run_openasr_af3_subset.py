@@ -25,7 +25,7 @@ def records(parquet_path: Path, limit: int | None, offset: int = 0) -> Iterator[
     emitted = 0
     skipped = 0
     source = pq.ParquetFile(parquet_path)
-    for batch in source.iter_batches(batch_size=min(limit, 32)):
+    for batch in source.iter_batches(batch_size=min(limit or 32, 32)):
         for record in batch.to_pylist():
             if skipped < offset:
                 skipped += 1
