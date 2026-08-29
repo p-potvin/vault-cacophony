@@ -73,6 +73,15 @@ G:\OpenASR\.venv\Scripts\python.exe scripts\evaluate_openasr.py `
   --input G:\OpenASR\results\af3-librispeech-clean-smoke.jsonl
 ```
 
+After the five-row smoke pass succeeds, extend it without re-running those rows:
+
+```powershell
+G:\OpenASR\.venv\Scripts\python.exe scripts\run_openasr_af3_subset.py `
+  --parquet G:\OpenASR\open-asr-leaderboard\librispeech\test.clean-00000-of-00001.parquet `
+  --output G:\OpenASR\results\af3-librispeech-clean-next15.jsonl `
+  --offset 5 --limit 15
+```
+
 ## Input manifest
 
 Provide UTF-8 JSONL. Every non-empty row requires `reference` and `prediction`.
