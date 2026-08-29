@@ -20,7 +20,7 @@
     route. For clean dialogue parakeet does fine without it.
 
 .PARAMETER Device
-    GPU index for crispasr (0 = RTX 3060, 1 = RTX 2060 on this box). Sets both
+    GPU index for crispasr (0 = the RTX 3060; this box is single-GPU now). Sets both
     CUDA_VISIBLE_DEVICES and GGML_VK_VISIBLE_DEVICES via crispasr's --device.
 
 .EXAMPLE

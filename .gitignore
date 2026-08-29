@@ -83,3 +83,7 @@ mini-omni
 
 # Python bytecode from the subtitle helper scripts
 __pycache__/
+
+# Local Codex orchestration state. It records machine-local run activity and
+# must not be published with the speech tooling.
+.omx/

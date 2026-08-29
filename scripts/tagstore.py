@@ -51,7 +51,7 @@ def load(path):
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("schema") == SCHEMA:
+            if isinstance(data, dict) and data.get("schema") == SCHEMA:
                 data.setdefault("tracks", {})
                 data.setdefault("cues", [])
                 return data
