@@ -1,0 +1,14 @@
+{
+  "id": "chr1str/crispasr-fc-pw-requant",
+  "title": "crispasr-fc-pw-requant",
+  "code_file": "crispasr-fc-pw-requant.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "competition_sources": [],
+  "dataset_sources": ["chr1str/crispasr-hf-token", "chr1str/crispasr-ccache"],
+  "kernel_sources": [],
+  "model_sources": []
+}

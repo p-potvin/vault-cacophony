@@ -1,9 +1,0 @@
-[submodule "CrispASR"]
-	path = CrispASR
-	url = https://github.com/p-potvin/CrispASR
-[submodule "NeMo-Speech.cpp"]
-	path = NeMo-Speech.cpp
-	url = https://github.com/NVIDIA/NeMo-Speech.cpp
-[submodule "audio.cpp"]
-	path = audio.cpp
-	url = https://github.com/0xShug0/audio.cpp

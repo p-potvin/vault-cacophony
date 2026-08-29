@@ -1,0 +1,17 @@
+{
+  "id": "chr1str/crispasr-dots-tts-gguf-conversion",
+  "title": "crispasr-dots-tts-gguf-conversion",
+  "code_file": "dots_tts_convert.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "competition_sources": [],
+  "dataset_sources": [
+    "chr1str/crispasr-hf-token",
+    "chr1str/crispasr-ccache"
+  ],
+  "kernel_sources": [],
+  "model_sources": []
+}

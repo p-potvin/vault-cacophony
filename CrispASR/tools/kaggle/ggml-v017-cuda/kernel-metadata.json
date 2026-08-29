@@ -1,0 +1,14 @@
+{
+  "id": "chr1str/crispasr-ggml-v0-17-cuda-validation",
+  "title": "CrispASR ggml v0.17 CUDA validation",
+  "code_file": "ggml_v017_cuda.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "competition_sources": [],
+  "dataset_sources": ["chr1str/crispasr-hf-token", "chr1str/crispasr-ccache"],
+  "kernel_sources": [],
+  "model_sources": []
+}

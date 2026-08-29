@@ -1,0 +1,99 @@
+# Check / trigger Kaggle regression kernels via the Kaggle CLI.
+#
+# Two uses:
+#
+#   1. Manual dispatch ("Check status") — verifies the validate and
+#      rebake kernels exist, shows their last-run status + timestamp,
+#      and warns if either hasn't run in the expected window. Does NOT
+#      download any artifacts. Useful for confirming the Kaggle
+#      scheduler is still active after a long gap.
+#
+#   2. Manual dispatch with trigger=true — pushes the current
+#      kernel bootstrap (crispasr-regression.py) to Kaggle, which
+#      triggers an immediate run AND refreshes the code. Use this
+#      after changing the bootstrap script itself.
+#
+# The Kaggle schedule itself can only be set in the Kaggle UI
+# (the CLI / API doesn't expose it). See tools/kaggle/README.md §4.
+# This workflow is the closest we can get to programmatic verification.
+#
+# Required secret: KAGGLE_API_TOKEN (raw token, ~38 bytes, from
+# kaggle.com → Settings → Account → "API token").
+
+name: Kaggle kernel status
+
+on:
+  workflow_dispatch:
+    inputs:
+      trigger_run:
+        description: 'Push bootstrap + trigger immediate run? (set to "true" to re-push)'
+        required: false
+        default: 'false'
+  schedule:
+    # Weekly on Monday at 06:00 UTC — a few hours after the Kaggle
+    # validate kernel is supposed to finish (Sun 04:00 UTC start,
+    # ~2 h typical runtime). If Kaggle's scheduler skipped the run
+    # the status check here will show the previous week's run.
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  kaggle-status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install kaggle CLI
+        run: pip install kaggle
+
+      - name: Write Kaggle credentials
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          mkdir -p ~/.kaggle
+          # Modern token format (raw token, not JSON).
+          printf '%s' "$KAGGLE_API_TOKEN" > ~/.kaggle/access_token
+          chmod 600 ~/.kaggle/access_token
+
+      - name: Check validate kernel status
+        id: validate_status
+        run: |
+          echo "=== validate kernel ==="
+          kaggle kernels status chr1str/crispasr-regression-suite || \
+            echo "WARNING: could not fetch validate kernel status (first push not done?)"
+
+      - name: Check rebake kernel status
+        id: rebake_status
+        run: |
+          echo "=== rebake kernel ==="
+          kaggle kernels status chr1str/crispasr-auto-rebake-refs || \
+            echo "WARNING: could not fetch rebake kernel status (first push not done?)"
+
+      - name: Verify URLs (no auth needed)
+        run: |
+          echo "Validate kernel: https://www.kaggle.com/code/chr1str/crispasr-regression-suite"
+          echo "Rebake kernel:   https://www.kaggle.com/code/chr1str/crispasr-auto-rebake-refs"
+          echo
+          echo "To verify the schedule is active, open each URL and check"
+          echo "Settings → 'Schedule a notebook run'. Expected:"
+          echo "  validate — Weekly · Sun · 04:00 UTC"
+          echo "  rebake   — Monthly · 1st · 04:00 UTC"
+          echo
+          echo "Progress from running kernels (public HF dataset):"
+          echo "  https://huggingface.co/datasets/cstr/crispasr-kaggle-progress"
+
+      - name: Push bootstrap + trigger run (if requested)
+        if: github.event.inputs.trigger_run == 'true'
+        run: |
+          echo "Pushing validate kernel bootstrap..."
+          kaggle kernels push -p tools/kaggle
+          echo "Done. Watch at: https://www.kaggle.com/code/chr1str/crispasr-regression-suite"
+          echo
+          echo "NOTE: re-push is only needed when crispasr-regression.py itself"
+          echo "changes (new pip deps, new env knobs). Pure C++ / manifest changes"
+          echo "are picked up automatically at runtime via git clone."

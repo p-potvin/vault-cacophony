@@ -1,0 +1,14 @@
+{
+  "id": "chr1str/crispasr-q8-quantize",
+  "title": "crispasr-q8-quantize",
+  "code_file": "crispasr-q8-quantize.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "competition_sources": [],
+  "dataset_sources": ["chr1str/crispasr-hf-token", "chr1str/crispasr-ccache"],
+  "kernel_sources": [],
+  "model_sources": []
+}

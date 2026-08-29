@@ -1,0 +1,71 @@
+name: Bindings Tests (C#)
+
+# The C# bindings had tests (bindings/csharp/CrispASR.Tests) but NOTHING in CI
+# built or ran them. That is exactly how issue #291 shipped: VadSegments'
+# doc-comment promised seconds while the code returned centiseconds, and no build
+# ever compared the two. This job compiles the binding (catching signature drift
+# against the C ABI) and runs the tests against a freshly built libcrispasr.so.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bindings/csharp/**'
+      - 'include/crispasr_session.h'
+      - 'include/crispasr.h'
+      - 'src/crispasr_c_api.cpp'
+      - '.github/workflows/bindings-csharp.yml'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'bindings/csharp/**'
+      - 'include/crispasr_session.h'
+      - 'include/crispasr.h'
+      - 'src/crispasr_c_api.cpp'
+      - '.github/workflows/bindings-csharp.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ubuntu:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install build tools
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends cmake ninja-build g++
+
+      # dotnet build alone would catch compile-time drift, but the reported bug
+      # was a LOGIC bug (wrong units) that only a run against the real library
+      # surfaces. So build libcrispasr.so and put it on the loader path.
+      - name: Build native libcrispasr.so
+        run: |
+          cmake -S . -B build-cs -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCRISPASR_BUILD_TESTS=OFF \
+            -DCRISPASR_BUILD_EXAMPLES=OFF \
+            -DCRISPASR_BUILD_SERVER=OFF \
+            -DCRISPASR_OPUS_FETCH=ON
+          cmake --build build-cs -j "$(nproc)" --target crispasr-lib
+
+      - name: Build binding (compile-time ABI check)
+        working-directory: bindings/csharp
+        run: dotnet build CrispASR/CrispASR.csproj -c Release
+
+      - name: Test
+        working-directory: bindings/csharp
+        # The DllImport name is "crispasr" → libcrispasr.so; the .NET native
+        # loader honours LD_LIBRARY_PATH. Tests that still cannot load the library
+        # (e.g. a missing model) skip themselves rather than fail, so a green run
+        # means the binding compiled AND every loadable test passed.
+        env:
+          LD_LIBRARY_PATH: ${{ github.workspace }}/build-cs/src:${{ github.workspace }}/build-cs/ggml/src
+        run: dotnet test CrispASR.Tests/CrispASR.Tests.csproj -c Release --verbosity normal

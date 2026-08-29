@@ -1,0 +1,196 @@
+// crispasr_backend_cohere.cpp — adapter for Cohere Transcribe.
+//
+// Wraps cohere_init_from_file + cohere_transcribe_ex. Cohere returns
+// per-token confidence and linearly-interpolated timestamps but no word
+// grouping, so we emit one segment per transcribe() call with tokens
+// attached.
+//
+// Cohere's punctuation toggle is set on the context params at init() time,
+// not per call, so this backend reads it from whisper_params once during init.
+// CLI --diarize is a generic post-processing pass; do not map it to Cohere's
+// experimental <|diarize|> decode prompt because that changes ASR text.
+
+#include "crispasr_backend.h"
+#include "crispasr_backend_utils.h"
+#include "whisper_params.h"
+#include "core/ngram_loop_fix.h"
+#include "core/crispasr_env.h"
+
+#include "cohere.h"
+
+#include <cstdio>
+#include <cstring>
+
+namespace {
+
+class CohereBackend : public CrispasrBackend {
+public:
+    CohereBackend() = default;
+    ~CohereBackend() override { CohereBackend::shutdown(); }
+
+    const char* name() const override { return "cohere"; }
+
+    uint32_t capabilities() const override {
+        return CAP_TIMESTAMPS_NATIVE | CAP_WORD_TIMESTAMPS | CAP_TOKEN_CONFIDENCE | CAP_DIARIZE |
+               CAP_PUNCTUATION_TOGGLE | CAP_FLASH_ATTN | CAP_TEMPERATURE | CAP_BEAM_SEARCH | CAP_PARALLEL_PROCESSORS |
+               CAP_AUTO_DOWNLOAD;
+    }
+
+    bool init(const whisper_params& p) override {
+        cohere_context_params cp = cohere_context_default_params();
+        cp.n_threads = p.n_threads;
+        // Cohere: cast-on-read is 13% faster than flash on chunked
+        // short-form (30s auto-chunks). Flash only wins on unchunked
+        // long-form (>5 min). Force flash via CRISPASR_COHERE_FLASH=1.
+        // See PERFORMANCE.md §5 (PLAN #73 closeout).
+        cp.use_flash = (getenv("CRISPASR_COHERE_FLASH") != nullptr);
+        cp.use_gpu = crispasr_backend_should_use_gpu(p);
+        cp.no_punctuation = !p.punctuation;
+        cp.diarize = false;
+        cp.verbosity = p.no_prints ? 0 : 1;
+        if (getenv("CRISPASR_VERBOSE") || crispasr_env::get("CRISPASR_COHERE_BENCH"))
+            cp.verbosity = 2;
+
+        ctx_ = cohere_init_from_file(p.model.c_str(), cp);
+        if (!ctx_) {
+            fprintf(stderr, "crispasr[cohere]: failed to load model '%s'\n", p.model.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    void warmup() override {
+        if (!ctx_)
+            return;
+        std::vector<float> silence(8000, 0.0f);
+        cohere_result* r = cohere_transcribe_ex(ctx_, silence.data(), (int)silence.size(), "en", 0);
+        if (r)
+            cohere_result_free(r);
+    }
+
+    std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
+                                             const whisper_params& params) override {
+        std::vector<crispasr_segment> out;
+        if (!ctx_)
+            return out;
+
+        // Sticky decode-time sampling controls.
+        cohere_set_temperature(ctx_, params.temperature, params.seed);
+        cohere_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
+        cohere_set_max_new_tokens(ctx_, params.max_new_tokens);
+        cohere_set_frequency_penalty(ctx_, params.frequency_penalty);
+
+        cohere_result* r = cohere_transcribe_ex(ctx_, samples, n_samples, params.language.c_str(), t_offset_cs);
+        if (!r)
+            return out;
+
+        crispasr_segment seg;
+        seg.t0 = t_offset_cs;
+        seg.t1 = t_offset_cs;
+        seg.text = core_ngram::fix_loops(r->text ? r->text : "");
+
+        seg.tokens.reserve(r->n_tokens);
+        for (int i = 0; i < r->n_tokens; i++) {
+            const auto& t = r->tokens[i];
+            crispasr_token ct;
+            ct.text = t.text;
+            ct.id = t.id;
+            ct.confidence = t.p;
+            ct.t0 = t.t0;
+            ct.t1 = t.t1;
+            seg.tokens.push_back(std::move(ct));
+        }
+
+        if (!seg.tokens.empty()) {
+            seg.t0 = seg.tokens.front().t0;
+            seg.t1 = seg.tokens.back().t1;
+        }
+
+        // Synthesize word-level timestamps by grouping adjacent tokens on
+        // leading-space boundaries. Cohere's tokenizer already converts the
+        // SentencePiece '▁' marker into a literal space in token.text, so a
+        // token that starts with ' ' is the first sub-word of a new word.
+        {
+            crispasr_word w;
+            bool have = false;
+            for (const auto& t : seg.tokens) {
+                const bool starts_word = !t.text.empty() && t.text[0] == ' ';
+                if (starts_word && have) {
+                    seg.words.push_back(std::move(w));
+                    w = {};
+                    have = false;
+                }
+                if (!have) {
+                    w.t0 = t.t0;
+                    have = true;
+                }
+                w.text += t.text;
+                w.t1 = t.t1;
+            }
+            if (have)
+                seg.words.push_back(std::move(w));
+            // Trim leading whitespace off each word text (cosmetic — the
+            // space sat there as the word-start marker).
+            for (auto& word : seg.words) {
+                while (!word.text.empty() && word.text.front() == ' ')
+                    word.text.erase(word.text.begin());
+            }
+        }
+
+        // issue #218 follow-up: fix_loops() above cleans seg.text, but
+        // seg.words was built from the raw (un-collapsed) token stream, so
+        // word-level output (SRT/VTT, JSON `words`) still shows every
+        // repeated word even once the flat text looks clean. Filter
+        // seg.words with the SAME collapse decision, in lockstep.
+        {
+            std::vector<std::string> word_texts;
+            word_texts.reserve(seg.words.size());
+            for (const auto& w : seg.words)
+                word_texts.push_back(w.text);
+            const std::vector<int> keep = core_ngram::fix_loops_keep_indices(word_texts);
+            if (keep.size() != seg.words.size()) {
+                std::vector<crispasr_word> filtered;
+                filtered.reserve(keep.size());
+                for (int idx : keep)
+                    filtered.push_back(std::move(seg.words[idx]));
+                seg.words = std::move(filtered);
+            }
+        }
+
+        // Apply the exact same logic to seg.tokens for full JSON output parity.
+        {
+            std::vector<std::string> token_texts;
+            token_texts.reserve(seg.tokens.size());
+            for (const auto& t : seg.tokens)
+                token_texts.push_back(t.text);
+            const std::vector<int> keep = core_ngram::fix_loops_keep_indices(token_texts);
+            if (keep.size() != seg.tokens.size()) {
+                std::vector<crispasr_token> filtered;
+                filtered.reserve(keep.size());
+                for (int idx : keep)
+                    filtered.push_back(std::move(seg.tokens[idx]));
+                seg.tokens = std::move(filtered);
+            }
+        }
+
+        cohere_result_free(r);
+        out.push_back(std::move(seg));
+        return out;
+    }
+
+    void shutdown() override {
+        if (ctx_) {
+            cohere_free(ctx_);
+            ctx_ = nullptr;
+        }
+    }
+
+private:
+    cohere_context* ctx_ = nullptr;
+};
+
+} // namespace
+
+std::unique_ptr<CrispasrBackend> crispasr_make_cohere_backend() {
+    return std::unique_ptr<CrispasrBackend>(new CohereBackend());
+}

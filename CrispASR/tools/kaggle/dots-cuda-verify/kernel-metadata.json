@@ -1,0 +1,14 @@
+{
+  "id": "chr1str/crispasr-dots-tts-cuda-verify",
+  "title": "CrispASR dots tts cuda verify",
+  "code_file": "crispasr-dots-cuda-verify.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "dataset_sources": ["chr1str/crispasr-hf-token", "chr1str/crispasr-ccache"],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}

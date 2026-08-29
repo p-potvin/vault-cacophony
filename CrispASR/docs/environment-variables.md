@@ -1,0 +1,1118 @@
+# Environment variables
+
+CrispASR exposes a large number of environment variables — tuning knobs, device
+placement overrides, benchmark timers, and debug/dump switches. This page is the
+single reference for all of them: the naming convention, the cross-cutting
+variables, the per-backend variables, and the ones CrispASR deliberately does
+**not** own.
+
+> This document was introduced for issue #265 ("consistency and documentation").
+> The same change standardized every backend-owned variable onto one prefix and
+> unified the reference-voice cache location (see below).
+
+## Naming convention
+
+Every CrispASR-owned variable is named:
+
+```
+CRISPASR_<BACKEND>_<FEATURE>
+```
+
+for example `CRISPASR_OMNIVOICE_CODEC_GPU`, `CRISPASR_IRODORI_CODEC_GPU`,
+`CRISPASR_PARAKEET_BENCH`. Process-global variables that are not tied to one
+backend drop the `<BACKEND>` segment (`CRISPASR_MODELS_DIR`, `CRISPASR_KV_ON_CPU`).
+
+### Legacy aliases and deprecation warnings
+
+Historically many backends used a bare prefix (`OMNIVOICE_CODEC_GPU`,
+`QWEN3_TTS_BENCH`, `CHATTERBOX_DEBUG`, …). Those bare names **still work** as
+legacy aliases so existing scripts, notebooks, and Kaggle A/B kernels keep
+running. The alias is derived automatically by stripping the `CRISPASR_` prefix,
+so for any `CRISPASR_FOO_BAR` documented here the bare `FOO_BAR` is also honored.
+
+The first time a run reads a value from a **legacy** name, CrispASR prints a
+one-time notice to stderr:
+
+```
+[crispasr] warning: environment variable 'OMNIVOICE_CODEC_GPU' is deprecated and
+will be removed in a future release; use 'CRISPASR_OMNIVOICE_CODEC_GPU' instead
+(the old name still works for now). ...
+```
+
+Migrate to the canonical `CRISPASR_`-prefixed name at your convenience. To
+silence the warnings (e.g. for a pipeline that scrapes stderr and cannot migrate
+yet), set:
+
+```
+CRISPASR_SUPPRESS_ENV_DEPRECATION=1
+```
+
+The lookup + aliasing is implemented once in `src/core/crispasr_env.h`
+(`crispasr_env::get / truthy / present`); new backends should read env vars
+through that helper with a canonical `CRISPASR_`-prefixed name.
+
+### Value/truthiness conventions
+
+Most variables are read with one of two conventions — check the surrounding
+suffix legend, but as a rule:
+
+- **Flag (opt-in)** — set to `1` (or any non-empty, non-`0` value) to enable.
+  Some legacy flags treat *being set at all* as on, so prefer `=1` / unset it
+  entirely rather than `=0` when a flag's exact semantics matter.
+- **Path / value** — the variable's value is a filesystem path, integer, or
+  float used directly.
+
+### Common suffix legend
+
+The same feature suffixes recur across nearly every backend. Rather than repeat
+them per backend below, they mean:
+
+| Suffix | Meaning |
+|--------|---------|
+| `_BENCH` | Print per-stage wall-clock timings for that engine. |
+| `_DEBUG` / `_DIAG` | Verbose debug logging. |
+| `_DUMP_DIR` / `_DUMP` / `_DUMP_*` | Write intermediate tensors / stages to disk (diagnostics, diff-harness). |
+| `_FORCE_SCALAR` | Disable SIMD kernels (numeric-parity debugging). |
+| `_GPU` / `_USE_GPU` / `_FORCE_METAL` | Force that stage/codec onto the GPU. |
+| `_CPU` / `_CPU_ONLY` / `_FORCE_CPU` | Force that stage/codec onto the CPU. |
+| `_NO_FA` / `_FLASH_ATTN` | Toggle flash-attention. |
+| `_FASTCONV` (`_DEBUG`) | Enable the baked-F32 / matmul conv fast path for a codec/vocoder. |
+| `_CFG_INTERVAL` (`_DEBUG`) | Interval-CFG cadence for a flow-matching decoder. |
+| `_SEED` | RNG seed for reproducible generation. |
+| `_*_FILE` / `_*_PATH` / `_*_GGUF` | Override an asset/model/fixture path (mostly dev/test). |
+
+## Global / cross-cutting variables
+
+These are not tied to a single backend.
+
+### Paths, cache, and models
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_MODELS_DIR` | Directory searched for GGUF models (also the auto-download target root). |
+| `CRISPASR_CACHE_DIR` | Base cache directory for auto-downloaded models/assets (default `~/.cache/crispasr`). |
+| `CRISPASR_SCRATCH_DIR` | Scratch directory for temporary run artifacts. |
+| `CRISPASR_DUMP_DIR` | Global tensor-dump directory (diagnostics). |
+| `CRISPASR_GGUF_MMAP` / `CRISPASR_GGUF_PRELOAD` | Control GGUF mmap vs. preload-into-RAM loading. |
+| `CRISPASR_MLOCK` | mlock model weights into RAM. |
+
+### GPU / device placement
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_N_GPU_LAYERS` | Number of transformer layers to offload to the GPU. |
+| `CRISPASR_ARG_DEVICE` | Default device selection for the CLI. |
+| `CRISPASR_KV_ON_CPU` | Keep the KV cache on the CPU. |
+| `CRISPASR_KV_QUANT` / `_KV_QUANT_K` / `_KV_QUANT_V` / `_KV_READ_F32` | KV-cache quantization / read format. |
+
+> Device *selection* across compiled backends also honors the standard ggml /
+> CUDA variables `CUDA_VISIBLE_DEVICES` and `GGML_VK_VISIBLE_DEVICES` — see
+> "Variables CrispASR does not own" below.
+
+### Session / long-audio chunking
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_SESSION_AUTOCHUNK` | Enable auto-chunking in the session API for long audio. |
+| `CRISPASR_SESSION_CHUNK_SECONDS` | Chunk length (seconds) for session auto-chunking. |
+| `CRISPASR_SESSION_PERBACKEND_CHUNK` | Use per-backend chunk-window tuning instead of a flat window. |
+| `CRISPASR_SESSION_UNIFIED_DISPATCH` | Route surfaces through the unified library dispatch path. |
+
+### Decoding / beam search (shared)
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_MAES_BETA` / `_MAES_GAMMA` / `_MAES_NUM_STEPS` | MAES beam-search parameters. |
+| `CRISPASR_TDT_BATCH` / `CRISPASR_RNNT_BATCH` | Batch the TDT / RNNT joint decode. |
+| `CRISPASR_RNNT_GGML_PERSTEP` | Per-step (vs. persistent-graph) ggml RNNT decode. |
+| `CRISPASR_NGRAM_LOOPFIX_OFF` | Disable the n-gram decode-loop breaker. |
+| `CRISPASR_GAP_FILL` / `_GAP_FILL_MIN_CS` | Gap-fill between segments (long audio). |
+
+### G2P / phonemizer
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_CMUDICT_PATH` | Path to the CMUdict pronunciation dictionary. |
+| `CRISPASR_DE_DICT_PATH` / `_FR_DICT_PATH` / `_ES_DICT_PATH` | Language-specific pronunciation dictionaries. |
+| `CRISPASR_G2P_DICT_SOURCE` / `_G2P_MODEL_PATH` | G2P dictionary source / neural G2P model path. |
+| `CRISPASR_ESPEAK_DATA_PATH` | eSpeak-NG data directory. |
+| `CRISPASR_KOKORO_G2P` | Kokoro G2P backend selection. |
+| `CRISPASR_KOKORO_MISAKI_IPA` | `0` disables the espeak-IPA → misaki-alphabet conversion Kokoro needs (#316), restoring the raw G2P spelling for A/B. On by default. |
+
+### Watermark / provenance
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_NO_WATERMARK` | Disable the audio watermark. |
+| `CRISPASR_WATERMARK_LEGACY` | Use the legacy watermark path. |
+| `CRISPASR_NO_C2PA_REMUX` | Skip the C2PA MP4 remux step. |
+
+### Quantization / diff-harness / misc
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_QUANT_LMHEAD` | Quantize the LM head during `crispasr-quantize`. |
+| `CRISPASR_IMATRIX_OUT` | Importance-matrix output path. |
+| `CRISPASR_ACTDUMP_OUT` / `_ACTDUMP_TENSOR` | Activation dump output / target tensor. |
+| `CRISPASR_DIFF_NO_GPU` / `_DIFF_USE_GPU` / `_DIFF_SLICES` / `_DIFF_STAGES` | `crispasr-diff` harness controls. |
+| `CRISPASR_MEL_PARALLEL` / `_MEL_TIMING` | Parallelize / time mel-spectrogram computation. |
+| `CRISPASR_VERBOSE` | Global verbose output. |
+| `CRISPASR_NO_WARMUP` / `CRISPASR_WARMUP` | Skip / force the model warmup pass. |
+| `CRISPASR_SERVER_WORKERS` / `CRISPASR_API_KEYS` | HTTP server worker count / API keys. |
+
+## Reference-voice cache (voice cloning)
+
+Encoding a reference clip for voice cloning (a codec encoder, a Conformer /
+Perceiver, or an ASR pass) is slow and produces a small, reusable blob. Every
+voice-cloning TTS backend caches that blob through **one shared mechanism**
+(`src/core/tts_ref_cache.h`), so the location and disable switch are identical
+across backends (issue #265 unified OmniVoice — which previously used a bespoke
+`~/.cache/crispasr` cache — onto this path):
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_TTS_REF_CACHE` | Set to `0` to disable reference-voice caching everywhere. |
+| `CRISPASR_TTS_REF_CACHE_DIR` | Override the cache directory (default `<TMPDIR>/crispasr-tts-refcache`). |
+
+Content-addressed entries are keyed by a hash of the raw reference (plus, for
+some backends, an encoder-weight fingerprint) and tagged per backend
+(`irodori-latent`, `openvoice2-se`, `omnivoice-voice`, `f5-reftext`, …) so no two
+backends read each other's blob. OmniVoice additionally honors the legacy
+`CRISPASR_OMNIVOICE_VOICE_CACHE=0` as an alias for the shared disable switch.
+
+## Variables CrispASR does not own
+
+These are read by CrispASR but are **OS / third-party conventions** and are
+intentionally *not* renamed to the `CRISPASR_` prefix:
+
+| Variable | Origin |
+|----------|--------|
+| `HOME`, `USERPROFILE`, `LOCALAPPDATA`, `XDG_CACHE_HOME` | OS home / cache dirs. |
+| `TMPDIR`, `TEMP`, `TMP` | OS temp dir (also the default ref-cache root). |
+| `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN` | HuggingFace auth (Hub convention). |
+| `CUDA_VISIBLE_DEVICES` | CUDA device selection. |
+| `GGML_VK_VISIBLE_DEVICES` | ggml Vulkan device selection. |
+| `LLAMA_*` | Vendored `llama.cpp` (talk-llama example). |
+
+### Sibling modular libraries (own conventions)
+
+The in-tree modular libraries keep their own established prefixes and are synced
+from their sibling repos, so their variables are **not** part of the `CRISPASR_`
+scheme:
+
+- **`crisp_audio/`** — audio tower: `CRISP_AUDIO_DUMP_STAGES`, `CRISP_AUDIO_KEEP_PAD_FRAMES`, `CRISP_AUDIO_WINDOWED_ATTN`.
+- **`glint/`** — clean-room MP3/AAC codec: `GLINT_*`, `AACDBG`.
+- **`crisp_lid/` · `crisp_punc/` · `crisp_truecase/`** — standalone LID / punctuation / truecasing libraries; they and their `src/` counterparts follow each library's own naming (`LID_*`, `FIREREDPUNC_*`, `PCS_*`, `TRUECASER_*`). `FIREREDPUNC_DEBUG=1` prints each restore pass as `[PUNCDBG] in=<…>` / `out=<…>`, which is the quickest way to see a backend's *true* model output — `--no-punctuation` is not, because it strips punctuation after the fact and so hides text the model punctuated itself.
+  > ⚠ **These libraries are built by the main target, and each has a second copy under `src/`.** `src/CMakeLists.txt` prefers `crisp_punc/` (etc.) and falls back to the `src/` copy only when the sibling directory is missing from a checkout — so the `crisp_punc/` copy is what normally links, and **a change must be applied to both**. #308's capitalisation fix went into `src/fireredpunc.cpp` alone and was dead code for months while the shipping copy kept the bug. `tests/test-punc-copies-in-sync.cpp` now fails if they diverge.
+
+## Test fixtures
+
+The live/integration test suite reads a few `CRISPASR_`-prefixed fixture
+variables (model/audio paths); `tests/env-live-tests.sh` sets sensible defaults.
+Like every other variable here, the pre-standardization bare names are still
+honored as deprecated aliases:
+
+| Variable | Purpose |
+|----------|---------|
+| `CRISPASR_PARAFORMER_MODEL` / `_PARAFORMER_MODEL_Q4K` / `_PARAFORMER_AUDIO_ZH` / `_PARAFORMER_AUDIO_EN` | Paraformer test model / audio paths. |
+| `CRISPASR_AUDIOSEAL_GGUF` | AudioSeal test model path. |
+| `CRISPASR_PIPER_TEST_MODEL` | Piper phonemize test model path. |
+| `CRISPASR_OV2_DUMP_DIR` | OpenVoice2 HiFi test dump directory. |
+| `CRISPASR_MODEL_BTC_CHORDS` | BTC chord-recognition test model path. Defaults to `$CRISPASR_MODELS_DIR/btc-chords-large-f32.gguf`. |
+
+---
+
+# Per-backend variables
+
+Every variable below is the canonical `CRISPASR_`-prefixed name; the bare form
+(without `CRISPASR_`) is accepted as a deprecated alias. See the **suffix
+legend** above for the meaning of the common `_BENCH` / `_DEBUG` / `_DUMP_*` /
+`_GPU` / `_CPU` / `_FORCE_SCALAR` / `_FASTCONV` / `_CFG_INTERVAL` / `_SEED`
+suffixes.
+
+### AAC codec
+
+- `CRISPASR_AAC_DEBUG`
+- `CRISPASR_AAC_DECODER`
+
+### ARK-ASR
+
+- `CRISPASR_ARKASR_CPU`
+- `CRISPASR_ARKASR_DEBUG_GEN`
+- `CRISPASR_ARKASR_GPU`
+- `CRISPASR_ARKASR_MAX_SINGLE_PASS_S`
+- `CRISPASR_ARKASR_NO_CHUNK_CONTEXT`
+- `CRISPASR_ARKASR_NO_EOS_SUPPRESS`
+- `CRISPASR_ARKASR_TIMING`
+
+### AudioSeal watermark
+
+- `CRISPASR_AUDIOSEAL_BENCH`
+- `CRISPASR_AUDIOSEAL_DEBUG`
+- `CRISPASR_AUDIOSEAL_DUMP_STAGES`
+
+### BananaMind TTS
+
+- `CRISPASR_BANANAMIND_DEBUG`
+- `CRISPASR_BANANAMIND_TTS_BENCH`
+
+### Bark
+
+- `CRISPASR_BARK_BENCH`
+- `CRISPASR_BARK_DECODE_CODES`
+- `CRISPASR_BARK_DUMP_DIR`
+
+### BERT encoder
+
+- `CRISPASR_BERT_ENCODER_BENCH`
+
+### BTC chord recognition
+
+- `CRISPASR_BTC_MAJ_MIN` — collapse the 170-class chord output to the 25-class
+  maj/min vocabulary. Default off (full 170-class output): 170 reduces to
+  maj/min at runtime, but a 25-class model can never be expanded, so the
+  170-class checkpoint is the shipping default.
+
+> The shipped BTC weights are **CC-BY-NC-SA** (trained on Isophonics / Robbie
+> Williams / UsPop2002 chord annotations) even though the upstream BTC code and
+> CrispASR itself are MIT. The registry refuses to download them without
+> `--accept-license cc-by-nc-sa-4.0` (or `CRISPASR_ACCEPT_LICENSE`). A
+> commercial product must supply its own weights.
+
+### Canary / Canary-CTC / Canary-Qwen
+
+- `CRISPASR_CANARY_BENCH`
+- `CRISPASR_CANARY_CTC_BENCH`
+- `CRISPASR_CANARY_QWEN_BENCH`
+- `CRISPASR_CANARY_QWEN_DEBUG`
+- `CRISPASR_CANARY_QWEN_MIN_ENC_FRAMES`
+- `CRISPASR_CANARY_QWEN_NO_ECHO_STRIP`
+- `CRISPASR_CANARY_STREAM_THRESHOLD_S`
+
+### Chatterbox
+
+- `CRISPASR_CHATTERBOX_BENCH`
+- `CRISPASR_CHATTERBOX_BENCH_B2`
+- `CRISPASR_CHATTERBOX_DEBUG`
+- `CRISPASR_CHATTERBOX_DUMP_ATTN_AT`
+- `CRISPASR_CHATTERBOX_DUMP_FFN_AT`
+- `CRISPASR_CHATTERBOX_DUMP_GPT2_LAYERS`
+- `CRISPASR_CHATTERBOX_DUMP_KPROJ_AT`
+- `CRISPASR_CHATTERBOX_DUMP_KROPE_AT`
+- `CRISPASR_CHATTERBOX_DUMP_KV_AT`
+- `CRISPASR_CHATTERBOX_DUMP_KV_LAYER`
+- `CRISPASR_CHATTERBOX_DUMP_LAYER`
+- `CRISPASR_CHATTERBOX_DUMP_LOGITS_AT`
+- `CRISPASR_CHATTERBOX_DUMP_NORM_AT`
+- `CRISPASR_CHATTERBOX_DUMP_QPROJ_AT`
+- `CRISPASR_CHATTERBOX_DUMP_VPROJ_AT`
+- `CRISPASR_CHATTERBOX_DUMP_WK`
+- `CRISPASR_CHATTERBOX_LANG`
+- `CRISPASR_CHATTERBOX_NAIVE_ATTN`
+- `CRISPASR_CHATTERBOX_SEED`
+- `CRISPASR_CHATTERBOX_SYN_TEXT`
+- `CRISPASR_CHATTERBOX_T3_BUCKET_REUSE`
+- `CRISPASR_CHATTERBOX_T3_CFG_B2`
+- `CRISPASR_CHATTERBOX_T3_CFG_BUCKET`
+- `CRISPASR_CHATTERBOX_T3_SEED`
+- `CRISPASR_CHATTERBOX_TEMP`
+- `CRISPASR_CHATTERBOX_THREADS`
+
+### Chatterbox S3Gen
+
+- `CRISPASR_S3GEN_CFG_INTERVAL`
+- `CRISPASR_S3GEN_DUMP`
+- `CRISPASR_S3GEN_DUMP_UNET`
+- `CRISPASR_S3GEN_DUMP_UNET_NO_AUTO_MARK`
+- `CRISPASR_S3GEN_FASTCONV`
+- `CRISPASR_S3GEN_FASTCONV_DEBUG`
+- `CRISPASR_S3GEN_RC_AS_MUL_MAT`
+- `CRISPASR_S3GEN_UNET_CFG_SINGLE`
+- `CRISPASR_S3GEN_UNET_CPU`
+- `CRISPASR_S3GEN_UNET_GALLOCR`
+- `CRISPASR_S3GEN_UNET_KEEP_GPU_OP`
+- `CRISPASR_S3GEN_UNET_MARK_DB_OUT`
+- `CRISPASR_S3GEN_UNET_MARK_DB_RESNET`
+- `CRISPASR_S3GEN_UNET_MARK_DB_TB`
+- `CRISPASR_S3GEN_UNET_MARK_MB_OUT`
+- `CRISPASR_S3GEN_UNET_MARK_MB_OUT_INDEX`
+- `CRISPASR_S3GEN_UNET_MARK_MB_OUT_MAX`
+- `CRISPASR_S3GEN_UNET_MARK_MB_RESNET`
+- `CRISPASR_S3GEN_UNET_PIN_CPU_OP`
+- `CRISPASR_S3GEN_UNET_PRESERVE_INTERMEDIATES`
+- `CRISPASR_S3GEN_UNET_PROBE_BLOCK1`
+- `CRISPASR_S3GEN_UNET_PROBE_DENOISER_OUT`
+- `CRISPASR_S3GEN_UNET_PROBE_INPUT_SNAPSHOT`
+- `CRISPASR_S3GEN_UNET_PROBE_RC_OUT`
+
+### Chatterbox sub-modules
+
+- `CRISPASR_CB_CAMPPLUS_BENCH`
+- `CRISPASR_CB_S3GEN_BENCH`
+- `CRISPASR_CB_S3TOK_BENCH`
+- `CRISPASR_CB_VE_BENCH`
+
+### Cohere
+
+- `CRISPASR_COHERE_BENCH`
+- `CRISPASR_COHERE_DEBUG`
+- `CRISPASR_COHERE_DEVICE`
+- `CRISPASR_COHERE_DUMP_ATTN`
+- `CRISPASR_COHERE_DUMP_ENCOUT`
+- `CRISPASR_COHERE_DUMP_MEL`
+- `CRISPASR_COHERE_DUMP_STAGES`
+- `CRISPASR_COHERE_FLASH`
+- `CRISPASR_COHERE_GAPS`
+- `CRISPASR_COHERE_LEGACY_SA`
+- `CRISPASR_COHERE_PROF`
+- `CRISPASR_COHERE_THREADS`
+
+### CosyVoice3
+
+- `CRISPASR_COSYVOICE3_BENCH`
+- `CRISPASR_COSYVOICE3_CAMPPLUS_PATH`
+- `CRISPASR_COSYVOICE3_CFG_BATCH`
+- `CRISPASR_COSYVOICE3_CFG_INTERVAL`
+- `CRISPASR_COSYVOICE3_CFG_INTERVAL_DEBUG`
+- `CRISPASR_COSYVOICE3_DUMP_TOKENS`
+- `CRISPASR_COSYVOICE3_FASTCONV`
+- `CRISPASR_COSYVOICE3_FASTCONV_DEBUG`
+- `CRISPASR_COSYVOICE3_FLOW_STEPS`
+- `CRISPASR_COSYVOICE3_HIFT_PATH`
+- `CRISPASR_COSYVOICE3_KV_BUCKET`
+- `CRISPASR_COSYVOICE3_VOICES_PATH`
+
+### CosyVoice3 (diff-harness assets)
+
+- `CRISPASR_CV3_FLOW_GGUF`
+- `CRISPASR_CV3_HIFT_GGUF`
+- `CRISPASR_CV3_S3TOK_GGUF`
+
+### CSM TTS
+
+- `CRISPASR_CSM_BENCH`
+- `CRISPASR_CSM_WAV_FRAMES`
+- `CRISPASR_CSM_WAV_OUT`
+- `CRISPASR_CSM_WAV_TEMP`
+- `CRISPASR_CSM_WAV_TEXT`
+
+### Dia TTS
+
+- `CRISPASR_DIA_BENCH`
+- `CRISPASR_DIA_DECODE_CODES`
+- `CRISPASR_DIA_DUMP_DIR`
+- `CRISPASR_DIA_DUMP_STEPLOGITS`
+- `CRISPASR_DIA_DUMP_TOKENS`
+- `CRISPASR_DIA_FORCE_TOKENS`
+- `CRISPASR_DIA_GREEDY`
+- `CRISPASR_DIA_MAX_STEPS`
+- `CRISPASR_DIA_TTS_GPU`
+
+### dots.tts
+
+- `CRISPASR_DOTS_CFG_INTERVAL`
+- `CRISPASR_DOTS_CFG_INTERVAL_DEBUG`
+- `CRISPASR_DOTS_DIFF_GPU`
+- `CRISPASR_DOTS_DIT_DEBUG`
+- `CRISPASR_DOTS_EOS_THRESHOLD`
+- `CRISPASR_DOTS_FM_AB`
+- `CRISPASR_DOTS_FM_DUMP`
+- `CRISPASR_DOTS_FUSED_STEP`
+- `CRISPASR_DOTS_MAX_PATCHES`
+- `CRISPASR_DOTS_ODE_STEPS`
+- `CRISPASR_DOTS_PENC_VERIFY`
+- `CRISPASR_DOTS_TTS_BENCH`
+- `CRISPASR_DOTS_TTS_CPU`
+- `CRISPASR_DOTS_TTS_DEBUG`
+
+### ECAPA (LID / speaker)
+
+- `CRISPASR_ECAPA_ASP_CPU`
+- `CRISPASR_ECAPA_ASP_GGML`
+- `CRISPASR_ECAPA_FORCE_SCALAR`
+- `CRISPASR_ECAPA_LID_BENCH`
+- `CRISPASR_ECAPA_REF_FBANK`
+- `CRISPASR_ECAPA_TIMING`
+
+### F5-TTS
+
+- `CRISPASR_F5_BATCH_CFG`
+- `CRISPASR_F5_BENCH`
+- `CRISPASR_F5_CFG_INTERVAL`
+- `CRISPASR_F5_DURATION_CLAMP` — clamp the per-char speech rate into a sane English band so a reference whose audio/transcript lengths are mismatched can't truncate (or balloon) the output (#294). Default on; set `0` to restore the exact upstream `ref_T / ref_text_len * gen_text_len / speed` estimate.
+- `CRISPASR_F5_FORCE_SCALAR`
+- `CRISPASR_F5_REF_MAX_SEC` — clip the reference audio to this many seconds before it drives the duration estimate (upstream parity: 12 s). Default `12`; set `0` to disable the clip.
+- `CRISPASR_F5_REF_TRIM_SILENCE` — strip leading/trailing silence and collapse internal silences >~1 s in the reference audio (upstream parity). Default on; set `0` to disable.
+
+### FastConformer (shared encoder)
+
+- `CRISPASR_FC_ATTN_CONT`
+- `CRISPASR_FC_BUCKET`
+- `CRISPASR_FC_FUSED_QKV`
+- `CRISPASR_FC_GPU_MANUAL_ATTN`
+- `CRISPASR_FC_MAX_LAYERS`
+- `CRISPASR_FC_MEM_DEBUG`
+- `CRISPASR_FC_NO_FLASH`
+- `CRISPASR_FC_PROFILE`
+- `CRISPASR_FC_PROF_FP`
+- `CRISPASR_FC_PROF_FP_COLS`
+- `CRISPASR_FC_PW_Q8`
+- `CRISPASR_FC_TILED_ATTN`
+- `CRISPASR_FC_TILED_BLOCK`
+- `CRISPASR_FC_WINDOWED_ATTN`
+- `CRISPASR_FC_WINDOW_BLOCK`
+
+### FastPitch
+
+- `CRISPASR_FASTPITCH_BENCH`
+- `CRISPASR_FASTPITCH_DUMP_DIR`
+- `CRISPASR_FASTPITCH_FORCE_TOKENS`
+
+### Ffmpeg
+
+- `CRISPASR_FFMPEG_LOG`
+
+### FireRed ASR / VAD
+
+- `CRISPASR_FIRERED_BEAM_F32`
+- `CRISPASR_FIRERED_BENCH`
+- `CRISPASR_FIRERED_ENC_CPU`
+- `CRISPASR_FIRERED_GGML_ATTN`
+- `CRISPASR_FIRERED_LID_BENCH`
+- `CRISPASR_FIRERED_MATVEC_CACHE`
+- `CRISPASR_FIRERED_NO_REPEAT_BREAK`
+- `CRISPASR_FIRERED_VAD_BENCH`
+- `CRISPASR_FIRERED_VAD_DEBUG`
+- `CRISPASR_FIRERED_VAD_FORCE_SCALAR`
+
+### FunASR / SenseVoice
+
+- `CRISPASR_FUNASR_BENCH`
+- `CRISPASR_FUNASR_DUMP_STAGES`
+- `CRISPASR_FUNASR_EMBED_FAST`
+- `CRISPASR_FUNASR_LLM_CPU`
+- `CRISPASR_FUNASR_LLM_LAYERS`
+- `CRISPASR_FUNASR_NAN_CHECK`
+- `CRISPASR_FUNASR_NO_FA`
+- `CRISPASR_FUNASR_STEP_CACHE`
+
+### Gemma-4 E2B
+
+- `CRISPASR_GEMMA4_AUTO_CHUNK`
+- `CRISPASR_GEMMA4_E2B_BENCH`
+- `CRISPASR_GEMMA4_E2B_EMBED_FAST`
+
+### GLM-ASR
+
+- `CRISPASR_GLM_ASR_BENCH`
+- `CRISPASR_GLM_ASR_DEBUG`
+- `CRISPASR_GLM_ASR_EMBED_FAST`
+- `CRISPASR_GLM_ASR_LEGACY_PROMPT`
+- `CRISPASR_GLM_ASR_SINGLE_WINDOW`
+
+### Granite speech / NLE
+
+- `CRISPASR_GRANITE_BENCH`
+- `CRISPASR_GRANITE_DEC_GALLOCR`
+- `CRISPASR_GRANITE_DEC_PROFILE`
+- `CRISPASR_GRANITE_DISABLE_ENCODER_GRAPH`
+- `CRISPASR_GRANITE_ENC_F16`
+- `CRISPASR_GRANITE_FORCE_SCALAR`
+- `CRISPASR_GRANITE_NLE_BENCH`
+- `CRISPASR_GRANITE_NLE_EDIT_DUMP`
+- `CRISPASR_GRANITE_QUANT_ALL`
+
+### HiFT vocoder
+
+- `CRISPASR_HIFT_FULL_IDFT`
+
+### HTDemucs (source separation)
+
+- `CRISPASR_HTDEMUCS_BLAS` — route the CrossTransformer matmuls through
+  `cblas_sgemm` (default **ON** where Accelerate is available). `=0` selects the
+  scalar path. The transformer is ~86% of an unoptimised forward pass, so this is
+  the dominant knob (measured 44x on the transformer, 4.6x overall).
+- `CRISPASR_HTDEMUCS_FASTCONV` — batched im2col + one GEMM for the CPU convs
+  (default **ON**). `=0` selects the original per-time-frame scalar path.
+  Measured `enc.conv2d` 10.0 s -> 0.17 s and `enc.rewrite` 12.2 s -> 0.30 s.
+- `CRISPASR_HTDEMUCS_WCACHE` — cache F32 copies of weight tensors by pointer
+  (default **ON**). `=0` re-reads and re-converts on every access, which the
+  DConv stacks do ~6k times per encoder layer.
+- `CRISPASR_HTDEMUCS_GGML` — run the CrossTransformer as a ggml graph instead of
+  the CPU/BLAS path (default **OFF**). Verified correct on CPU and Metal (45/45
+  stages, every layer cos 1.000000) but not yet proven faster overall, so it
+  stays opt-in per the inverse-default rule.
+- `CRISPASR_HTDEMUCS_GPU` — request a GPU backend (CUDA > Metal > Vulkan, CPU
+  fallback). Only meaningful together with `_GGML=1`: under the CPU/BLAS path
+  the weights would sit on the device and every kernel would pay a read back.
+- `CRISPASR_HTDEMUCS_PROFILE` — print a per-phase wall-time breakdown of one
+  forward pass (stft / enc / transformer / dec / istft).
+- `CRISPASR_HTDEMUCS_DEBUG` — verbose per-layer shape and NaN diagnostics.
+- `CRISPASR_HTDEMUCS_SKIP_TIME` — skip the time branch (bisection aid).
+
+All three optimisation gates are output-equivalent: the per-stage diff reports
+45/45 stages passing with them ON or OFF.
+
+### Higgs STT
+
+- `CRISPASR_HIGGS_DEBUG`
+- `CRISPASR_HIGGS_STT_BENCH`
+- `CRISPASR_HIGGS_STT_EMBED_FAST`
+- `CRISPASR_HIGGS_STT_FUSED_QKV`
+
+### IndexTTS
+
+- `CRISPASR_INDEXTTS_AA_BACKEND`
+- `CRISPASR_INDEXTTS_AA_SCALAR`
+- `CRISPASR_INDEXTTS_AUDIO24K_FILE`
+- `CRISPASR_INDEXTTS_BEAM_SIZE`
+- `CRISPASR_INDEXTTS_BENCH`
+- `CRISPASR_INDEXTTS_COND_FILE`
+- `CRISPASR_INDEXTTS_DEBUG`
+- `CRISPASR_INDEXTTS_KV_DEVICE_COPY`
+- `CRISPASR_INDEXTTS_LATENT_FILE`
+- `CRISPASR_INDEXTTS_MEL_CODES_FILE`
+- `CRISPASR_INDEXTTS_MEL_FILE`
+- `CRISPASR_INDEXTTS_SPK_NORM`
+- `CRISPASR_INDEXTTS_TEXT_NORMALIZER`
+- `CRISPASR_INDEXTTS_VOCODER_AA`
+- `CRISPASR_INDEXTTS_VOCODER_RAW`
+- `CRISPASR_INDEXTTS_VOC_BENCH`
+- `CRISPASR_INDEXTTS_VOC_FORCE_GPU`
+
+### Irodori TTS
+
+- `CRISPASR_IRODORI_CAPTION`
+- `CRISPASR_IRODORI_CAPTION_TOKEN_IDS`
+- `CRISPASR_IRODORI_CFG_CAPTION`
+- `CRISPASR_IRODORI_CFG_INTERVAL`
+- `CRISPASR_IRODORI_CFG_INTERVAL_DEBUG`
+- `CRISPASR_IRODORI_CFG_SPEAKER`
+- `CRISPASR_IRODORI_CFG_TEXT`
+- `CRISPASR_IRODORI_CODEC_CPU`
+- `CRISPASR_IRODORI_CODEC_GPU`
+- `CRISPASR_IRODORI_CPU`
+- `CRISPASR_IRODORI_DEBUG`
+- `CRISPASR_IRODORI_DECODE_CHUNK`
+- `CRISPASR_IRODORI_DECODE_CTX`
+- `CRISPASR_IRODORI_DIT_TIMING`
+- `CRISPASR_IRODORI_DUMP_LATENT`
+- `CRISPASR_IRODORI_DUMP_TEXT_STATE`
+- `CRISPASR_IRODORI_DUMP_TOKENS`
+- `CRISPASR_IRODORI_DUMP_V_PRED0`
+- `CRISPASR_IRODORI_ENC_DUMP`
+- `CRISPASR_IRODORI_ENC_PRENORM`
+- `CRISPASR_IRODORI_FASTCONV`
+- `CRISPASR_IRODORI_LAYERS`
+- `CRISPASR_IRODORI_ODE_STEPS`
+- `CRISPASR_IRODORI_PERSIST_GRAPH`
+- `CRISPASR_IRODORI_REF_NOISE`
+- `CRISPASR_IRODORI_TOKEN_IDS`
+- `CRISPASR_IRODORI_T_LATENT`
+
+### Kokoro
+
+- `CRISPASR_KOKORO_BENCH`
+- `CRISPASR_KOKORO_DEBUG`
+- `CRISPASR_KOKORO_DEBUG_INTERMEDIATES`
+- `CRISPASR_KOKORO_DUMP_STAGES`
+- `CRISPASR_KOKORO_FASTCONV`
+- `CRISPASR_KOKORO_FASTCONV_DEBUG`
+- `CRISPASR_KOKORO_G2P`
+- `CRISPASR_KOKORO_SEED`
+- `CRISPASR_KOKORO_USE_GPU`
+- `CRISPASR_KOKORO_VOICE_GGUF`
+
+### KugelAudio
+
+- `CRISPASR_KUGELAUDIO_CPU_ONLY`
+- `CRISPASR_KUGELAUDIO_DEBUG`
+
+### Kyutai STT
+
+- `CRISPASR_KYUTAI_RVQ_FAST`
+- `CRISPASR_KYUTAI_STT_BENCH`
+
+### LFM2-Audio
+
+- `CRISPASR_LFM2_AUDIO_BENCH`
+- `CRISPASR_LFM2_AUDIO_CPU`
+- `CRISPASR_LFM2_SNAP_LAYERS`
+
+### M2M-100 translate
+
+- `CRISPASR_M2M100_BENCH`
+- `CRISPASR_M2M100_GPU`
+
+### MarbleNet VAD
+
+- `CRISPASR_MARBLENET_VAD_BENCH`
+
+### MeloTTS
+
+- `CRISPASR_MELOTTS_BENCH`
+- `CRISPASR_MELOTTS_BERT`
+- `CRISPASR_MELOTTS_FORCE_SCALAR`
+- `CRISPASR_MELOTTS_WEIGHT_CACHE`
+
+### Mimi codec
+
+- `CRISPASR_MIMI_NONCAUSAL`
+
+### MiMo-ASR
+
+- `CRISPASR_MIMO_ASR_BENCH`
+- `CRISPASR_MIMO_ASR_DIAG`
+- `CRISPASR_MIMO_ASR_DUMP_STAGES`
+- `CRISPASR_MIMO_ASR_GPU`
+- `CRISPASR_MIMO_FORCE_CPU`
+- `CRISPASR_MIMO_SMOKE_DUMP`
+- `CRISPASR_MIMO_SMOKE_GPU`
+- `CRISPASR_MIMO_TOKENIZER_GPU`
+- `CRISPASR_MIMO_TOK_CPU`
+
+### mini-omni2
+
+- `CRISPASR_MINI_OMNI2_BENCH`
+
+### Moonshine
+
+- `CRISPASR_MOONSHINE_ALL_GPU`
+- `CRISPASR_MOONSHINE_BENCH`
+- `CRISPASR_MOONSHINE_ENC_ATTN`
+- `CRISPASR_MOONSHINE_NO_REPEAT_BREAK`
+- `CRISPASR_MOONSHINE_STREAMING_BENCH`
+- `CRISPASR_MOONSHINE_STREAMING_GPU`
+- `CRISPASR_MOONSHINE_STREAM_BENCH`
+
+### MOSS family
+
+- `CRISPASR_MOSS_AUDIO_BENCH`
+- `CRISPASR_MOSS_AUDIO_EMBED_FAST`
+- `CRISPASR_MOSS_AUDIO_ENC_FLASH`
+- `CRISPASR_MOSS_AUDIO_ENC_MANUAL`
+- `CRISPASR_MOSS_AUDIO_FORCE_CPU`
+- `CRISPASR_MOSS_AUDIO_MEL_FILE`
+- `CRISPASR_MOSS_DIARIZE_BENCH`
+- `CRISPASR_MOSS_DIARIZE_DEBUG`
+- `CRISPASR_MOSS_DIARIZE_DUMP_CONV`
+- `CRISPASR_MOSS_DIARIZE_ENC_FLASH`
+- `CRISPASR_MOSS_DIARIZE_ENC_MANUAL`
+- `CRISPASR_MOSS_DIARIZE_FORCE_CPU`
+- `CRISPASR_MOSS_DIARIZE_NO_LOOPFIX`
+- `CRISPASR_MOSS_TRANSCRIBE_BENCH`
+- `CRISPASR_MOSS_TRANSCRIBE_ENC_DUMP`
+- `CRISPASR_MOSS_TRANSCRIBE_ENC_FLASH`
+- `CRISPASR_MOSS_TRANSCRIBE_ENC_MANUAL`
+- `CRISPASR_MOSS_TRANSCRIBE_FORCE_CPU`
+- `CRISPASR_MOSS_TRANSCRIBE_L0_DUMP`
+- `CRISPASR_MOSS_TRANSCRIBE_MEL_DUMP`
+- `CRISPASR_MOSS_TRANSCRIBE_NO_LOOPFIX`
+- `CRISPASR_MOSS_TTS_BENCH`
+- `CRISPASR_MOSS_TTS_LOCAL_DEBUG`
+- `CRISPASR_MOSS_TTS_LOCAL_GREEDY_AUDIO`
+- `CRISPASR_MOSS_TTS_LOCAL_NO_GPU`
+
+### MP3 codec
+
+- `CRISPASR_MP3_ENCODER`
+
+### Diarization — foxnose (#324)
+
+- `CRISPASR_DIARIZE_COUNT` — speaker-count estimator: `bic` (default, the
+  upstream GMM/BIC + silhouette sweep) or `eigengap`. Eigengap is better on
+  well-separated synthetic data and cheaper, but under-counts on real speech
+  (11.4 % vs 5.3 % DER on VoxConverse) — see `docs/foxnose-diarize/PLAN.md`
+- `CRISPASR_DIARIZE_BIC_WINDOW` — score silhouette only in a `[k-2, k+3]` window
+  around the BIC anchor instead of the full `[min, max]` range. The full range is
+  the default: the BIC anchor is unreliable in both directions (measured errors
+  of +5 / -3 / -3 on 4/5/6 well-separated blobs) and when it over-counts the
+  window is stranded above the truth and cannot climb back to it
+- `CRISPASR_WESPEAKER_BENCH` — per-stage embedder timings (fbank / resnet /
+  resnet_windows). Counting invocations of these is also how you check WHICH
+  embedding path actually ran
+- `CRISPASR_WESPEAKER_DEBUG` — embedder diagnostics
+- `CRISPASR_DIARIZE_DEBUG` — chosen speaker count, the reason it was chosen,
+  and the per-k silhouette curve behind it. Worth reading before trusting a
+  count: on a borderline file the decision can rest on a <1 % score gap
+- `CRISPASR_DIARIZE_EMBED_WORKERS` — windows embedded concurrently (default:
+  `-t`). Each worker gets its own context sharing one copy of the weights
+- `CRISPASR_SPEAKER_EMBED_THREADS` — ggml threads per embedder context
+  (default: `-t`). Honoured by the pluggable embedders and by wespeaker
+- `CRISPASR_DIARIZE_SPAN_EMBED=1` — run ONE network pass per span of windows
+  instead of one per window. 1.78x less diarization CPU for +0.30 mean DER on
+  the VoxConverse dev shard; off by default because accuracy is the better
+  default for a diarizer. See `docs/cli.md#diarization`
+- `CRISPASR_DIARIZE_SPAN_WINDOWS` — windows per span (default 32). Measured NOT
+  to affect the accuracy cost — identical from N=2 to N=32 — so there is
+  nothing to tune here; larger is simply faster
+
+### GigaAM-v3
+
+- `CRISPASR_GIGAAM_BENCH` — per-stage timings (mel / encoder / decode)
+- `CRISPASR_GIGAAM_DEBUG` — encoder output min/max/mean
+- `CRISPASR_GIGAAM_FLASH` — `ggml_flash_attn_ext` in the encoder (opt-in; the
+  manual QK^T path is what the per-stage diff was validated on)
+- `CRISPASR_GIGAAM_FORCE_SCALAR` — scalar LSTM/joint loops instead of cblas
+- `CRISPASR_GIGAAM_QUANT_ALL` — let `crispasr-quantize` quantize the heads and
+  the pre-encode convs too (default keeps them at source precision)
+
+### Nemotron
+
+- `CRISPASR_NEMOTRON_BENCH`
+- `CRISPASR_NEMOTRON_CONTEXT_PRESET`
+- `CRISPASR_NEMOTRON_DEBUG`
+- `CRISPASR_NEMOTRON_DECODE_TIMING`
+- `CRISPASR_NEMOTRON_FORCE_SCALAR`
+- `CRISPASR_NEMOTRON_GGML_DECODE`
+- `CRISPASR_NEMOTRON_MAES`
+- `CRISPASR_NEMOTRON_NO_WINDOW_MASK`
+- `CRISPASR_NEMOTRON_STREAMING`
+
+### OmniASR
+
+- `CRISPASR_OMNIASR_BENCH`
+- `CRISPASR_OMNIASR_DEBUG`
+- `CRISPASR_OMNIASR_DUMP_DIR`
+- `CRISPASR_OMNIASR_KEEP_F16_HEAD`
+- `CRISPASR_OMNIASR_KEEP_F16_TAIL`
+- `CRISPASR_OMNIASR_QUANT_ALL`
+
+### OmniVoice
+
+- `CRISPASR_OMNIVOICE_ACENC_BISECT`
+- `CRISPASR_OMNIVOICE_BENCH`
+- `CRISPASR_OMNIVOICE_CFG_INTERVAL`
+- `CRISPASR_OMNIVOICE_CHUNK`
+- `CRISPASR_OMNIVOICE_CLASS_TEMP`
+- `CRISPASR_OMNIVOICE_CODEC_FASTCONV`
+- `CRISPASR_OMNIVOICE_CODEC_GPU` — codec placement override (`1` = GPU, `0` = CPU). Unset defaults to GPU on
+  CUDA and CPU on Metal/CPU.
+- `CRISPASR_OMNIVOICE_CPU`
+- `CRISPASR_OMNIVOICE_DEBUG_CODES`
+- `CRISPASR_OMNIVOICE_DEBUG_SUM`
+- `CRISPASR_OMNIVOICE_ENCODE_DIFF`
+- `CRISPASR_OMNIVOICE_FRAMES_PER_CHAR`
+- `CRISPASR_OMNIVOICE_FUSED_STEP`
+- `CRISPASR_OMNIVOICE_GUIDANCE`
+- `CRISPASR_OMNIVOICE_HUBERT_REF`
+- `CRISPASR_OMNIVOICE_NUM_STEPS`
+- `CRISPASR_OMNIVOICE_PERSISTENT_GRAPH`
+- `CRISPASR_OMNIVOICE_POS_TEMP`
+- `CRISPASR_OMNIVOICE_UNIFIED_CFG`
+- `CRISPASR_OMNIVOICE_VOICE_CACHE`
+
+### OpenVoice2
+
+- `CRISPASR_OPENVOICE2_BENCH`
+
+### OpenVoice2
+
+- `CRISPASR_OV2_DUMP_DIR`
+- `CRISPASR_OV2_FORCE_SCALAR`
+- `CRISPASR_OV2_NO_NORMALIZE`
+- `CRISPASR_OV2_TAU`
+
+### Opus codec
+
+- `CRISPASR_OPUS_DEBUG`
+- `CRISPASR_OPUS_DECODER`
+- `CRISPASR_OPUS_ENCODER`
+
+### Orpheus
+
+- `CRISPASR_ORPHEUS_BENCH`
+- `CRISPASR_ORPHEUS_BUCKET`
+- `CRISPASR_ORPHEUS_DEBUG`
+- `CRISPASR_ORPHEUS_DIFF_GPU`
+- `CRISPASR_ORPHEUS_DIFF_MAXGEN`
+- `CRISPASR_ORPHEUS_PROMPT_IDS`
+- `CRISPASR_ORPHEUS_SNAC_CODE`
+- `CRISPASR_ORPHEUS_SNAC_GPU`
+- `CRISPASR_ORPHEUS_SNAC_T_SUPER`
+
+### OuteTTS
+
+- `CRISPASR_OUTETTS_BENCH`
+
+### Paraformer
+
+- `CRISPASR_PARAFORMER_BENCH`
+- `CRISPASR_PARAFORMER_GPU`
+
+### Parakeet
+
+- `CRISPASR_PARAKEET_ATT_CONTEXT`
+- `CRISPASR_PARAKEET_BENCH`
+- `CRISPASR_PARAKEET_CHUNK_OVERLAP`
+- `CRISPASR_PARAKEET_CHUNK_SECONDS`
+- `CRISPASR_PARAKEET_DEBUG`
+- `CRISPASR_PARAKEET_DECODE_TIMING`
+- `CRISPASR_PARAKEET_ENC_CACHE`
+- `CRISPASR_PARAKEET_ENC_PROBE`
+- `CRISPASR_PARAKEET_FORCE_SCALAR`
+- `CRISPASR_PARAKEET_GGML_DECODE`
+- `CRISPASR_PARAKEET_INTERNAL_CHUNKING`
+- `CRISPASR_PARAKEET_LONGFORM`
+- `CRISPASR_PARAKEET_MAES`
+- `CRISPASR_PARAKEET_MEM_COEFF`
+- `CRISPASR_PARAKEET_MEM_POLICY`
+- `CRISPASR_PARAKEET_QUANT_ALL`
+- `CRISPASR_PARAKEET_SIMULATE_ENCODE_OOM`
+- `CRISPASR_PARAKEET_STREAM_CHUNK`
+- `CRISPASR_PARAKEET_STREAM_OVERLAP`
+- `CRISPASR_PARAKEET_STREAM_THRESHOLD`
+- `CRISPASR_PARAKEET_VAD_SLICE_CAP`
+- `CRISPASR_PARAKEET_VRAM_BUDGET_MB`
+
+### Parler-TTS
+
+- `CRISPASR_PARLER_BUCKET`
+- `CRISPASR_PARLER_DEBUG`
+- `CRISPASR_PARLER_DESC_IDS`
+- `CRISPASR_PARLER_DIFF_MAXGEN`
+- `CRISPASR_PARLER_DUMP_ENC`
+- `CRISPASR_PARLER_PROMPT_IDS`
+- `CRISPASR_PARLER_TTS_BENCH`
+
+### Piper
+
+- `CRISPASR_PIPER_FORCE_SCALAR`
+- `CRISPASR_PIPER_TTS_BENCH`
+- `CRISPASR_PIPER_WEIGHT_CACHE`
+
+### Pocket-TTS
+
+- `CRISPASR_POCKET_DUMP_DIR`
+- `CRISPASR_POCKET_FORCE_LATENTS`
+- `CRISPASR_POCKET_FORCE_NOISE`
+- `CRISPASR_POCKET_MANUAL_BACKBONE`
+- `CRISPASR_POCKET_MANUAL_MIMI`
+- `CRISPASR_POCKET_MAX_FRAMES`
+- `CRISPASR_POCKET_MIMI_DUMP`
+- `CRISPASR_POCKET_MIMI_SCALAR`
+- `CRISPASR_POCKET_TTS_BENCH`
+- `CRISPASR_POCKET_VOICE_CACHE`
+- `CRISPASR_POCKET_VULKAN_MIMI_MAX_FRAMES`
+
+### Pyannote segmentation
+
+- `CRISPASR_PYANNOTE_LEGACY`
+- `CRISPASR_PYANNOTE_SEG_BENCH`
+- `CRISPASR_PYANNOTE_SEG_DUMP`
+- `CRISPASR_PYANNOTE_CHUNK_S` — audio per chunk of parallel inference, in
+  seconds (default 60; `0` restores the pre-#326 single scan over the whole
+  file). Chunking is decided by audio LENGTH and never by thread count, so
+  posteriors do not change with `-t`
+- `CRISPASR_PYANNOTE_CHUNK_CONTEXT_S` — real audio spliced either side of a
+  chunk and then trimmed (default 5), which absorbs the convolutions' zero
+  padding and the LSTM's zero initial state
+
+### Qwen3-ASR
+
+- `CRISPASR_QWEN3ASR_QUANT_AUDIO`
+
+### Qwen3-ASR / Qwen3-TTS
+
+- `CRISPASR_QWEN3_ASR_BENCH`
+- `CRISPASR_QWEN3_ASR_EMBED_FAST`
+- `CRISPASR_QWEN3_ASR_FUSED_QKV`
+- `CRISPASR_QWEN3_SYSPROMPT_LANG`
+- `CRISPASR_QWEN3_TTS_BENCH`
+- `CRISPASR_QWEN3_TTS_CODEC_ALLOW_FULL`
+- `CRISPASR_QWEN3_TTS_CODEC_CHUNK`
+- `CRISPASR_QWEN3_TTS_CODEC_CPU`
+- `CRISPASR_QWEN3_TTS_CODEC_CTX`
+- `CRISPASR_QWEN3_TTS_CODEC_FORCE_METAL`
+- `CRISPASR_QWEN3_TTS_CODEC_GGUF`
+- `CRISPASR_QWEN3_TTS_CODEC_GPU`
+- `CRISPASR_QWEN3_TTS_CODEC_TRACE`
+- `CRISPASR_QWEN3_TTS_EMBD_CHECK`
+- `CRISPASR_QWEN3_TTS_MAX_FRAMES`
+- `CRISPASR_QWEN3_TTS_SKIP_REF_DECODE`
+
+### SenseVoice
+
+- `CRISPASR_SENSEVOICE_BENCH`
+- `CRISPASR_SENSEVOICE_NO_FA`
+
+### Sidon
+
+- `CRISPASR_SIDON_FASTCONV` — DAC convolution mode (`off`, `k1-f16`, `k1-f32`, or `full`). Unset defaults to
+  `k1-f16` on CUDA and `off` on Vulkan/CPU.
+- `CRISPASR_SIDON_RPE` — relative-position-bias formulation: `bucket-direct` (default), `bucket`, or `expand`
+  (legacy `[head_dim, T, T]` expansion, ~1 GiB more predictor workspace at `T≈2825`; keeps the Vulkan
+  `mul_mat` batching branch). All three are algebraically equivalent.
+- `CRISPASR_SIDON_DECODER_CHUNK_FRAMES` — maximum DAC core size in feature frames (default `512`). `0` decodes
+  the whole utterance in one graph (~4.5 GiB at `T≈2825` vs ~0.79 GiB chunked). Chunked output is bit-exact
+  against the whole-utterance decode.
+- `CRISPASR_SIDON_LOOKAHEAD` — set to `0` to disable the input padding (one leading predictor frame plus 1.5 s
+  of right-side lookahead). Padding is on by default; without it the last ~12 ms of every clip is a full-scale
+  transient.
+- `CRISPASR_SIDON_MAX_FRAMES` — predictor input cap in feature frames (default `3000`, ~58.5 s after the
+  lookahead). Guards the `O(T^2)` attention.
+- `CRISPASR_SIDON_DEBUG` — print per-stage scheduler workspace sizes (per backend) after graph allocation.
+
+### Sherpa
+
+- `CRISPASR_SHERPA_LID_BIN`
+
+### Silero LID
+
+- `CRISPASR_SILERO_FORCE_SCALAR`
+- `CRISPASR_SILERO_LID_BENCH`
+- `CRISPASR_SILERO_LID_DEBUG`
+- `CRISPASR_SILERO_LID_DUMP`
+- `CRISPASR_SILERO_LID_LEGACY`
+- `CRISPASR_SILERO_LID_MAX_S`
+- `CRISPASR_SILERO_LID_TRACE`
+- `CRISPASR_SILERO_LID_TRACE_OFF`
+- `CRISPASR_SILERO_LID_TRUNC`
+- `CRISPASR_SILERO_LID_VULKAN`
+
+### SpeechT5
+
+- `CRISPASR_SPEECHT5_DUMP_DIR`
+- `CRISPASR_SPEECHT5_FASTCONV`
+- `CRISPASR_SPEECHT5_FASTCONV_DEBUG`
+- `CRISPASR_SPEECHT5_TTS_BENCH`
+
+### T5 translate
+
+- `CRISPASR_T5_GPU`
+- `CRISPASR_T5_TRANSLATE_BENCH`
+
+### TaDa TTS
+
+- `CRISPASR_TADA_ACOUSTIC_CFG`
+- `CRISPASR_TADA_ALLOW_VULKAN`
+- `CRISPASR_TADA_BATCH_PREFILL`
+- `CRISPASR_TADA_BENCH`
+- `CRISPASR_TADA_BUCKET_MIN`
+- `CRISPASR_TADA_CFG_INTERVAL`
+- `CRISPASR_TADA_CFG_INTERVAL_DEBUG`
+- `CRISPASR_TADA_CODEC_BENCH`
+- `CRISPASR_TADA_CODEC_DUMP`
+- `CRISPASR_TADA_CODEC_GGUF`
+- `CRISPASR_TADA_CODEC_VULKAN_NATIVE`
+- `CRISPASR_TADA_CTC_ASR`
+- `CRISPASR_TADA_DIFF_TEXT`
+- `CRISPASR_TADA_DO_SAMPLE`
+- `CRISPASR_TADA_DUMP_ACOUSTIC_FEATURES`
+- `CRISPASR_TADA_DUMP_FEATURES`
+- `CRISPASR_TADA_DUMP_FM_STEPS`
+- `CRISPASR_TADA_DUMP_TIME_BEFORE`
+- `CRISPASR_TADA_ENCODER_DEBUG`
+- `CRISPASR_TADA_EXTRA_STEPS`
+- `CRISPASR_TADA_FM_B2`
+- `CRISPASR_TADA_KEEP_F16_HEAD`
+- `CRISPASR_TADA_KEEP_F16_TAIL`
+- `CRISPASR_TADA_MAX_EXPANDED_FRAMES`
+- `CRISPASR_TADA_NOISE_TEMP`
+- `CRISPASR_TADA_NO_BUCKET`
+- `CRISPASR_TADA_NUM_CANDIDATES`
+- `CRISPASR_TADA_NUM_FM_STEPS`
+- `CRISPASR_TADA_PROMPT_CACHE`
+- `CRISPASR_TADA_PROMPT_TEXT`
+- `CRISPASR_TADA_QUANT_ALL`
+- `CRISPASR_TADA_REPETITION_PENALTY`
+- `CRISPASR_TADA_SCORER`
+- `CRISPASR_TADA_TALKER_TIMING`
+- `CRISPASR_TADA_TEMPERATURE`
+- `CRISPASR_TADA_TOP_K`
+- `CRISPASR_TADA_TOP_P`
+- `CRISPASR_TADA_VULKAN_NATIVE`
+
+### TitaNet speaker
+
+- `CRISPASR_TITANET_BENCH`
+- `CRISPASR_TITANET_DUMP`
+- `CRISPASR_TITANET_FORCE_SCALAR`
+- `CRISPASR_TITANET_GGML`
+- `CRISPASR_TITANET_LEGACY`
+- `CRISPASR_TITANET_REF_MEL`
+
+### VibeVoice
+
+- `CRISPASR_VIBEVOICE_BENCH`
+- `CRISPASR_VIBEVOICE_DEBUG`
+- `CRISPASR_VIBEVOICE_DUMP_DIR`
+- `CRISPASR_VIBEVOICE_ENCODER_CHUNK_SECONDS`
+- `CRISPASR_VIBEVOICE_ENCODER_CONTEXT_SECONDS`
+- `CRISPASR_VIBEVOICE_LM_BUCKETS`
+- `CRISPASR_VIBEVOICE_NO_LM_BUCKETS`
+- `CRISPASR_VIBEVOICE_PRED_SCHED`
+- `CRISPASR_VIBEVOICE_QUANT_ALL`
+- `CRISPASR_VIBEVOICE_REF_FEATURES`
+- `CRISPASR_VIBEVOICE_REUSE_PRED_GRAPH`
+- `CRISPASR_VIBEVOICE_TTS_CFG_SCALE`
+- `CRISPASR_VIBEVOICE_TTS_DUMP`
+- `CRISPASR_VIBEVOICE_TTS_DUMP_DECODER`
+- `CRISPASR_VIBEVOICE_TTS_DUMP_PERFRAME`
+- `CRISPASR_VIBEVOICE_TTS_FLASH_ATTN`
+- `CRISPASR_VIBEVOICE_TTS_LATENTS`
+- `CRISPASR_VIBEVOICE_TTS_NOISE`
+- `CRISPASR_VIBEVOICE_TTS_SEED`
+- `CRISPASR_VIBEVOICE_TTS_TRACE`
+- `CRISPASR_VIBEVOICE_TTS_TRACE_FRAME`
+- `CRISPASR_VIBEVOICE_VAE_BACKEND`
+- `CRISPASR_VIBEVOICE_VOICE_AUDIO`
+
+### VoxCPM2
+
+- `CRISPASR_VOXCPM2_BENCH`
+- `CRISPASR_VOXCPM2_CFG_INTERVAL`
+- `CRISPASR_VOXCPM2_CFG_INTERVAL_DEBUG`
+- `CRISPASR_VOXCPM2_CFG_VALUE`
+- `CRISPASR_VOXCPM2_CPU_ONLY`
+- `CRISPASR_VOXCPM2_INFERENCE_STEPS`
+- `CRISPASR_VOXCPM2_MAX_LEN`
+- `CRISPASR_VOXCPM2_USE_REF`
+- `CRISPASR_VOXCPM2_VAE_MAX_SAMPLES` - maximum 16 kHz input samples accepted by one `voxcpm2-vae` upscaling call
+  (default `960000`, or 60 seconds). Split longer audio, or raise this only when enough RAM/VRAM is available.
+
+### Voxtral / Voxtral-TTS
+
+- `CRISPASR_VOXTRAL_BENCH`
+- `CRISPASR_VOXTRAL_FUSED_QKV`
+- `CRISPASR_VOXTRAL_TTS_CODEC_FROM_FILE`
+- `CRISPASR_VOXTRAL_TTS_DIFF_DUMP`
+- `CRISPASR_VOXTRAL_TTS_SEMANTIC_CB`
+- `CRISPASR_VOXTRAL_TTS_TEXT`
+- `CRISPASR_VOXTRAL_TTS_VOICE`
+
+### Voxtral-4B
+
+- `CRISPASR_VOXTRAL4B_BENCH`
+- `CRISPASR_VOXTRAL4B_FUSED_QKV`
+- `CRISPASR_VOXTRAL4B_STREAM_BATCH_ENCODER`
+- `CRISPASR_VOXTRAL4B_STREAM_CHUNK_MS`
+- `CRISPASR_VOXTRAL4B_STREAM_DEBUG`
+- `CRISPASR_VOXTRAL4B_STREAM_DECODER_THREAD`
+- `CRISPASR_VOXTRAL4B_STREAM_DIFF`
+- `CRISPASR_VOXTRAL4B_STREAM_LIVE`
+- `CRISPASR_VOXTRAL4B_STREAM_TIMING`
+
+### Wav2Vec2
+
+- `CRISPASR_WAV2VEC2_BENCH`
+- `CRISPASR_WAV2VEC2_DUMP_DIR`
+- `CRISPASR_WAV2VEC2_VERBOSE`
+
+### WavTokenizer
+
+- `CRISPASR_WAVTOK_BENCH`
+- `CRISPASR_WAVTOK_DUMP_DIR`
+- `CRISPASR_WAVTOK_FIXED_CODES`
+
+### Zonos
+
+- `CRISPASR_ZONOS_CPP_DUMP_DIR`
+- `CRISPASR_ZONOS_DECODE_CHUNK`
+- `CRISPASR_ZONOS_DECODE_CTX`
+- `CRISPASR_ZONOS_DIFF_N_STEPS`
+- `CRISPASR_ZONOS_FASTCONV`
+- `CRISPASR_ZONOS_SPEAKER_EMB_PATH`
+- `CRISPASR_ZONOS_TTS_BENCH`
+- `CRISPASR_ZONOS_TTS_TEXT`
+

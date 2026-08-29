@@ -1,0 +1,37 @@
+NVIDIA/personaplex#105 — KV cache allocated on the meta device under accelerate offload.
+
+Applied to the local reference checkout at D:\moshi-docker\personaplex, which
+is an unpacked tree rather than a git clone, so this patch is kept here so the
+modification is reproducible and visible. Unmerged upstream as of 2026-08-15.
+
+Symptom: with --cpu-offload, warmup dies with "Cannot copy out of meta tensor;
+no data!". StreamingMultiheadAttention._init_streaming_state allocates the
+RingKVCache on the device of its own in_proj_weight, but accelerate leaves an
+offloaded layer's parameters as meta placeholders and only materialises the
+real weights around the forward pass — so the cache lands on `meta`.
+
+This is a no-op for a pure multi-GPU dispatch, where every parameter is real
+on its assigned card; it only matters when some layers are offloaded to CPU or
+disk. We carry it because CPU offload is the fallback path for producing phase
+2 reference dumps on a 12 GB card.
+
+--- a/moshi/moshi/modules/transformer.py
++++ b/moshi/moshi/modules/transformer.py
+@@ -400,6 +400,16 @@
+         else:
+             capacity = self.context
+         device = self.in_proj_weight.device
++        if device.type == "meta":
++            # NVIDIA/personaplex#105. Under accelerate's CPU/disk offload an
++            # offloaded layer's parameters are meta placeholders — the real
++            # weights are restored around the forward pass — so allocating the
++            # KV cache on the parameter's device lands it on `meta` and warmup
++            # dies with "Cannot copy out of meta tensor; no data!". Resolve to
++            # the hook's execution device instead. No-op for a pure multi-GPU
++            # dispatch, where parameters are real on their assigned card.
++            hook = getattr(self, "_hf_hook", None)
++            exec_dev = getattr(hook, "execution_device", None)
++            device = torch.device(exec_dev if exec_dev is not None else "cuda")
+         # TODO: the following estimation will not work great with FSDP.
+         dtype = self.in_proj_weight.dtype
+         dim_per_head = self.embed_dim // self.num_heads

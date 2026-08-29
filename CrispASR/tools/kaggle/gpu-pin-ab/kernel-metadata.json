@@ -1,0 +1,17 @@
+{
+  "id": "chr1str/crispasr-gpu-pin-ab",
+  "title": "crispasr-gpu-pin-ab",
+  "code_file": "crispasr-gpu-pin-ab.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "dataset_sources": [
+    "chr1str/crispasr-hf-token",
+    "chr1str/crispasr-ccache"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}
