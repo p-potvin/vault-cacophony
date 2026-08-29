@@ -82,6 +82,18 @@ G:\OpenASR\.venv\Scripts\python.exe scripts\run_openasr_af3_subset.py `
   --offset 5 --limit 15
 ```
 
+To attempt the remaining full LibriSpeech test-clean split, omit `--limit` and
+use `--resume`. The output is flushed after every utterance; a rerun skips IDs
+already present and still stops on the first wrapper error, empty output, or
+10-minute per-utterance timeout.
+
+```powershell
+G:\OpenASR\.venv\Scripts\python.exe scripts\run_openasr_af3_subset.py `
+  --parquet G:\OpenASR\open-asr-leaderboard\librispeech\test.clean-00000-of-00001.parquet `
+  --output G:\OpenASR\results\af3-librispeech-clean-full.jsonl `
+  --resume --timeout-s 600
+```
+
 ## Input manifest
 
 Provide UTF-8 JSONL. Every non-empty row requires `reference` and `prediction`.
