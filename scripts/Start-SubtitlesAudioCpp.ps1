@@ -135,6 +135,12 @@ if (-not $AudioCpp) { $AudioCpp = Join-Path $RepoRoot "audio.cpp" }
 if (-not $Python)   { $Python   = Join-Path $RepoRoot ".venv\Scripts\python.exe" }
 
 $Cli      = Join-Path $AudioCpp "audiocpp_cli.exe"
+
+# Model-run telemetry. Optional by design: if the module is missing the
+# pipeline runs exactly as before, because Write-AudioCppRun checks for the
+# command before calling it.
+$script:VwAudioSeconds = 0.0
+Import-Module (Join-Path $PSScriptRoot "VwTelemetry.psm1") -Force -ErrorAction SilentlyContinue
 $SepModel = if ($Separator -eq "bs_roformer") {
     Join-Path $AudioCpp "models\BS-RoFormer-ep368-GGUF\bs-roformer-ep368-q8_0.gguf"
 } else {
@@ -179,13 +185,56 @@ function Invoke-Native {
     param([string]$Exe, [string[]]$Arguments, [string]$What)
     $prev = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
+
+    # Only audiocpp invocations are model runs. ffmpeg goes through here too,
+    # and recording a remux as a model run would put ordinary media work in the
+    # model table and inflate every volume figure with inference that never
+    # happened.
+    $isModel = $Exe -match 'audiocpp'
+    $sw = if ($isModel) { [System.Diagnostics.Stopwatch]::StartNew() } else { $null }
+
     try {
         $out = & $Exe @Arguments 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "$What failed (exit $LASTEXITCODE): $((($out | Select-Object -Last 4) -join ' | '))"
+        $code = $LASTEXITCODE
+        if ($isModel) { Write-AudioCppRun $Arguments $What $sw.Elapsed.TotalMilliseconds $code }
+        if ($code -ne 0) {
+            throw "$What failed (exit $code): $((($out | Select-Object -Last 4) -join ' | '))"
         }
     }
     finally { $ErrorActionPreference = $prev }
+}
+
+# Records one run per audiocpp invocation. Wrapped in its own try so a
+# telemetry fault can never fail a transcription that already succeeded.
+function Write-AudioCppRun {
+    param([string[]]$Arguments, [string]$What, [double]$ElapsedMs, [int]$ExitCode)
+    try {
+        if (-not (Get-Command Write-VwModelRun -ErrorAction SilentlyContinue)) { return }
+        $spec = Get-VwAudioCppTask -Arguments $Arguments
+
+        $fields = @{
+            model       = $(if ($spec.family) { $spec.family } else { 'audiocpp' })
+            task        = (ConvertTo-VwTaskName $spec.task)
+            runtime     = 'audio.cpp'
+            service     = 'subtitles-audiocpp'
+            project     = 'vault-cacophony'
+            duration_ms = [math]::Round($ElapsedMs, 3)
+            backend     = 'cuda'
+            caller      = $What
+        }
+        if ($spec.mode)     { $fields['mode'] = $spec.mode }
+        if ($spec.language) { $fields['language'] = $spec.language }
+        # Set by the caller before each stage; the real-time factor is the
+        # number that means anything for audio work, and it needs the clip
+        # length to exist at all.
+        if ($script:VwAudioSeconds -gt 0) { $fields['audio_seconds'] = $script:VwAudioSeconds }
+        if ($ExitCode -ne 0) {
+            $fields['status'] = 'error'
+            $fields['error_class'] = "AudioCppExit$ExitCode"
+        }
+        Write-VwModelRun -Fields $fields
+    }
+    catch { }
 }
 
 function Get-AudioSeconds([string]$Path) {
@@ -246,7 +295,13 @@ function Invoke-Separation {
         if ($Family -eq "bs_roformer") {
             $sepArgs += @('--session-option', "bs_roformer.num_overlap=$Passes")
         }
+        # Per chunk, not the whole mix: a 16 minute video cut into eight
+        # slices would otherwise report each slice as having processed all
+        # 16 minutes, making the real-time factor look eight times better
+        # than it is.
+        $script:VwAudioSeconds = if ($n -gt 1) { $coreEnd - $readStart } else { $total }
         Invoke-Native $Cli $sepArgs "separation (chunk $($i + 1)/$n)"
+        $script:VwAudioSeconds = 0.0
         $stem = Join-Path $dir "vocals.wav"
         if (-not (Test-Path -LiteralPath $stem)) { throw "separation produced no vocals stem (chunk $($i + 1)/$n)" }
 
@@ -343,6 +398,10 @@ foreach ($f in $files) {
             Join-VocalStems -Stems $stems -Out $asrWav -Overlap $SepOverlap -Volume $VolumeBoost
         }
         if (-not (Test-Path -LiteralPath $asrWav)) { throw "no 16 kHz audio for ASR" }
+
+        # ASR sees the whole clip in one pass, so the full duration is the
+        # right denominator for its real-time factor.
+        try { $script:VwAudioSeconds = Get-AudioSeconds $asrWav } catch { $script:VwAudioSeconds = 0.0 }
 
         $words = Join-Path $Tmp "$safe.words.json"
         $tagged = Join-Path $Tmp "$safe.tagged.txt"
