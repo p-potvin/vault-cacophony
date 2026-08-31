@@ -65,7 +65,9 @@ def merge_tokens(tokens):
     words, cur = [], None
     for t in tokens:
         piece = t.get("word", "")
-        if not piece.strip():
+        # SentencePiece subword prefix is \u2581 (lower one eighth block)
+        clean_piece = piece.replace("\u2581", " ")
+        if not clean_piece.strip():
             if cur:
                 words.append(cur)
                 cur = None
@@ -77,20 +79,20 @@ def merge_tokens(tokens):
         # had "mother." on screen for nineteen seconds.
         stranded = cur is not None and (
             t["start_sample"] - cur["end_sample"]) / SR > PIECE_GAP_S
-        if stranded and not any(c.isalnum() for c in piece):
+        if stranded and not any(c.isalnum() for c in clean_piece):
             # Trailing punctuation is the exception: it belongs to the word it
             # follows, so take the character and leave the timing alone, or the
             # transcript reads "welcome his gospel" / ". He had written".
-            cur["word"] += piece
+            cur["word"] += clean_piece
             continue
-        if piece.startswith(" ") or cur is None or stranded:
+        if clean_piece.startswith(" ") or cur is None or stranded:
             if cur:
                 words.append(cur)
-            cur = {"word": piece.strip(),
+            cur = {"word": clean_piece.strip(),
                    "start_sample": t["start_sample"],
                    "end_sample": t["end_sample"]}
         else:
-            cur["word"] += piece
+            cur["word"] += clean_piece
             cur["start_sample"] = min(cur["start_sample"], t["start_sample"])
             cur["end_sample"] = max(cur["end_sample"], t["end_sample"])
     if cur:
