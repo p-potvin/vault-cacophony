@@ -14,6 +14,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -134,13 +135,16 @@ def main() -> int:
         for record in records(args.parquet, args.limit, args.offset):
             if record.get("id") in completed_ids:
                 continue
+            started = time.perf_counter()
             prediction = transcribe(record, args, directory)
+            elapsed = time.perf_counter() - started
             result = {
                 "id": record.get("id"),
                 "dataset": record.get("dataset", "librispeech"),
                 "reference": record["text"],
                 "prediction": prediction,
                 "audio_length_s": record.get("audio_length_s"),
+                "transcription_seconds": elapsed,
                 "model": "audio-flamingo-3-q4_k_m",
             }
             output.write(json.dumps(result, ensure_ascii=False) + "\n")
