@@ -42,6 +42,7 @@ def main() -> int:
     predictions = [normalizer(row["prediction"]) for row in rows]
     errors = jiwer.process_words(references, predictions)
     durations = [float(row["audio_length_s"]) for row in rows if row.get("audio_length_s") is not None]
+    timed_rows = [row for row in rows if row.get("transcription_seconds") is not None]
     unique_ids = {row.get("id") for row in rows}
     normalized_wer = evaluate.load("wer").compute(predictions=predictions, references=references)
     reference_words = errors.hits + errors.substitutions + errors.deletions
@@ -81,11 +82,20 @@ def main() -> int:
             "min_seconds": min(durations),
             "max_seconds": max(durations),
         },
+        "timing": {
+            "timed_utterances": len(timed_rows),
+            "timed_audio_seconds": sum(float(row["audio_length_s"]) for row in timed_rows),
+            "transcription_seconds": sum(float(row["transcription_seconds"]) for row in timed_rows),
+        },
         "integrity": {
             "unique_ids": len(unique_ids),
             "duplicate_ids": len(rows) - len(unique_ids),
         },
     }
+    if report["timing"]["transcription_seconds"]:
+        report["timing"]["rtfx"] = (
+            report["timing"]["timed_audio_seconds"] / report["timing"]["transcription_seconds"]
+        )
     rendered = json.dumps(report, indent=2) + "\n"
     print(rendered, end="")
     if args.output:
