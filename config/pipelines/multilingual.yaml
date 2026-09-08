@@ -36,7 +36,19 @@ asr:
     chunk_size: 0.16
     ctc_left_padding: 3.84
     ctc_right_padding: 0.16
-    rnnt_right_context: 1
+    # -1 = the model's maximum (3 for nemotron-3.5, step 320 ms). Measured on
+    # long-form audio, this is the single most effective lever found against the
+    # long-form dropouts:
+    #
+    #   French 11.6 min   right=1: 11 gaps / 24.1 s -> right=3: 7 gaps / 15.1 s
+    #   Quebecois 25.5min right=1: 44 gaps / 119.2 s -> right=3: 31 gaps / 77.7 s
+    #
+    # Quebecois also recovers 83 words. Note the sweep is NOT monotonic --
+    # right=2 measured worse than right=1 on the French file (13 gaps / 43.0 s),
+    # so do not assume intermediate values interpolate. It costs latency: the
+    # encoder step goes 160 ms -> 320 ms, which matters for the live overlay and
+    # not at all for offline subtitle generation.
+    rnnt_right_context: -1
   decoder:
     kind: greedy
   # Silero VAD. The GGUF must come from this repo's own converter --

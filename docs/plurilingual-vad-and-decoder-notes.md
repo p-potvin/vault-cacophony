@@ -144,3 +144,83 @@ and use `auto` only for genuinely unknown audio.** The measured WER favours
 table is how little the language flag moves the result and how strong the
 tokenizer's English bias is — telling it "this is entirely Spanish" helps
 against that bias rather than hurting.
+
+---
+
+# Follow-up: the dropouts are not language switches
+
+Tue, 08 Sep 2026, second pass.
+
+## Language switching is not the cause
+
+The switch hypothesis fit the bilingual file well — all four largest gaps land
+exactly on an en/fr boundary (`residency.`|`Vont`, `intimidating`|`d'accepter`,
+`critique.`|`French`, `facilement`|`I`), 7 of 11 overall. But the monolingual
+control refutes it:
+
+| file | length | gaps > 1.5 s | dropped | % of audio | per minute |
+|---|---|---|---|---|---|
+| French/English (bilingual) | 11.6 min | 11 | 24.1 s | 3.46% | 0.95 |
+| Quebecois vs France (**monolingual fr**) | 25.5 min | 44 | 119.2 s | **7.80%** | **1.73** |
+
+The monolingual file drops nearly **twice as often**. And those gaps are not
+silence — they measure 68–134% of the file's mean RMS — nor are they empty:
+transcribed in isolation, 4 of the 5 largest return ordinary French.
+
+> Et dans la prononciation, mais sinon c'est pas mal le même vocabulaire que
+> qu'au Québec et par
+
+So switches correlate on the bilingual file, but they do not cause the effect.
+Whatever this is, it gets worse with length, not with language mixing.
+
+## rnnt_right_context is the best lever found
+
+`asr.streaming.rnnt_right_context` (`-1` = the model's max, 3 for nemotron-3.5):
+
+| file | right=1 | right=2 | right=3 (max) |
+|---|---|---|---|
+| French 11.6 min | 11 gaps / 24.1 s | 13 gaps / 43.0 s | **7 gaps / 15.1 s** |
+| Quebecois 25.5 min | 44 gaps / 119.2 s | — | **31 gaps / 77.7 s** |
+
+Roughly **-37%** dropped time on the French file and **-35%** on the Quebecois,
+which also recovers 83 words. Both configs now set `-1`.
+
+Two caveats. The sweep is **not monotonic** — `right=2` is worse than `right=1`
+on the French file, so intermediate values cannot be assumed to interpolate. And
+it costs latency: the encoder step goes 160 ms to 320 ms, which matters for the
+live overlay and is free for offline subtitles.
+
+It reduces the problem; it does not solve it. The Quebecois file still loses
+77.7 s, 5.09% of its audio, at the model's maximum right context.
+
+Also worth recording: offline and streaming `right=1` produce **byte-identical**
+transcripts, so the earlier "offline vs streaming" distinction was not a real
+variable.
+
+## VAD masking was correctly enabled, and does not help
+
+Verified by A/B rather than by the log line, all at `right=3`:
+
+| condition | words | gaps | dropped | text md5 |
+|---|---|---|---|---|
+| no VAD | 2324 | 7 | 15.1 s | `8cfae76e` |
+| VAD loaded, `mask_enable` off | 2324 | 7 | 15.1 s | `8cfae76e` |
+| VAD + masking on | 2322 | 7 | 15.1 s | `1318fc9b` |
+| VAD + `--endpointing --vad-based-eou` | 2324 | 7 | 15.1 s | `8cfae76e` |
+
+Loading the model alone is byte-identical to no VAD, confirming the documented
+behaviour that `mask_enable` is the real switch. Masking on changes the text, so
+it was genuinely active — it moves 2 words and **zero** gaps.
+
+VAD-driven endpointing is byte-identical too. That is expected: it emits one
+final per utterance mid-stream, which is a server streaming behaviour and has
+nothing to do with single-file transcription.
+
+## Where this leaves the dropouts
+
+Not silence, not music, not segmentation, not language switching, not reachable
+by VAD. It scales with file length, it is partly mitigated by more right
+context, and the audio involved transcribes perfectly when cut out and fed in
+alone. The next thing worth doing is a length bisection — transcribe the first
+2, 4, 8, 16 minutes of the Quebecois file and find where a given span starts
+being dropped.

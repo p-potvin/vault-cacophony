@@ -44,7 +44,12 @@ asr:
     chunk_size: 0.16
     ctc_left_padding: 3.84
     ctc_right_padding: 0.16
-    rnnt_right_context: 1
+    # -1 = model max (3 for nemotron-3.5, step 320 ms). Measured to cut
+    # long-form dropouts by ~35% on 11.6 and 25.5 min files; see
+    # docs/plurilingual-vad-and-decoder-notes.md. Not monotonic -- right=2
+    # measured worse than right=1. Costs 160 ms -> 320 ms of encoder step,
+    # which matters live and not at all offline.
+    rnnt_right_context: -1
   decoder:
     kind: greedy
   # Silero VAD. The GGUF must come from this repo's own converter --
