@@ -87,6 +87,20 @@ re-measured here.
 
 ---
 
+## Status — steps 1 and 2 are done
+
+Measured Tue, 08 Sep 2026. Results in
+[plurilingual-step1-results.md](plurilingual-step1-results.md).
+
+**Step 1 failed and step 3 should not be built as designed.** Detection returns
+an empty `languages` on 58% of 10 s segments, and the rate is flat (50-58%)
+from 5 s to 30 s, so there is no sweet spot to tune. Step 2 then removed the
+motive: `--language auto` scores 23.99% WER against 27.40% pinned `es-US` and
+45.61% pinned `en-US`, so `auto` is not a compromise, it is the best option.
+
+Detection is fine on inter-sentential material (12.9% empty on the French file),
+so the failure is specific to mid-clause switching. Steps 4 and 5 stand.
+
 ## Next steps, in order
 
 ### 1. Measure detection on real code-switched audio (blocks everything else)
