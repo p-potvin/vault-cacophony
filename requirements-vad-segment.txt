@@ -1,0 +1,2 @@
+torch
+silero-vad==6.2.0

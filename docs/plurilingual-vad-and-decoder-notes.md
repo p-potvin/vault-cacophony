@@ -299,3 +299,68 @@ Worth testing next, in order:
    cheaper fix.
 3. A windowed normalization option in `fe.cpp` — statistics over a rolling
    window rather than the whole call.
+
+---
+
+# VAD-bounded segmentation — measured
+
+Tue, 08 Sep 2026, fourth pass. `scripts/vad_segment.py` cuts a file at the
+midpoint of Silero-detected silences, targeting a segment length, so no cut
+lands mid-word and each segment is normalized on its own statistics.
+
+## Right context stops mattering once the file is short
+
+`rnnt_right_context` 1, 2 and 3 produce **byte-identical output** on the 5 min
+prefix of the bilingual file — same md5, 1010 words — and identical merged
+results at *every* VAD segment length tested on both files. It only diverges on
+long whole-file input (11.6 min: RC1/RC2/RC3 agree only 0.90–0.92 pairwise).
+
+So right context is not really a quality knob. It is a mitigation for long-input
+degradation, and it is redundant once the input is segmented.
+
+## French/English, 11.6 min
+
+| method | words | gaps | dropped | % audio |
+|---|---|---|---|---|
+| whole-file RC1 | 2332 | 11 | 24.1 s | 3.46% |
+| whole-file RC2 | 2262 | 13 | 43.0 s | 6.17% |
+| whole-file RC3 | 2324 | 7 | 15.1 s | 2.17% |
+| **VAD-segmented (7 seg, any RC)** | **2363** | **4** | **12.2 s** | **1.75%** |
+
+Segmentation wins on every metric — most words, fewest gaps, least dropped time.
+
+## Quebecois, 25.5 min — segment length has an optimum
+
+Total gap time conflates two different things, so both are broken out: `warmup`
+is the per-segment encoder head gap, `real loss` is dropped content.
+
+| method | segs | words | gaps | gap total | warmup | real loss |
+|---|---|---|---|---|---|---|
+| whole-file RC1 | 1 | 4048 | 44 | 119.2 s | 0.6 s | 119.2 s |
+| whole-file RC3 | 1 | 4131 | 31 | 77.7 s | 0.6 s | 77.7 s |
+| VAD target 60 s | 25 | 4069 | 34 | 96.1 s | 32.2 s | 63.9 s |
+| **VAD target 150 s** | 11 | **4147** | 35 | 81.9 s | 17.8 s | **64.1 s** |
+| VAD target 240 s | 7 | 4099 | 31 | 82.0 s | 5.9 s | 76.1 s |
+
+**150 s is the optimum.** Real loss is flat at ~64 s for 60 s and 150 s segments
+and climbs back to 76 s at 240 s — approaching whole-file behaviour, exactly as
+the normalization account predicts. Meanwhile warmup falls monotonically with
+fewer segments. 150 s takes the low real loss without paying 25 segments' worth
+of warmup, and yields the highest word count of any configuration tested.
+
+Note that on raw "dropped seconds" whole-file RC3 (77.7 s) looks competitive with
+VAD 150 s (81.9 s). It is not: 17.8 s of the latter is warmup at known
+boundaries, so it recovers ~14 s more real speech and 16 more words.
+
+## Recommended configuration
+
+- segment with `scripts/vad_segment.py --target-s 150 --min-silence-ms 100
+  --threshold 0.7`
+- transcribe segments, any right context (it makes no difference once segmented)
+- the two files needed different VAD sensitivity to find silences at all: the
+  bilingual file is 98.8% speech and yields only 5 silences at defaults, hence
+  `--min-silence-ms 100 --threshold 0.7`
+
+Remaining: ~64 s of real loss on the Quebecois file is still unexplained by
+normalization alone, and warmup is a genuine per-segment cost that a proper
+overlap-and-merge would avoid. Those are the next two things worth attacking.
