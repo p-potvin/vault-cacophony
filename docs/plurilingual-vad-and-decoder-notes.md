@@ -552,3 +552,86 @@ measured 240 s optimum stands and is comfortably inside the limit.
 The alternative, if upstream behaviour can be changed, is to let cache-aware
 models fall through to `OfflineRunner`'s existing segmentation instead of the
 streaming runner, which would fix this for every caller without a wrapper.
+
+---
+
+# The fix, built and measured
+
+Tue, 08 Sep 2026, seventh pass.
+
+## What changed
+
+`Recognizer::recognize` — the complete-buffer/file path — no longer picks the
+streaming runner on length alone:
+
+```cpp
+const bool vulkan_requires_streaming = vulkan && head != HeadKind::Ctc;
+const bool use_streaming =
+    ((longform_streaming && exceeds_offline_limit) || vulkan_requires_streaming)
+    && supports_streaming;
+```
+
+Over-limit input now falls through to `OfflineRunner`, which already splits at
+`max_offline_samples_()` and snaps every cut to the quietest 100 ms window.
+
+**Streaming is not closed off.** Three things were kept deliberately:
+
+1. `streaming_recognize()` — live capture and server streams — builds its runner
+   unconditionally and was not touched. Verified: `transcribe --stream` on the
+   25.5 min file still logs `mode=streaming`.
+2. The Vulkan RNNT compatibility route is preserved as-is.
+3. `NEMO_SPEECH_LONGFORM_STREAMING=1` restores the old length-triggered
+   behaviour. Verified: it reproduces the previous default **exactly** —
+   4048 words, 44 gaps, 119.2 s.
+
+## Measured
+
+Quebecois 25.5 min, `--language fr-FR`:
+
+| condition | words | gaps | dropped | % audio |
+|---|---|---|---|---|
+| old default (streaming) | 4048 | 44 | 119.2 s | 7.80% |
+| old streaming + RC3 | 4131 | 31 | 77.7 s | 5.09% |
+| old VAD-seg target 150 s | 4147 | 35 | 81.9 s | 5.36% |
+| **new default (offline)** | **4114** | **32** | **81.1 s** | **5.31%** |
+| new + escape hatch | 4048 | 44 | 119.2 s | 7.80% |
+
+Bilingual 11.6 min, `--language auto`:
+
+| condition | words | gaps | dropped |
+|---|---|---|---|
+| old streaming RC1 | 2332 | 11 | 24.1 s |
+| old streaming RC3 | 2324 | 7 | 15.1 s |
+| **new default (offline)** | **2348** | 8 | 23.3 s |
+
+Against the **default** — which is what callers actually got — this is a clear
+win: +66 words and 38 s less dropped on the Quebecois file, and the highest word
+count of any configuration on the bilingual file. It is not a clean sweep:
+hand-tuned streaming RC3 still edges it on dropped seconds for the Quebecois
+file (77.7 s against 81.1 s), while recovering fewer words. VAD segmentation
+remains marginally ahead on word count and is now largely redundant.
+
+## Regression
+
+155 enspa clips (mostly 5.8–14.7 s, one at 24.6 s) are all far below the limit
+and were offline before and after. 154 of 155 byte-identical.
+
+The one that differed is **not** a regression: running the *same* new binary
+twice gives 3 differing clips out of 155, and the second run matches the old
+build exactly. Directory transcription with `--concurrency 4` batches utterances
+together and the batch composition varies between runs, which flips marginal
+clips.
+
+**This means per-clip results carry roughly 2% run-to-run noise whenever
+`--concurrency > 1`.** Single-file transcription is deterministic (verified
+earlier: two runs of the 25.5 min file byte-identical). Differences of one or
+two clips in any batch comparison are noise. The auto-vs-es head-to-head
+(71 against 26 with 58 ties) is far outside that band and stands.
+
+## Config consequence
+
+`asr.streaming.rnnt_right_context` is inert on the file path now, because the
+offline encoder ignores `asr.streaming.*`. Both pipeline configs are reverted
+from `-1` to the model default `1`: the measurement that justified `-1` came
+from file runs that were silently streaming, and on the live path it only buys
+latency (encoder step 160 ms to 320 ms).

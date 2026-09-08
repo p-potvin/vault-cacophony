@@ -44,12 +44,16 @@ asr:
     chunk_size: 0.16
     ctc_left_padding: 3.84
     ctc_right_padding: 0.16
-    # -1 = model max (3 for nemotron-3.5, step 320 ms). Measured to cut
-    # long-form dropouts by ~35% on 11.6 and 25.5 min files; see
-    # docs/plurilingual-vad-and-decoder-notes.md. Not monotonic -- right=2
-    # measured worse than right=1. Costs 160 ms -> 320 ms of encoder step,
-    # which matters live and not at all offline.
-    rnnt_right_context: -1
+    # Applies to genuine streaming only (live capture, server streams). The
+    # complete-buffer/file path now decodes offline at any length, and the
+    # offline encoder ignores asr.streaming.*, so this no longer affects
+    # subtitle generation from files.
+    #
+    # Left at the model default. The -1 (model max, 3) setting measured earlier
+    # was justified by long-form file runs that were silently on the streaming
+    # runner; with that fixed the justification is gone, and -1 costs live
+    # latency (encoder step 160 ms -> 320 ms).
+    rnnt_right_context: 1
   decoder:
     kind: greedy
   # Silero VAD. The GGUF must come from this repo's own converter --
