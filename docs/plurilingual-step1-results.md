@@ -1,5 +1,11 @@
 # Plurilingual steps 1 and 2 — measured results, Tue, 08 Sep 2026
 
+> **Superseded in part.** The step 2 table here was produced with the fused
+> attention kernel; see
+> [plurilingual-segmentation-audit.md](plurilingual-segmentation-audit.md) for
+> corrected numbers, a parakeet-ctc result, and a segmentation audit. The step 1
+> conclusion is unchanged.
+
 Answers steps 1 and 2 of [HANDOFF-plurilingual.md](HANDOFF-plurilingual.md).
 
 **Conclusion: do not build per-segment routing.** Step 1 shows the detection
