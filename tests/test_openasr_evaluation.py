@@ -43,6 +43,27 @@ class OpenAsrEvaluationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             MODULE.normalized_pairs([{"reference": "present"}], LowercaseNormalizer())
 
+    def test_methodology_defaults_to_the_english_normalizer(self) -> None:
+        report = MODULE.score_records(
+            [{"reference": "Hello.", "prediction": "hello"}], LowercaseNormalizer(), ExactMetric()
+        )
+
+        self.assertEqual(
+            report["methodology"]["normalizer"], MODULE.NORMALIZER_PATHS["english"]
+        )
+
+    def test_methodology_records_the_selected_normalizer(self) -> None:
+        report = MODULE.score_records(
+            [{"reference": "Hello.", "prediction": "hello"}],
+            LowercaseNormalizer(),
+            ExactMetric(),
+            normalizer_path=MODULE.NORMALIZER_PATHS["basic"],
+        )
+
+        self.assertEqual(
+            report["methodology"]["normalizer"], MODULE.NORMALIZER_PATHS["basic"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
