@@ -224,3 +224,78 @@ context, and the audio involved transcribes perfectly when cut out and fed in
 alone. The next thing worth doing is a length bisection — transcribe the first
 2, 4, 8, 16 minutes of the Quebecois file and find where a given span starts
 being dropped.
+
+---
+
+# Root cause: whole-file feature normalization
+
+Tue, 08 Sep 2026, third pass. This explains the length dependence.
+
+## Later audio changes earlier transcription
+
+Prefixes of the 25.5 min Quebecois file, transcribed independently, comparing
+only the words in the **first 3 minutes** — audio that is byte-identical in
+every run:
+
+| prefix | words in 0–3 min | identical to the 5 min run |
+|---|---|---|
+| 5 min | 513 | — |
+| 10 min | 507 | no (similarity 0.937) |
+| 15 min | 507 | no (0.937) |
+| 20 min | 507 | no (0.937) |
+| 26 min | 507 | no (0.937) |
+
+Appending audio at 20:00 changes what is transcribed at 2:00, and the changes
+are losses:
+
+```
+ 5 min: invitation avec grand plaisir. Ça
+26 min: invitation, ça
+
+ 5 min: fait sur le français québécois.
+26 min: fait.
+```
+
+It stabilises from 10 minutes on — 10, 15, 20 and 26 are identical to each
+other.
+
+## Why
+
+`src/asr/features/fe.cpp:477`:
+
+> Per-feature normalization over the valid frames **in this call**. Streaming
+> mode skips it and maintains incremental statistics in the runner.
+
+The offline path computes, per mel bin, a mean and an unbiased variance across
+**every valid frame of the whole file**, then applies them to all frames
+(`fe.cpp:484-501`). So the normalization applied to the frame at 3:35 is a
+function of audio at 20:00. A longer file moves those statistics, every frame
+shifts, and marginal spans fall out of the decode. Once the file is long enough
+for the statistics to converge — about 10 minutes here — the effect saturates,
+which is exactly the stabilisation in the table.
+
+The same mechanism explains the earlier bisection: the 3:35 span is dropped for
+2.96 s at a 5 min prefix and 8.32 s at every prefix of 10 min or more.
+
+## What follows
+
+This reframes the dropouts. They are not a decoder defect and not about
+language: whole-file normalization means long-form accuracy is inherently
+length-dependent, and the marginal spans it costs are the "gaps".
+
+It also partly rehabilitates segmenting. Cutting a long file into pieces gives
+each piece its own, better-conditioned statistics — that is likely why the
+isolated cut-outs transcribe perfectly. The earlier finding stands that naive
+fixed-window cuts damage boundaries, so the shape of a fix is: **segment on
+silence (VAD), not on a fixed grid**, so each segment is separately normalized
+and no cut lands mid-word.
+
+Worth testing next, in order:
+
+1. VAD-bounded segmentation vs whole-file on both long files, scored on gap time
+   and word count.
+2. Whether the streaming incremental-statistics path (which skips this
+   normalization) shows the same length dependence — if not, that is the
+   cheaper fix.
+3. A windowed normalization option in `fe.cpp` — statistics over a rolling
+   window rather than the whole call.
