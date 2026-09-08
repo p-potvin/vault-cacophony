@@ -452,3 +452,103 @@ it is catastrophic, as expected from pinning a single language.
 `build.ps1` with script defaults had reconfigured it to NMT/HTTP/flashlight OFF;
 that is undone. `NEMO_SPEECH_WITH_NORM` remains OFF — it cannot be enabled on
 Windows.
+
+---
+
+# Root cause, found: the automatic offline-to-streaming switch
+
+Tue, 08 Sep 2026, sixth pass. This is the actual mechanism, and it supersedes
+both the retracted normalization account and the "unknown" verdict after it.
+
+## The switch
+
+`recognizer.cpp:559-568`:
+
+```cpp
+const bool exceeds_offline_limit = exceeds_offline_position_limit(*model_, n, sample_rate);
+const bool supports_streaming = head == Ctc || rnnt->supports_cache_streaming();
+const bool use_streaming = (exceeds_offline_limit || (vulkan && ...)) && supports_streaming;
+```
+
+`exceeds_offline_position_limit` projects the input through the frontend and
+subsampling and compares the result against the encoder's positional-embedding
+table. For nemotron-3.5 — `hop 160`, `subsampling_factor 8`,
+`conv_context causal`, `pos_emb_max_len 5000` — that puts the boundary at
+
+**399.9 s = 6 min 40 s.**
+
+Below it the file is decoded by the offline full-context runner. Above it, the
+recognizer silently swaps in the buffered cache-aware streaming runner. Nothing
+in the output says which ran; only the `[asr] mode=` line on stderr does.
+
+Confirmed by straddling it. Two prefixes of the same file:
+
+```
+395 s  ->  [asr] mode=offline   head=rnnt attention-left=56 attention-right=3
+405 s  ->  [asr] mode=streaming head=rnnt left=56 center=1 right=1 step=160ms
+```
+
+## What it costs
+
+Comparing only the shared 0–395 s — byte-identical audio, the sole difference
+being 10 s appended past the threshold:
+
+| | words | gaps > 1.5 s | dropped | % of audio |
+|---|---|---|---|---|
+| 395 s file — **offline** | 1074 | 6 | 18.3 s | 4.64% |
+| 405 s file — **streaming** | 1060 | 7 | 25.0 s | 6.32% |
+
+Word-sequence similarity 0.924, and the losses are the familiar ones:
+
+```
+offline  : invitation avec grand plaisir. Ça      streaming: invitation, ça
+offline  : fait sur le français québécois.        streaming: fait.
+```
+
+Ten seconds of extra audio at the end of a file deletes words six minutes
+earlier, because those ten seconds change which decoder runs.
+
+## Everything else follows from this
+
+- **The prefix ladder.** 5 min (300 s) is offline; 10, 15, 20 and 26 min are all
+  streaming. That is why 0–3 min gave 513 words at 5 min and 507 at every longer
+  prefix, identical to each other. The "saturation at 10 minutes" was not
+  statistics converging — every prefix ≥ 10 min simply ran the same path.
+- **Right context.** `asr.streaming.*` is inert in the offline path, which is
+  why RC1/RC2/RC3 are byte-identical on the 5 min file and on every VAD segment,
+  and only diverge above 400 s.
+- **Why segmentation helps.** VAD segments (60, 150, 240 s targets) all sit
+  under 399.9 s, so each is decoded offline. Segmentation was never fixing
+  normalization; it was keeping the input in the better runner.
+- **Why isolated cut-outs read perfectly.** They are seconds long.
+- **The enspa WER table is unaffected** — clips are 5.8–14.7 s, far below the
+  threshold, all offline.
+
+## A correction to earlier notes
+
+Runs of the 11.6 min bilingual file were labelled an "offline baseline". At
+696 s that file is **above** the threshold, so those runs were streaming. The
+`mode=offline` line quoted earlier came from a probe over four 10 s segments.
+The claim that "offline and streaming right=1 are byte-identical" was therefore
+comparing streaming with streaming — true but vacuous.
+
+## The offline runner already solves this, unreachably
+
+`OfflineRunner::offline_segments_` splits long audio at `max_offline_samples_`
+(a binary search for the largest length under the position limit) and snaps each
+cut to the centre of the quietest 100 ms window via `snap_to_quiet_` — the same
+design as `scripts/vad_segment.py`. But `use_streaming` diverts long input to
+the streaming runner before `OfflineRunner` is ever constructed, and it is
+gated on `supports_cache_streaming()`. So the offline-only models
+(parakeet-tdt) get quiet-snapped offline segmentation for free on long files,
+while the cache-aware ones (nemotron-3.5, nemotron-en) never do.
+
+## Recommendation
+
+Keep every ASR call under **399.9 s** for nemotron models. `vad_segment.py
+--target-s 150` already does; anything up to ~300 s is safe with margin. The
+measured 240 s optimum stands and is comfortably inside the limit.
+
+The alternative, if upstream behaviour can be changed, is to let cache-aware
+models fall through to `OfflineRunner`'s existing segmentation instead of the
+streaming runner, which would fix this for every caller without a wrapper.
