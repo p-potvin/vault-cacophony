@@ -227,9 +227,14 @@ being dropped.
 
 ---
 
-# Root cause: whole-file feature normalization
+# Root cause: whole-file feature normalization — RETRACTED
 
-Tue, 08 Sep 2026, third pass. This explains the length dependence.
+Tue, 08 Sep 2026, third pass, **corrected in the fifth pass below**. The
+measurements in this section are sound and reproducible; the *explanation* is
+wrong. `nemotron-3.5` sets `asr.preprocessor.normalize = "NA"`, so the
+whole-file normalization described here never executes for the model every one
+of these tests used. Read this section for the evidence of length dependence,
+not for its cause. See "Correction: normalization is not the mechanism".
 
 ## Later audio changes earlier transcription
 
@@ -364,3 +369,86 @@ boundaries, so it recovers ~14 s more real speech and 16 more words.
 Remaining: ~64 s of real loss on the Quebecois file is still unexplained by
 normalization alone, and warmup is a genuine per-segment cost that a proper
 overlap-and-merge would avoid. Those are the next two things worth attacking.
+
+---
+
+# Correction: normalization is not the mechanism
+
+Tue, 08 Sep 2026, fifth pass.
+
+## What was wrong
+
+The third pass attributed the long-form dropouts to `fe.cpp:477`, which
+normalizes mel features over every frame of the call. That code is real and it
+would have that effect — but it is gated on `cfg_.normalize_per_feature`, which
+comes from the model:
+
+| model | `asr.preprocessor.normalize` |
+|---|---|
+| nemotron-3.5-asr-streaming-0.6b | **`NA`** |
+| nemotron-speech-streaming-en-0.6b | **`NA`** |
+| parakeet-ctc-1.1b | `per_feature` |
+| parakeet-tdt-0.6b-v3 | `per_feature` |
+
+Every long-form test in these notes used nemotron-3.5, so **no per-feature
+normalization ran at all**. The mechanism cannot be the one claimed.
+
+Proved directly: a windowed-normalization option was added and swept at 10, 30,
+60 and 150 s on the 25.5 min file. All four are byte-identical to the
+unmodified whole-call path — 4131 words, 31 gaps, 77.7 s — because the code is
+never reached for this model.
+
+## What still stands
+
+The length dependence itself is measured and reproducible, and it is not run
+noise: transcribing the same file twice gives byte-identical output
+(md5 `342A796A…` both runs). So appending audio really does change earlier
+transcription, deterministically. The mechanism is still unknown.
+
+Everything else in these notes is unaffected — the monolingual control, the
+right-context sweep, the VAD A/B, and the VAD-segmentation results are all
+measurements, not inferences from the retracted cause. Segmentation still helps;
+the reason it helps is what is now open again.
+
+## The windowed-normalization knob
+
+Implemented anyway, since it is correct for the models that do use per-feature
+normalization. `NEMO_SPEECH_NORM_WINDOW_S` (seconds, 0 = off = whole call)
+switches `fe.cpp` to statistics gathered over a centered window around each
+frame, via prefix sums so the cost stays O(n_mels x n_frames).
+
+- Unset, it is **bit-identical** to the previous build: the 25.5 min file
+  reproduces 4131 words / 31 gaps / 77.7 s and the same text md5 across the
+  rebuild.
+- It measurably changes output on `parakeet-tdt`, which does use per-feature
+  normalization, so the implementation works.
+- It does not help there either: on the Quebecois file, off = 1922 words /
+  644.5 s dropped, 30 s = 1831 / 676.2 s, 60 s = 1886 / 648.2 s. parakeet-tdt is
+  a poor fit for this material regardless (42% of audio dropped against
+  nemotron's 5%).
+
+Keep it as a sweepable knob for the parakeet models. It is not a fix for the
+nemotron long-form problem and must not be described as one.
+
+## fr-CA
+
+Accepted without error, and it does change output, but it does not help:
+
+| file | flag | words | gaps | dropped |
+|---|---|---|---|---|
+| Quebecois 25.5 min | `fr-FR` | 4131 | 31 | 77.7 s |
+| Quebecois 25.5 min | `fr-CA` | 4102 | 36 | 90.4 s |
+| bilingual 11.6 min | `auto` | 2324 | 7 | 15.1 s |
+| bilingual 11.6 min | `fr-CA` | 1570 | 26 | 201.3 s |
+
+0.951 word-sequence similarity to `fr-FR` on the monolingual file, and the model
+still reports `fr-FR` back in `languages` either way. On the half-English file
+it is catastrophic, as expected from pinning a single language.
+
+## Build note
+
+`build-cuda` was rebuilt with `-Profile server -Flashlight`
+(ASR + diarization + TTS + NMT + HTTP + flashlight). An earlier run of
+`build.ps1` with script defaults had reconfigured it to NMT/HTTP/flashlight OFF;
+that is undone. `NEMO_SPEECH_WITH_NORM` remains OFF — it cannot be enabled on
+Windows.
