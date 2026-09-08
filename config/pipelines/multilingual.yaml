@@ -39,6 +39,31 @@ asr:
     rnnt_right_context: 1
   decoder:
     kind: greedy
+  # Silero VAD. The GGUF must come from this repo's own converter --
+  #   pip install "silero-vad==6.2.0"
+  #   python NeMo-Speech.cpp/convert_model.py silero --outfile <out>.gguf
+  # which writes general.architecture="vad", the vad.* hparams, and tensor
+  # names like encoder.0.conv.weight. A silero GGUF from another toolchain
+  # (e.g. vokra-core, which writes vokra.* and sr16k.encoder.0.reparam_conv.*)
+  # loads in no way at all: the binary rejects it at startup.
+  #
+  # mask_enable is the actual switch. Loading a VAD model alone does nothing.
+  # Note that turning masking on moves the RNNT path from mode=offline to
+  # mode=streaming, which is a behaviour change beyond the masking itself.
+  #
+  # Measured on the 11.6 min French/English file: masking left the long-form
+  # dropouts completely untouched -- identical gap positions and durations to
+  # the centisecond -- and moved word count 2332 -> 2336. It is not a fix for
+  # those; see docs/plurilingual-vad-and-decoder-notes.md.
+  vad:
+    model_path: NeMo-Speech.cpp/models/silero-v6.2.0-nemo.gguf
+    masker:
+      mask_enable: false
+      onset: 0.5
+      offset: 0.3
+      pad_onset_ms: 200
+      pad_offset_ms: 200
+      min_duration_off_ms: 500
   endpointing:
     enable: true
     vad_based: false

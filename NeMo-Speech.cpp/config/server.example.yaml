@@ -45,7 +45,7 @@ asr:
     vad_based: false
     stop_history_eou_ms: 800
   postproc:
-    pnc_model_path: /models/pnc.gguf
+    #pnc_model_path: /models/pnc.gguf
     #itn_model_dir: /models/sparrowhawk_en
     # profanity_list_path: /models/profanity.txt
 
