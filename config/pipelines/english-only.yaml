@@ -1,0 +1,66 @@
+# english-only.yaml — resident server profile for the -EnglishOnly pipelines.
+#
+# Covers ESA (English Standard Audio) and EDA (English Dirty Audio). The two
+# differ only in whether the client runs BS-RoFormer first, which is a
+# client-side stage in audio.cpp and not a server concern -- so both use this
+# file unchanged.
+#
+#   nemo-speech serve --config config/pipelines/english-only.yaml
+#
+# Precedence is defaults < this YAML < environment < CLI, so anything here can
+# be overridden per run without editing the file:
+#   nemo-speech serve --config .../english-only.yaml --asr.backend.gpu 1
+#
+# NMT is deliberately absent. -EnglishOnly means no translation, and leaving
+# nmt out keeps Riva-Translate-4B (2.7 GB) off the card entirely rather than
+# loading it to sit idle.
+
+http:
+  enabled: true
+  host: 127.0.0.1
+  port: 8123
+  threads: 4
+  max-upload-mb: 512
+  access-log: true
+  log-format: text
+  playground: false
+
+asr:
+  enabled: true
+  backend:
+    gpu: 0
+  model:
+    # nemotron-speech-streaming-en-0.6b. Cache-aware streaming, and streaming
+    # mode is strictly cheaper than offline on this model: measured 74.6 s vs
+    # 76.8 s on 45 minutes, at 1078 MiB against 2430 MiB. Use parakeet-tdt
+    # instead for pure batch throughput (RTFx 118 offline with the query-length
+    # gate) -- but it cannot stream, so it cannot serve the live surface.
+    path: nvidia/nemotron-speech-streaming-en-0.6b
+  streaming:
+    # Asymmetric on purpose. Each CTC step processes chunk + left + right to
+    # emit `chunk` seconds, so right padding is latency you pay on every cue
+    # while left padding is context you already have. 3.84 left / 0.16 right
+    # keeps the context and drops the wait.
+    chunk_size: 0.16
+    ctc_left_padding: 3.84
+    ctc_right_padding: 0.16
+    rnnt_right_context: 1
+  decoder:
+    kind: greedy
+  endpointing:
+    enable: true
+    vad_based: false
+    stop_history_eou_ms: 800
+  postproc: {}
+
+# Word-level speaker tags. Roughly doubles ASR cost (83.5 s -> 157.5 s on 45
+# minutes) and still lands at 17x realtime. Comment out for the cheapest path.
+diar:
+  model_path: nvidia/diar_streaming_sortformer_4spk-v2
+  preset: streaming
+
+nmt:
+  enabled: false
+
+tts:
+  enabled: false

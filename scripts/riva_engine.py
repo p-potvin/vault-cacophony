@@ -1,97 +1,101 @@
 #!/usr/bin/env python3
-"""Riva-Translate-4B translation engine.
+"""Riva-Translate-4B V2 translation engine.
 
-Wraps the quantized Riva-Translate-4B-Instruct GGUF model for fast, local,
+Wraps the quantized Riva-Translate-4B-Instruct-v2 GGUF model for fast, local,
 offline neural machine translation. Implements the official NVIDIA prompt
-specification and language pair mappings across 50+ language pairs.
+chat template with language pair codes.
+
+Supported Language Codes:
+- System prompt expects 2-letter or 4-letter language pair codes (e.g. "en-es", "es-en", "en-fr", "en-de", "en-zh-cn", "en-es-us", "en-pt-br").
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# Official Riva Language Pair Mappings (Source -> Target Language Display Names)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Official NVIDIA Riva language pairs registry
 RIVA_LANGUAGE_PAIRS: Dict[str, Tuple[str, str]] = {
-    # English to World Languages
-    "en-zh-cn": ("English", "Simplified Chinese"),
-    "en-zh": ("English", "Simplified Chinese"),
-    "en-zh-tw": ("English", "Traditional Chinese"),
-    "en-ar": ("English", "Arabic"),
-    "en-de": ("English", "German"),
+    # English -> Other
     "en-es": ("English", "European Spanish"),
     "en-es-es": ("English", "European Spanish"),
     "en-es-us": ("English", "Latin American Spanish"),
     "en-fr": ("English", "French"),
+    "en-de": ("English", "German"),
+    "en-it": ("English", "Italian"),
+    "en-pt": ("English", "European Portuguese"),
+    "en-pt-pt": ("English", "European Portuguese"),
+    "en-pt-br": ("English", "Brazilian Portuguese"),
+    "en-ru": ("English", "Russian"),
+    "en-zh": ("English", "Simplified Chinese"),
+    "en-zh-cn": ("English", "Simplified Chinese"),
+    "en-zh-tw": ("English", "Traditional Chinese"),
     "en-ja": ("English", "Japanese"),
     "en-ko": ("English", "Korean"),
-    "en-ru": ("English", "Russian"),
-    "en-pt": ("English", "Brazilian Portuguese"),
-    "en-pt-br": ("English", "Brazilian Portuguese"),
-    "en-pt-pt": ("English", "European Portuguese"),
-    "en-it": ("English", "Italian"),
+    "en-ar": ("English", "Arabic"),
     "en-nl": ("English", "Dutch"),
     "en-pl": ("English", "Polish"),
     "en-cs": ("English", "Czech"),
     "en-sv": ("English", "Swedish"),
     "en-da": ("English", "Danish"),
     "en-fi": ("English", "Finnish"),
-    "en-no": ("English", "Norwegian"),
+    "en-el": ("English", "Greek"),
     "en-hu": ("English", "Hungarian"),
     "en-ro": ("English", "Romanian"),
+    "en-sk": ("English", "Slovak"),
     "en-bg": ("English", "Bulgarian"),
     "en-uk": ("English", "Ukrainian"),
-    "en-sk": ("English", "Slovak"),
     "en-hr": ("English", "Croatian"),
     "en-sl": ("English", "Slovenian"),
     "en-et": ("English", "Estonian"),
     "en-lv": ("English", "Latvian"),
     "en-lt": ("English", "Lithuanian"),
-    "en-el": ("English", "Greek"),
+    "en-no": ("English", "Norwegian"),
     "en-tr": ("English", "Turkish"),
     "en-id": ("English", "Indonesian"),
     "en-vi": ("English", "Vietnamese"),
     "en-th": ("English", "Thai"),
     "en-hi": ("English", "Hindi"),
-
-    # World Languages to English
-    "zh-en": ("Simplified Chinese", "English"),
-    "zh-cn-en": ("Simplified Chinese", "English"),
-    "zh-tw-en": ("Traditional Chinese", "English"),
-    "ar-en": ("Arabic", "English"),
-    "de-en": ("German", "English"),
+    # Other -> English
     "es-en": ("European Spanish", "English"),
     "es-es-en": ("European Spanish", "English"),
     "es-us-en": ("Latin American Spanish", "English"),
     "fr-en": ("French", "English"),
+    "de-en": ("German", "English"),
+    "it-en": ("Italian", "English"),
+    "pt-en": ("European Portuguese", "English"),
+    "pt-pt-en": ("European Portuguese", "English"),
+    "pt-br-en": ("Brazilian Portuguese", "English"),
+    "ru-en": ("Russian", "English"),
+    "zh-en": ("Simplified Chinese", "English"),
+    "zh-cn-en": ("Simplified Chinese", "English"),
+    "zh-tw-en": ("Traditional Chinese", "English"),
     "ja-en": ("Japanese", "English"),
     "ko-en": ("Korean", "English"),
-    "ru-en": ("Russian", "English"),
-    "pt-en": ("Brazilian Portuguese", "English"),
-    "pt-br-en": ("Brazilian Portuguese", "English"),
-    "it-en": ("Italian", "English"),
+    "ar-en": ("Arabic", "English"),
     "nl-en": ("Dutch", "English"),
     "pl-en": ("Polish", "English"),
     "cs-en": ("Czech", "English"),
     "sv-en": ("Swedish", "English"),
     "da-en": ("Danish", "English"),
     "fi-en": ("Finnish", "English"),
-    "no-en": ("Norwegian", "English"),
+    "el-en": ("Greek", "English"),
     "hu-en": ("Hungarian", "English"),
     "ro-en": ("Romanian", "English"),
+    "sk-en": ("Slovak", "English"),
     "bg-en": ("Bulgarian", "English"),
     "uk-en": ("Ukrainian", "English"),
-    "sk-en": ("Slovak", "English"),
     "hr-en": ("Croatian", "English"),
     "sl-en": ("Slovenian", "English"),
     "et-en": ("Estonian", "English"),
     "lv-en": ("Latvian", "English"),
     "lt-en": ("Lithuanian", "English"),
-    "el-en": ("Greek", "English"),
+    "no-en": ("Norwegian", "English"),
     "tr-en": ("Turkish", "English"),
     "id-en": ("Indonesian", "English"),
     "vi-en": ("Vietnamese", "English"),
@@ -99,12 +103,23 @@ RIVA_LANGUAGE_PAIRS: Dict[str, Tuple[str, str]] = {
     "hi-en": ("Hindi", "English"),
 }
 
-DEFAULT_MODEL_PATH = str(
-    Path(__file__).resolve().parent.parent
-    / "audio.cpp"
-    / "models"
-    / "Riva-Translate-4B-Instruct.i1-Q4_K_M.gguf"
-)
+
+def find_default_model_path() -> str:
+    """Locate the Riva-Translate-4B-Instruct-v2 GGUF model."""
+    candidates = [
+        REPO_ROOT / "NeMo-Speech.cpp" / "models" / "Riva-Translate-4B-Instruct-v2-Q4_K_M.gguf",
+        Path(__file__).resolve().parent / "models" / "Riva-Translate-4B-Instruct-v2-Q4_K_M.gguf",
+        REPO_ROOT / "models" / "Riva-Translate-4B-Instruct-v2-Q4_K_M.gguf",
+        REPO_ROOT / "audio.cpp" / "models" / "Riva-Translate-4B-Instruct-v2-Q4_K_M.gguf",
+        REPO_ROOT / "audio.cpp" / "models" / "Riva-Translate-4B-Instruct.i1-Q4_K_M.gguf",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return str(candidates[0])
+
+
+DEFAULT_MODEL_PATH = find_default_model_path()
 
 
 def normalize_code(code: str) -> str:
@@ -161,6 +176,20 @@ def resolve_language_pair(source: str, target: str) -> Tuple[str, str, str]:
     s = normalize_code(source)
     t = normalize_code(target)
 
+    # Handle auto cases
+    if s == "auto" and (t == "auto" or t == "en" or not t):
+        return "auto", "Auto", "English"
+    if s == "auto":
+        # Target specified, source auto (e.g. auto -> es)
+        tgt_name = RIVA_LANGUAGE_PAIRS.get(f"en-{t}", ("English", t.upper()))[1]
+        return f"en-{t}", "Auto", tgt_name
+    if t == "auto":
+        # Source specified, target auto
+        if s == "en":
+            return "en-es", "English", "European Spanish"
+        src_name = RIVA_LANGUAGE_PAIRS.get(f"{s}-en", (s.upper(), "English"))[0]
+        return f"{s}-en", src_name, "English (Auto)"
+
     # If already a combined tag e.g. 'en-es'
     if "-" in s and not t:
         tag = s
@@ -181,17 +210,31 @@ def resolve_language_pair(source: str, target: str) -> Tuple[str, str, str]:
         src_name, tgt_name = RIVA_LANGUAGE_PAIRS[base_tag]
         return base_tag, src_name, tgt_name
 
-    # Check reverse or default English pair
-    if s_base != "en" and t_base != "en":
-        raise ValueError(
-            f"Unsupported language pair: '{source}' -> '{target}'. "
-            "Riva-Translate-4B requires English on either the source or target side."
+    # Fallback to direct pair for Riva v2
+    return tag, s.upper(), t.upper()
+
+
+def build_riva_messages(lang_pair_code: str, text: str, context: Optional[str] = None) -> List[Dict[str, str]]:
+    """Build the official NVIDIA Riva-Translate-4B-Instruct-v2 chat messages."""
+    messages = [
+        {"role": "system", "content": lang_pair_code},
+    ]
+    if context and context.strip():
+        messages.append({"role": "context", "content": context.strip()})
+    messages.append({"role": "user", "content": text.strip()})
+    return messages
+
+
+def build_riva_prompt(source_lang_name: str, target_lang_name: str, text: str, lang_pair_code: Optional[str] = None) -> str:
+    """Build the NVIDIA Riva translation prompt (supports v2 short tag or v1 verbose format)."""
+    if lang_pair_code:
+        return (
+            f"<s>System\n"
+            f"{lang_pair_code}</s>\n"
+            f"<s>User\n"
+            f"{text.strip()}</s>\n"
+            f"<s>Assistant\n"
         )
-    raise ValueError(f"Language pair not found in Riva registry: '{source}' -> '{target}'")
-
-
-def build_riva_prompt(source_lang_name: str, target_lang_name: str, text: str) -> str:
-    """Build the official NVIDIA Riva translation prompt."""
     return (
         f"System\n"
         f"You are an expert at translating text from {source_lang_name} to {target_lang_name}.</s>\n"
@@ -201,8 +244,63 @@ def build_riva_prompt(source_lang_name: str, target_lang_name: str, text: str) -
     )
 
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+CP437_UTF8_MAP = {
+    "├®": "é", "├í": "á", "├¡": "í", "├│": "ó", "├║": "ú",
+    "├▒": "ñ", "├æ": "Ñ", "├╝": "ü", "├¿": "è", "├á": "à",
+    "├ç": "ç", "├»": "ï", "├«": "î", "├┤": "ô", "├ª": "æ",
+    "├â": "Ã", "├é": "É", "├È": "È", "├À": "À",
+    "┬í": "¡", "┬¿": "¿", "âEuro": "—", "â€\"": "—",
+}
+
+
+def clean_console_text(text: str) -> str:
+    """Clean CP437 unicode misinterpretations for console display only."""
+    if not isinstance(text, str):
+        return text
+    for bad, good in CP437_UTF8_MAP.items():
+        if bad in text:
+            text = text.replace(bad, good)
+    return text
+
+
+def ensure_cuda_dlls():
+    """Ensure CUDA 13.3 and PyTorch CUDA DLL directories are added to Windows search path."""
+    if sys.platform != "win32":
+        return
+
+    # Add PyTorch CUDA DLLs if present
+    torch_lib = os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")
+    if os.path.exists(torch_lib):
+        try:
+            os.add_dll_directory(torch_lib)
+            os.environ["PATH"] = torch_lib + ";" + os.environ.get("PATH", "")
+        except Exception:
+            pass
+
+    # Add system CUDA toolkit paths
+    cuda_paths = [
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64",
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin",
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v11.8\bin",
+    ]
+    for p in cuda_paths:
+        if os.path.exists(p):
+            try:
+                os.add_dll_directory(p)
+                os.environ["PATH"] = p + ";" + os.environ.get("PATH", "")
+            except Exception:
+                pass
+
+
 class RivaEngine:
-    """Inference engine for Riva-Translate-4B GGUF."""
+    """Inference engine for Riva-Translate-4B-Instruct-v2 GGUF."""
 
     def __init__(
         self,
@@ -219,11 +317,12 @@ class RivaEngine:
         self.n_gpu_layers = n_gpu_layers
         self.verbose = verbose
         self._llm = None
-        self._cache: Dict[Tuple[str, str, str], str] = {}
+        self._cache: Dict[Tuple[str, str], str] = {}
 
     def _init_llm(self):
         if self._llm is not None:
             return
+        ensure_cuda_dlls()
         try:
             from llama_cpp import Llama
 
@@ -246,27 +345,25 @@ class RivaEngine:
         max_tokens: int = 256,
         temperature: float = 0.0,
     ) -> str:
-        """Translate a single string."""
+        """Translate a single string using Riva-Translate-4B-Instruct-v2."""
         if not text.strip():
             return text
 
         tag, src_name, tgt_name = resolve_language_pair(source_lang, target_lang)
-        cache_key = (src_name, tgt_name, text.strip())
+        cache_key = (tag, text.strip())
         if cache_key in self._cache:
             return self._cache[cache_key]
 
         self._init_llm()
-        prompt = build_riva_prompt(src_name, tgt_name, text)
+        messages = build_riva_messages(tag, text)
 
-        res = self._llm(
-            prompt,
+        res = self._llm.create_chat_completion(
+            messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
-            stop=["</s>", "<|endoftext|>", "\n<s>"],
-            echo=False,
         )
 
-        translated = res["choices"][0]["text"].strip()
+        translated = res["choices"][0]["message"]["content"].strip()
         # Clean up possible formatting artifacts
         if translated.startswith('"') and translated.endswith('"') and len(translated) > 1:
             translated = translated[1:-1].strip()
@@ -301,7 +398,7 @@ class RivaEngine:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Translate text using Riva-Translate-4B GGUF.")
+    parser = argparse.ArgumentParser(description="Translate text using Riva-Translate-4B-Instruct-v2 GGUF.")
     parser.add_argument("text", nargs="?", help="Text to translate (or pipe via stdin)")
     parser.add_argument("--model", default=DEFAULT_MODEL_PATH, help="Path to Riva GGUF model")
     parser.add_argument("--from-lang", "-s", default="en", help="Source language (default: en)")
@@ -315,7 +412,7 @@ def main():
         if not sys.stdin.isatty():
             input_text = sys.stdin.read()
         else:
-            parser.print_help()
+            print("[!] Error: No input text provided.", file=sys.stderr)
             sys.exit(1)
 
     engine = RivaEngine(
@@ -325,11 +422,11 @@ def main():
     )
 
     result = engine.translate(
-        text=input_text,
+        input_text,
         target_lang=args.to_lang,
         source_lang=args.from_lang,
     )
-    print(result)
+    print(clean_console_text(result))
 
 
 if __name__ == "__main__":

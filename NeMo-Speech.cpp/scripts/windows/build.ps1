@@ -216,11 +216,10 @@ Write-Host "    config=$Config compiler=$Compiler host=$HostArch target=$TargetA
 Write-Host "    vcpkg=$($VcpkgFeatures -join ',') triplet=$VcpkgTriplet"
 if ($DryRun) { return }
 
-# --- 1. Refresh environment from registry (choco/installers land there) ---------
 $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 $user    = [Environment]::GetEnvironmentVariable('Path', 'User')
 $process = $env:Path
-$env:Path = "$machine;$user;$process"
+$env:Path = ("$machine;$user;$process" -split ';' | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique) -join ';'
 $vk = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
 if (-not $vk) { $vk = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'User') }
 if ($vk) { $env:VULKAN_SDK = $vk }
@@ -244,10 +243,18 @@ $vcvarsBat = if ($HostArch -eq 'ARM64' -and $TargetArch -eq 'x64') {
     'vcvars64.bat'
 }
 $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\$vcvarsBat"
-if (-not (Test-Path $vcvars)) { throw "$vcvarsBat not found at $vcvars" }
-Write-Host "==> importing MSVC env from $vsPath ($vcvarsBat)"
-cmd /c "`"$vcvars`" >NUL 2>&1 && set" | ForEach-Object {
-    if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
+$tmpBat = [System.IO.Path]::GetTempFileName() + ".bat"
+try {
+    "@call `"$vcvars`" >nul`r`n@set" | Set-Content $tmpBat
+    $envLines = @(& cmd.exe /c $tmpBat)
+    foreach ($line in $envLines) {
+        if ($line -match '^([^=]+)=(.*)$') {
+            [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
+            Set-Item -Path "env:$($Matches[1])" -Value $Matches[2]
+        }
+    }
+} finally {
+    Remove-Item $tmpBat -ErrorAction SilentlyContinue
 }
 
 foreach ($tool in 'git', 'cl', 'cmake', 'ninja') {

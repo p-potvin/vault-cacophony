@@ -1,0 +1,79 @@
+# multilingual.yaml — resident server profile for every non -EnglishOnly pipeline.
+#
+# Covers MSA, MDA, and both Plurilingual variants. As with english-only.yaml the
+# Standard/Dirty split is client-side (BS-RoFormer via audio.cpp) and does not
+# change this file.
+#
+#   nemo-speech serve --config config/pipelines/multilingual.yaml
+#
+# The ASR model is nemotron-3.5 rather than parakeet-tdt for one specific
+# reason: it is the only model here that reports which language it heard.
+# Measured on synthesized clips with --language auto, whole-file:
+#
+#   fr clip -> languages: "fr-FR"      de clip -> languages: "de-DE"
+#   es clip -> languages: "es-US"      en clip -> languages: "en-US"
+#
+# parakeet-tdt transcribes those same 25 languages correctly but returns no
+# language field at all, so it cannot drive translation routing.
+
+http:
+  enabled: true
+  host: 127.0.0.1
+  port: 8123
+  threads: 4
+  max-upload-mb: 512
+  access-log: true
+  log-format: text
+  playground: false
+
+asr:
+  enabled: true
+  backend:
+    gpu: 0
+  model:
+    path: nvidia/nemotron-3.5-asr-streaming-0.6b
+  streaming:
+    chunk_size: 0.16
+    ctc_left_padding: 3.84
+    ctc_right_padding: 0.16
+    rnnt_right_context: 1
+  decoder:
+    kind: greedy
+  endpointing:
+    enable: true
+    vad_based: false
+    stop_history_eou_ms: 800
+  postproc: {}
+
+diar:
+  model_path: nvidia/diar_streaming_sortformer_4spk-v2
+  preset: streaming
+
+# Riva-Translate-4B. Loaded here so the 2.7 GB checkpoint is resident for the
+# whole run: translating per file through the CLI reloads it every time, which
+# on a season of twenty episodes is twenty loads for a stage whose real work is
+# seconds. Through /v1/translations it measured 12 cues in 2.41 s.
+#
+# IMPORTANT: Riva is English-centric. X->en and en->X work; anything else is
+# rejected outright with
+#   {"error":{"message":"nmt: unsupported language pair: fr -> es"}}
+# Confirmed for fr->es, es->de and de->fr. Non-English pairs must pivot through
+# English (two calls) -- see docs/pipeline-reconciliation.md.
+nmt:
+  enabled: true
+  backend:
+    gpu: 0
+  model:
+    path: NeMo-Speech.cpp/models/Riva-Translate-4B-Instruct-v2-Q4_K_M.gguf
+    # 1024 is the engine default (~136 MiB of KV at ~0.13 MiB/token). 4096 is
+    # ~546 MiB and gives room for longer cues; the model maximum is 8192.
+    n_ctx: 4096
+  generation:
+    max_new_tokens: 256
+  pool:
+    # Raise only if concurrent streams actually need it: each context is
+    # another n_ctx-sized KV cache.
+    contexts: 1
+
+tts:
+  enabled: false
