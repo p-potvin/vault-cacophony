@@ -635,3 +635,86 @@ offline encoder ignores `asr.streaming.*`. Both pipeline configs are reverted
 from `-1` to the model default `1`: the measurement that justified `-1` came
 from file runs that were silently streaming, and on the live path it only buys
 latency (encoder step 160 ms to 320 ms).
+
+---
+
+# Full re-run on the fixed build
+
+Tue, 08 Sep 2026, eighth pass. Everything below was re-measured after the
+dispatch fix. Pre-fix outputs are kept under `scratchpad/marked/`.
+
+## Concurrency 1 is deterministic
+
+155 enspa clips transcribed twice at `--concurrency 1`: **155/155
+byte-identical**. That confirms `--concurrency 4` was the sole source of the
+per-clip variation, and all comparison runs below use concurrency 1.
+
+The aggregates barely moved, so the earlier concurrency-4 numbers were sound —
+the noise flipped individual marginal clips without shifting the totals.
+
+## enspa WER, re-run
+
+| condition | as-is | apostrophes stripped | enspa (151) | spa (4) | empty |
+|---|---|---|---|---|---|
+| nemotron `auto` | **23.87%** | 23.96% | 23.89% | 22.03% | 0 |
+| nemotron `es-US` | 27.17% | 27.08% | 27.23% | 22.03% | 1 |
+| parakeet-tdt | 26.19% | 26.22% | 26.22% | 23.73% | 2 |
+| nemotron `en-US` | 46.17% | 46.94% | 45.55% | 100.00% | 10 |
+| parakeet-ctc | 55.58% | 56.38% | 55.06% | 100.00% | 0 |
+
+Unchanged conclusions: `auto` leads, `en-US` is destructive on Spanish, and
+apostrophe handling is irrelevant (≤0.8 points, unsigned).
+
+## Long files — VAD segmentation still earns its keep
+
+Quebecois 25.5 min, everything now offline:
+
+| condition | words | gaps | dropped | warmup | real loss |
+|---|---|---|---|---|---|
+| whole-file `fr-FR` | 4114 | 32 | 81.1 s | — | 81.1 s |
+| whole-file `fr-CA` | 4089 | 40 | 97.0 s | — | 97.0 s |
+| VAD 60 s (25 seg) | 4069 | 34 | 96.1 s | 32.2 s | 63.9 s |
+| **VAD 150 s (11 seg)** | **4147** | 35 | 81.9 s | 17.8 s | **64.1 s** |
+| VAD 240 s (7 seg) | 4099 | 31 | 82.0 s | 5.9 s | 76.1 s |
+
+Bilingual 11.6 min:
+
+| condition | words | gaps | dropped |
+|---|---|---|---|
+| whole-file `auto` | 2348 | 8 | 23.3 s |
+| **VAD-segmented (7 seg), `auto`** | **2363** | **4** | **12.2 s** (5.7 s warmup) |
+| whole-file `fr-FR` | 1484 | 22 | 186.2 s |
+| whole-file `fr-CA` | 1621 | 23 | 185.5 s |
+
+**Segmentation is not redundant after the fix.** On the Quebecois file it still
+recovers ~17 s more real speech than whole-file (64.1 s against 81.1 s of loss)
+and 33 more words; on the bilingual file it halves the dropped time. The
+`--target-s 150` optimum holds, and the VAD-segmented numbers are byte-identical
+to the pre-fix run — expected, since segments were always under the threshold
+and always decoded offline.
+
+## fr-CA
+
+On the metrics, `fr-FR` wins the monolingual file: 4114 words / 81.1 s dropped
+against fr-CA's 4089 / 97.0 s, at 0.949 word-sequence similarity. On the
+bilingual file `fr-CA` beats `fr-FR` (1621 against 1484 words) but both are far
+behind `auto`, which is expected when half the audio is English.
+
+This contradicts the owner's reading that fr-CA is the better Quebecois
+transcript. The two are not measuring the same thing: gap-and-word-count metrics
+reward coverage, not correctness of the words recovered, and there is no
+reference transcript for this file so no WER is available. The side-by-side is
+in
+[docs/transcripts/v2-quebecois-frFR-vs-frCA-vs-vad.md](transcripts/v2-quebecois-frFR-vs-frCA-vs-vad.md)
+— judge it by reading, and treat the table above as coverage only.
+
+Note also that the model reports `languages: ["fr-FR"]` whichever of the two is
+requested.
+
+## Recommended pipeline
+
+1. `scripts/vad_segment.py --target-s 150 --min-silence-ms 100 --threshold 0.7`
+2. transcribe segments with `--concurrency 1` for reproducibility
+3. `--language auto` for mixed audio, an explicit code when the language is
+   known and single
+4. right context: leave at the default; it is inert on this path
