@@ -31,17 +31,17 @@ asr:
     chunk_size: 0.16
     ctc_left_padding: 3.84
     ctc_right_padding: 0.16
-    rnnt_right_context: 1
+    rnnt_right_context: -1
   decoder:
-    kind: flashlight                # greedy | flashlight
+    kind: greedy                # greedy | flashlight
   vad:
-    model_path:                 # empty = no VAD loaded
+    model_path: /models/silero-vad  # empty = no VAD loaded
     masker:
       mask_enable: false
       onset: 0.5
       offset: 0.3
   endpointing:
-    enable: true
+    enable: false
     vad_based: false
     stop_history_eou_ms: 800
   postproc:
@@ -101,8 +101,8 @@ nmt:
     gpu: 0                      # GPU device index, -1 = CPU
   model:
     path: /models/riva-translate-4b-instruct-v2.q8_0.gguf   # f16 also works
-    n_ctx: 1024                 # raise for longer inputs; KV cache grows with n_ctx
+    n_ctx: 2048                 # raise for longer inputs; KV cache grows with n_ctx
   generation:
     max_new_tokens: 256
   pool:
-    contexts: 1                 # concurrent decode contexts
+    contexts: 2                 # concurrent decode contexts
