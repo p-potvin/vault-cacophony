@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -166,6 +167,8 @@ RnntGreedyDecoder::finalize() {
     flush_word();
 }
 
+static bool rnnt_trace_enabled();
+
 std::vector<int>
 RnntGreedyDecoder::step(const float* enc_out, int d_model, int T, int64_t frame_offset) {
     return step_impl(enc_out, nullptr, d_model, T, frame_offset);
@@ -197,6 +200,13 @@ RnntGreedyDecoder::step_impl(
         return emitted;
     DecodeStepScope decode_scope(engine_);
     stats_.encoder_frames += static_cast<uint64_t>(T);
+    if (rnnt_trace_enabled())
+        std::fprintf(
+            stderr,
+            "[rnnt] CHUNK enter frame_offset=%lld T=%d frames (%.0f ms) blank_id=%d"
+            " max_symbols_per_step=%d prev_token=%d boosting=%s\n",
+            static_cast<long long>(frame_offset), T, T * 80.0, blank_id, max_sym,
+            prev_token_, bias_on_ ? "on" : "off");
 
     // With a fixed predictor output, joint evaluations for all remaining
     // encoder frames are independent. Evaluate them in one graph and consume
@@ -303,6 +313,16 @@ RnntGreedyDecoder::step_impl(
         t += first_emit;
         const int token = token_ids_[static_cast<size_t>(first_emit)];
 
+        if (rnnt_trace_enabled()) {
+            const char* piece = "";
+            if (token >= 0 && token < static_cast<int>(vocab.size()))
+                piece = vocab[static_cast<size_t>(token)].c_str();
+            std::fprintf(
+                stderr,
+                "[rnnt]   t=%2d/%d EMIT token=%-6d %-14s (blank_run=%d before it,"
+                " symbols_at_frame=%d/%d)\n",
+                t, T, token, piece, first_emit, symbols_at_frame, max_sym);
+        }
         emitted.push_back(token);
         ++stats_.emitted_tokens;
         last_emit_frame_ = frame_offset + t;
@@ -331,10 +351,22 @@ RnntGreedyDecoder::step_impl(
             bias_node_ = bias_tree_.advance(bias_node_, token);
 
         if (++symbols_at_frame >= max_sym) {
+            if (rnnt_trace_enabled())
+                std::fprintf(
+                    stderr,
+                    "[rnnt]   !! SYMBOL CAP: %d symbols emitted on frame t=%d"
+                    " (max_symbols_per_step=%d). Force-advancing to t=%d; anything the"
+                    " model still wanted on this frame is DISCARDED.\n",
+                    symbols_at_frame, t, max_sym, t + 1);
             ++t;
             symbols_at_frame = 0;
         }
     }
+    if (rnnt_trace_enabled())
+        std::fprintf(
+            stderr,
+            "[rnnt] CHUNK exit  t=%d/%d emitted=%zu token(s)\n",
+            t, T, emitted.size());
     return emitted;
 }
 
@@ -384,6 +416,37 @@ TdtGreedyDecoder::finalize() {
     flush_word();
 }
 
+// ---------------------------------------------------------------------------
+// Optional TDT decode tracing. Set NEMO_SPEECH_DEBUG_RNNT=1 to dump the decode
+// loop to stderr. Off by default; costs one cached bool test per frame.
+//
+// What the loop does, since the trace only makes sense alongside it:
+//
+//   * The encoder hands the decoder a CHUNK of T frames. T is the cache-aware
+//     chunk, cache_chunk_frames = 1 + cache_right_ctx, so rnnt_right_context=1
+//     gives T=2 (160 ms) and =3 gives T=4 (320 ms). Right context is therefore
+//     not just lookahead: it sets how much audio the joint sees per chunk.
+//   * At each frame the joint predicts BOTH a token and a DURATION index. The
+//     duration says how many frames to jump: skip = durations[idx]. That is
+//     what makes this TDT (token-and-duration transducer) rather than plain
+//     RNN-T, where every step advances exactly one frame.
+//   * The inner loop repeats only while skip == 0, i.e. while the model wants
+//     several tokens on the SAME frame. max_symbols_per_step bounds that, so
+//     the cap can only bite on chains of zero-duration tokens.
+//   * A duration may jump PAST the end of the chunk. The overshoot is stored in
+//     pending_skip_ and consumed at the start of the next chunk, where those
+//     frames are skipped outright and never reach the joint. Audio inside them
+//     cannot be transcribed, and nothing reports an error. That is the most
+//     plausible route for speech to disappear silently.
+static bool
+rnnt_trace_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NEMO_SPEECH_DEBUG_RNNT");
+        return v != nullptr && *v != 0 && *v != '0';
+    }();
+    return on;
+}
+
 std::vector<int>
 TdtGreedyDecoder::step(const float* enc_out, int d_model, int T, int64_t frame_offset) {
     const auto& cfg = engine_->rnnt_config();
@@ -397,6 +460,20 @@ TdtGreedyDecoder::step(const float* enc_out, int d_model, int T, int64_t frame_o
 
     stats_.encoder_frames += static_cast<uint64_t>(T);
     int t = pending_skip_;
+    if (rnnt_trace_enabled()) {
+        std::fprintf(
+            stderr,
+            "[rnnt] CHUNK enter frame_offset=%lld T=%d frames carried_pending_skip=%d"
+            " max_symbols_per_step=%d blank_id=%d\n",
+            static_cast<long long>(frame_offset), T, pending_skip_,
+            cfg.max_symbols_per_step, cfg.blank_id);
+        if (pending_skip_ > 0)
+            std::fprintf(
+                stderr,
+                "[rnnt]   ^ previous chunk overshot its end by %d frame(s); they are"
+                " SKIPPED here and never reach the joint (%.0f ms of audio lost)\n",
+                pending_skip_, pending_skip_ * 80.0);
+    }
     pending_skip_ = 0;
     while (t < T) {
         int symbols_added = 0;
@@ -425,12 +502,31 @@ TdtGreedyDecoder::step(const float* enc_out, int d_model, int T, int64_t frame_o
             skip = cfg.durations[static_cast<size_t>(duration_index)];
             if (skip < 0)
                 throw std::runtime_error("TDT duration values must be non-negative");
+            if (rnnt_trace_enabled()) {
+                const bool is_blank = (token == cfg.blank_id);
+                const char* piece = "";
+                if (!is_blank && token >= 0 &&
+                    token < static_cast<int>(engine_->vocab().size()))
+                    piece = engine_->vocab()[static_cast<size_t>(token)].c_str();
+                std::fprintf(
+                    stderr,
+                    "[rnnt]   t=%2d/%d sym#%d token=%-6d %-14s dur_idx=%d skip=%d"
+                    " (%.0f ms)%s\n",
+                    t, T, symbols_added, token, is_blank ? "<blank>" : piece,
+                    duration_index, skip, skip * 80.0, is_blank ? "" : "  EMIT");
+            }
 
             // NeMo special-cases blank + duration zero: no decoder state has
             // changed and revisiting the same encoder frame could only repeat
             // that decision, so advance one frame immediately.
-            if (token == cfg.blank_id && skip == 0)
+            if (token == cfg.blank_id && skip == 0) {
+                if (rnnt_trace_enabled())
+                    std::fprintf(
+                        stderr,
+                        "[rnnt]     blank with duration 0 -> forcing skip=1 so this"
+                        " frame cannot be revisited forever\n");
                 skip = 1;
+            }
 
             if (token != cfg.blank_id) {
                 emitted.push_back(token);
@@ -459,12 +555,31 @@ TdtGreedyDecoder::step(const float* enc_out, int d_model, int T, int64_t frame_o
             need_loop = skip == 0;
         }
 
+        if (rnnt_trace_enabled() && symbols_added >= cfg.max_symbols_per_step)
+            std::fprintf(
+                stderr,
+                "[rnnt]   !! symbol cap reached at t=%d: %d symbols on one frame"
+                " (max_symbols_per_step=%d), skip=%d\n",
+                t, symbols_added, cfg.max_symbols_per_step, skip);
         // NeMo's infinite-loop guard: duration zero can otherwise revisit the
         // same frame forever (blank or a chain of zero-duration tokens).
-        if (symbols_added == cfg.max_symbols_per_step && skip == 0)
+        if (symbols_added == cfg.max_symbols_per_step && skip == 0) {
+            if (rnnt_trace_enabled())
+                std::fprintf(
+                    stderr,
+                    "[rnnt]   !! GUARD FIRED: cap hit with duration 0, force-advancing"
+                    " t %d -> %d. Anything still pending on this frame is DISCARDED.\n",
+                    t, t + 1);
             ++t;
+        }
     }
     pending_skip_ = std::max(0, t - T);
+    if (rnnt_trace_enabled())
+        std::fprintf(
+            stderr,
+            "[rnnt] CHUNK exit  t=%d T=%d emitted=%zu token(s) new_pending_skip=%d%s\n",
+            t, T, emitted.size(), pending_skip_,
+            pending_skip_ > 0 ? "  <-- will skip the next chunk's opening frames" : "");
     return emitted;
 }
 

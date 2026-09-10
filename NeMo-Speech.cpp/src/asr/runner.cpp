@@ -805,6 +805,15 @@ CacheStreamRunner::CacheStreamRunner(
     // attn_mask sizing and chunk-shift math. Same derivation the encoder uses
     // (make_cache_aware_config), so the two can't drift.
     enc_cfg_ = make_cache_aware_config(model->encoder_config(), right_ctx);
+    if (std::getenv("NEMO_SPEECH_DEBUG_RNNT"))
+        std::fprintf(
+            stderr,
+            "[enc ] cache-aware geometry: requested right_ctx=%d -> left_ctx=%d"
+            " chunk_frames=%d right_ctx=%d (attention %d frames, step %.0f ms)\n",
+            right_ctx, enc_cfg_.cache_left_ctx, enc_cfg_.cache_chunk_frames,
+            enc_cfg_.cache_right_ctx,
+            enc_cfg_.cache_left_ctx + enc_cfg_.cache_chunk_frames,
+            enc_cfg_.cache_chunk_frames * 80.0);
 
     // The per-stream K/V/conv cache is device-resident (cache_state_), allocated
     // lazily on first encode. Only attn_mask stays host-side - it's a per-call
