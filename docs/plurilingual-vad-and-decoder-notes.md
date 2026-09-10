@@ -798,3 +798,92 @@ cleanup; on switching audio it recovers content nothing else recovers.
 
 VAD segmentation does **not** help here, which is worth noting given it helped
 with the long-form dropouts — further evidence these are two different faults.
+
+## Follow-up: the discriminator is right context, and it is reproducible
+
+Thu, 11 Sep 2026. The owner spotted that two archived runs kept the sentence,
+which narrows it much further than the separation result did.
+
+Every archived run of the same file, checked for the missing sentence:
+
+| run | setting | result | words |
+|---|---|---|---|
+| `fr-out` | default (rc=1) | **kept** | 2332 |
+| `fr-rc1` | rc=1 | **kept** | 2332 |
+| `fr-vad` | rc=1 + VAD | **kept** | 2336 |
+| `fr-rc2` | rc=2 | dropped | 2262 |
+| `fr-rc3` | rc=3 | dropped | 2324 |
+| `fr-vadoff` / `fr-vadon` / `fr-eou` | rc=3 | dropped | 2322–2324 |
+| `v2-fr-auto`, `fix-fr-offline` | offline path | dropped | 2348 |
+
+Confirmed causally by re-running the same file at each setting with everything
+else held constant:
+
+```
+right_context=1  KEPT     words=2332
+right_context=2  dropped  words=2262
+right_context=3  dropped  words=2324
+```
+
+**`rnnt_right_context=1` keeps the span; 2 and 3 lose it.** Perfectly
+reproducible, which matches the owner's observation that the hole is "too clean"
+to be model noise — it is a deterministic consequence of a decode setting.
+
+### Why right context changes what is emitted
+
+`fastconformer.h:107`: `cache_chunk_frames = 1 + cache_right_ctx`. Right context
+does not merely add lookahead, it sets the **decode chunk size** — rc=1 is a
+2-frame / 160 ms step, rc=3 is a 4-frame / 320 ms step. More speech is consumed
+per decoding step at higher rc.
+
+### Candidate mechanism, NOT confirmed
+
+`rnnt_greedy_decoder.cpp:462-465` carries exactly the kind of guard the owner
+suspected:
+
+```cpp
+// NeMo's infinite-loop guard: duration zero can otherwise revisit the
+// same frame forever (blank or a chain of zero-duration tokens).
+if (symbols_added == cfg.max_symbols_per_step && skip == 0)
+    ++t;
+```
+
+`max_symbols_per_step` defaults to 10. When the cap is hit the frame is
+force-advanced and whatever the model still wanted to emit is discarded — a
+mechanism that actively deletes output rather than failing to produce it.
+
+This is **a hypothesis, not a result.** It has not been tested, because
+`max_symbols_per_step` is read from the GGUF (`model.cpp:1263`) and is not
+registered as a CLI key — like the sortformer scoring constants, it cannot be
+overridden without a rebuild. Testing it means patching the default in
+`rnnt_greedy_decoder.h:41` and rebuilding.
+
+### The tension this creates with the dispatch fix
+
+Two earlier conclusions now pull against each other:
+
+- `rnnt_right_context=-1` (=3) was recorded as the best lever against long-form
+  dropouts, cutting total gap time by ~35%.
+- rc=1 is what preserves this switch content.
+
+They are not the same failure. Higher right context reduces total dropped
+seconds while *causing* this particular language-switch hole. The pipeline
+configs are already back at rc=1, which is the right default for code-switched
+material, but the trade-off should be a conscious choice per workload rather
+than a single global setting.
+
+Worse, the offline/streaming dispatch fix interacts with this: long files now
+take the offline path, which uses the model's `offline_left_ctx`/
+`offline_right_ctx` (56/3) and **also drops the span**. Note those are an
+attention *window*, a different mechanism from the cache-aware decode chunk, so
+this is a correlation between two settings that both happen to be "3" — not a
+demonstrated common cause. Neither offline context value is CLI-overridable
+either.
+
+### Where this leaves the language-switch story
+
+Separation still recovers the span, and rc=1 still recovers it. Both are real.
+The failure band measured over preceding French context (1–3 s drops, 0–0.5 s
+and 4–6 s keep) was measured at the offline default, so it describes the failing
+configuration rather than the model in general. The switch is what makes the
+span *vulnerable*; the decode geometry is what determines whether it survives.
