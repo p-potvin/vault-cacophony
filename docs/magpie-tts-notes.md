@@ -149,3 +149,84 @@ reproduced here in clean synthetic audio with no accent or noise to blame.
 Voice identity does hold across languages: Sofia and Aria remain recognisably
 themselves in Spanish and French, which is why the diarizer merged them there
 too.
+
+---
+
+# Gap sweep, voice-embedding check, and an end-to-end run
+
+Wed, 10 Sep 2026.
+
+## Inter-turn gap: 100-350 ms, and long pauses hurt
+
+The same two conversations re-spliced at 0 / 100 / 350 / 1000 ms:
+
+| conversation | 0 ms | 100 ms | 350 ms | 1000 ms |
+|---|---|---|---|---|
+| conv4 (English) WER | 3.70% | **2.22%** | 2.96% | 3.70% |
+| convml (en/es/fr) WER | 17.65% | **14.71%** | 14.71% | **26.47%** |
+| labels emitted (conv4 / convml) | 3 / 2 | 3 / 2 | 3 / 2 | 3 / 2 |
+
+Two things fall out. **The gap does not touch the speaker merge** — three labels
+for four speakers at every gap tested, so the Sofia/Aria collapse is not a
+boundary or timing artifact.
+
+And **a long pause is actively harmful on multilingual audio**. At 1000 ms the
+en/es/fr file lost language detection entirely, returning `['en-US']` instead of
+all three, and WER nearly doubled to 26.47%. Silence apparently lets the
+language state fall back to English. Keep inter-turn silence in the
+**100-350 ms** band; a full second is worse than none at all.
+
+## The two merged voices really are the closest pair
+
+The owner's objection was that Sofia and Aria sound nothing alike. They don't —
+but the diarizer is not listening the way a person does. Same sentence in all
+five voices, CAM++ (WeSpeaker VoxCeleb) embeddings, cosine similarity:
+
+```
+  0.422  Sofia / Aria     <- merged in all three failing runs
+  0.345  Jason / Leo      <- the single Leo->Jason miss in conv5
+  0.327  John / Leo
+  0.226  John / Jason
+  0.205  Aria / Jason
+  0.193  John / Sofia
+  0.165  Aria / Leo
+  0.127  John / Aria
+  0.111  Sofia / Jason
+  0.052  Sofia / Leo
+```
+
+Sofia/Aria is the top pair by a clear margin, and Jason/Leo — the second-closest
+— is exactly where the one remaining speaker error landed. The merges track
+embedding distance, not perceived similarity. Speaker embeddings key on pitch
+range, formant structure and timbre statistics rather than the qualities a
+listener attends to, which is why the ear and the model disagree.
+
+This also gives a cheap pre-flight check: embed any candidate voice set with
+`scripts/voiceprint.py` and reject pairs above roughly 0.4 before generating
+anything.
+
+## End to end from a real audio file
+
+`Start-BetterSubtitles.ps1 -Speakers -LowMemory` on the real 11.6 min
+French/English recording, with the new defaults (nemotron-3.5, `--language auto`)
+and BS-RoFormer separation:
+
+- 696.1 s of audio in **217.3 s wall** — about 3.2x realtime for the whole
+  pipeline, separation at RTFx 4.35 and ASR at RTFx 12.24
+- **2365 words**, 223 cues, against 2348 from the raw file, so separation is
+  worth roughly 17 words here
+- diarization found **4 speakers**: the narrator at 169 cues plus three voices
+  from the clips she plays
+
+The structure is right where it matters:
+
+```
+[Speaker 1] ...and to understand that, let's watch our first video.
+[Speaker 2] Tous les jeunes adultes que nous a interpellons ici à Montréal...
+[Speaker 3] Moi, j'ai que
+[Speaker 2] toutes mes séries en anglais, même dans...
+```
+
+The narrator/clip handoff lands exactly on the cut. The one-cue flip to
+Speaker 3 mid-sentence is the same turn-boundary weakness seen in the synthetic
+runs — brief, and it recovers immediately.
