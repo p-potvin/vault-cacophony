@@ -887,3 +887,78 @@ The failure band measured over preceding French context (1–3 s drops, 0–0.5 
 and 4–6 s keep) was measured at the offline default, so it describes the failing
 configuration rather than the model in general. The switch is what makes the
 span *vulnerable*; the decode geometry is what determines whether it survives.
+
+## Word boosting is a no-op on every model we have
+
+Thu, 11 Sep 2026. Tested directly rather than by impression.
+
+Boosting the exact swallowed phrases at the failing setting changes **nothing**:
+
+```
+rc=3, no boost   dropped, 2324 words, text md5 8cfae76e09c9
+rc=3, boost 3    dropped, 2324 words, text md5 8cfae76e09c9   <- byte-identical
+```
+
+Byte-identical output means boosting is not merely failing to rescue the span,
+it is not running at all.
+
+The reason is in `model.h:120` and `model.cpp:1307`: word boosting needs the
+SentencePiece proto embedded in the GGUF under **`asr.tokenizer.spm_model`**,
+base64-encoded, and the code notes it is "absent in older GGUFs (boosting
+no-ops)". Checked all four cached ASR models:
+
+| model | `asr.tokenizer.spm_model` |
+|---|---|
+| nemotron-3.5-asr-streaming-0.6b | **absent** |
+| nemotron-speech-streaming-en-0.6b | **absent** |
+| parakeet-ctc-1.1b | **absent** |
+| parakeet-tdt-0.6b-v3 | **absent** |
+
+nemotron-3.5 carries `asr.tokenizer.type = sentencepiece_bpe` and
+`asr.tokenizer.vocab`, but not the model proto itself, so
+`AsrModel::tokenize_boost_phrase` returns empty and every phrase is silently
+dropped before it can reach the boosting tree.
+
+**So `--speech-context` currently does nothing here, on any model, RNNT or CTC.**
+The documented behaviour is real; our GGUFs simply predate the embedded
+tokenizer. Anything that looked like boosting working was coincidence.
+
+The fix is a re-conversion, not a code change: `conversion/asr.py:229` already
+defines `KEY_TOK_MODEL = asr.tokenizer.spm_model`, so converting nemotron-3.5
+from its HF checkpoint with this repo's `convert_model.py` embeds the proto and
+turns boosting on. That is a ~0.6 B model, far more tractable than the 44 GB
+VoiceChat download.
+
+Until then, boosting cannot be used to steer the language switches.
+
+## max_symbols_per_step is safe to change
+
+The concern that it must match a CUDA graph shape does not apply. The ONNX and
+TensorRT constraint is about the **encoder** attention mask having to match
+left + current + right context — that is `cache_left_ctx`, `cache_chunk_frames`
+and `cache_right_ctx`, and it is real.
+
+`max_symbols_per_step` is a different thing: `rnnt_greedy_decoder.cpp:404` uses
+it purely as the bound of a `while` loop that issues repeated **single-symbol**
+calls (`joint_tdt_argmax(..., 1, ...)`), each a fixed-shape graph. Changing the
+bound changes how many times a fixed graph is invoked, never a tensor shape.
+
+It is still not reachable from the CLI — GGUF-only, `model.cpp:1263` — so
+testing the hypothesis means editing `rnnt_greedy_decoder.h:41` and rebuilding.
+
+## Rebuild cost, measured
+
+| | time |
+|---|---|
+| no-op incremental (`ninja`, MSVC env loaded) | **0.3 s** |
+| one host-side file changed, rebuild + relink via `build.ps1` | **54.4 s** |
+
+The 54 s includes `build.ps1`'s vcpkg check and cmake reconfigure; the compile
+and link themselves are a few seconds. A CUDA-touching change costs far more,
+and a fresh build directory is tens of minutes.
+
+Iterating on a host-side C++ file is therefore cheap — under a minute per
+attempt. That removes the main argument for deploying the ONNX build just to
+avoid rebuilds. `cmake --build` must be invoked through `build.ps1` (or a
+Developer prompt); calling it directly fails with `Cannot open include file:
+'cstdint'` because the MSVC environment is not loaded.
