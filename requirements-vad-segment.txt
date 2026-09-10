@@ -1,2 +1,15 @@
-torch
+# vad_segment.py needs torch plus silero-vad. torchaudio is not imported by
+# vad_segment.py itself, but silero_vad/utils_vad.py imports it at module level,
+# so it has to be installed and ABI-compatible with torch.
+#
+# Pinned to the cu126 set shared across the VaultWares venvs. torchaudio does
+# not track torch's version number: 2.11.0 is what pairs with torch 2.13.0, and
+# there is no torchaudio 2.13.0 at all.
+#
+# Install with:
+#   uv pip install -r requirements-vad-segment.txt
+#       --index pytorch-cu126=https://download.pytorch.org/whl/cu126
+#       --index-strategy unsafe-best-match
+torch==2.13.0
+torchaudio==2.11.0
 silero-vad==6.2.0

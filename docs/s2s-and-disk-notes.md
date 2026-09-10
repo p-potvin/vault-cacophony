@@ -110,3 +110,56 @@ rather than a script. `vaultwares-api` is on Python 3.13 and cannot join the
 
 A single global VaultWares venv would save little beyond that alignment: uv's
 cache is already doing most of the sharing.
+
+---
+
+## Follow-up: the two venvs are aligned
+
+Wed, 10 Sep 2026. `vaultwares-api` left alone as instructed (Python 3.13, CPU
+torch, no CUDA payload).
+
+`vault-inference` turned out to be a latent bug rather than a preference: its
+`pyproject.toml` had pinned `torch==2.13.0` for a while but sourced it from the
+cu121 index, which has no 2.13.0 build, so the venv sat on **2.5.1+cu121 while
+claiming 2.13.0**. Repointing the index to cu126 satisfies the pin that was
+already declared.
+
+`vault-cacophony` moved 2.8.0+cu129 to 2.13.0+cu126. That broke `torchaudio`,
+which is compiled against a specific torch ABI — `libtorchaudio.pyd` refused to
+load, and `silero_vad/utils_vad.py` imports torchaudio at module level, so the
+VAD segmenter went down with it. **torchaudio does not track torch's version
+number**: there is no torchaudio 2.13.0, and 2.11.0 is the build that pairs with
+torch 2.13.0. `requirements-vad-segment.txt` now pins all three explicitly.
+
+| venv | unique before | unique after |
+|---|---|---|
+| vault-cacophony | 7.75 G | 6.78 G |
+| vault-explorer | 4.04 G | 1.24 G |
+| vault-streaming | 0.27 G | 0.27 G |
+| vault-inference | 4.51 G | **0.29 G** |
+| ColONEL-KFC | 1.17 G | 1.00 G |
+| vaultwares-studio | 2.17 G | 2.17 G |
+| vaultwares-api | 0.61 G | 0.61 G |
+| python-zipper | 0.64 G | 0.64 G |
+| **total unique** | **21.16 G** | **13.00 G** |
+
+**8.16 GiB of unique venv data eliminated**, and C: free space went from 52.9 GB
+to 71.7 GB — the larger figure because dropping the two odd torch builds also
+released their entries in uv's shared cache.
+
+Verified after the change: all five CUDA venvs import torch with `cuda=True`;
+vault-inference's transformers, accelerate, bitsandbytes 0.50.0, safetensors,
+sentencepiece, fastapi, uvicorn and pydantic all import; and `vad_segment.py`
+reproduces its previous output exactly on the French file (36 speech spans,
+98.8% speech).
+
+Rollback freezes for both venvs are in the session scratchpad under
+`venv-rollback/`.
+
+## VoiceChat is out of reach on this box
+
+Not pursued further. Even at Q4 the pipeline needs two ~5 GB models resident
+side by side plus KV cache, which this GPU cannot hold. The 44.4 GB fp32
+download was never started. A Q4 PersonaPlex is the remaining idea and does not
+use this checkpoint layout, so it would be its own conversion problem rather
+than a drop-in.
