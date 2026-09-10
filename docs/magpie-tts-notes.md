@@ -230,3 +230,133 @@ The structure is right where it matters:
 The narrator/clip handoff lands exactly on the cut. The one-cue flip to
 Speaker 3 mid-sentence is the same turn-boundary weakness seen in the synthetic
 runs — brief, and it recovers immediately.
+
+---
+
+# Corrections and the post-processing survey
+
+Wed, 10 Sep 2026.
+
+## CORRECTION: voice identity does NOT survive a language change
+
+An earlier section claimed "voice identity does hold across languages". That is
+wrong, and the owner's ear caught it. Same sentence, same speaker, three
+languages, CAM++ cosine:
+
+| speaker | en vs es | en vs fr | es vs fr |
+|---|---|---|---|
+| Sofia | 0.604 | 0.567 | 0.646 |
+| Aria | 0.511 | **0.428** | 0.465 |
+| John | 0.568 | 0.483 | 0.611 |
+
+Same-speaker embeddings normally sit well above these. The decisive comparison:
+**Aria-English vs Aria-French is 0.428, and Aria vs Sofia *within* French is
+also 0.428.** Changing the language moves the voice as much as changing the
+speaker does. These are effectively different voices per language, not one voice
+speaking three languages.
+
+That also explains the multilingual merge. Sofia/Aria similarity is
+language-dependent:
+
+| | en | es | fr |
+|---|---|---|---|
+| Sofia vs Aria | 0.289 | **0.441** | **0.428** |
+
+They are reasonably distinct in English and converge in Spanish and French,
+which is exactly where the diarizer collapsed them.
+
+**Consequence for dubbing:** a speaker cannot be kept consistent across a
+language switch by reusing the same `--voice`. Anything needing one identity
+across languages needs voice cloning, which is reported poor here.
+
+## CORRECTION: the end-to-end speaker flip
+
+In the real-audio run the flip to Speaker 3 on "Moi, j'ai que" is **correct** —
+that is a different person in the played clip. The error is the flip *back* to
+Speaker 2 for "toutes mes series en anglais", which is still Speaker 3. Recorded
+the wrong way round earlier.
+
+## Synthesis speed
+
+**2.0-2.9x realtime** on cuda:0, typically ~2.6x. Per-run: en 2.53-2.70,
+es 2.45-2.57, fr 2.80-2.86, de 1.97, conversation lines 2.66-2.81.
+
+## Sortformer: what can and cannot be controlled
+
+Exposed (`--diar-*`): `model_path`, `preset` (streaming | offline), `chunk`,
+`right_context`, `left_context`, `fifo`, `spkcache`, `update_period`.
+
+**Not exposed:** there is no "do not re-assign" flag and no "pin to speaker N at
+the limit" behaviour. The scoring constants that would govern that —
+`pred_score_threshold` 0.25, `scores_boost_latest` 0.05, `sil_threshold` 0.2,
+`strong_boost_rate` 0.75, `weak_boost_rate` 1.5, `min_pos_scores_rate` 0.5 — are
+model-tied, read from `sortformer.scoring.*` in the GGUF, and are never
+registered as CLI keys. `num_speakers = 4` is likewise a model constant.
+
+`--diar-preset offline` is the closest available lever and it is **not** a clean
+win:
+
+| conversation | streaming | offline |
+|---|---|---|
+| convctl (4 distinct) | 96.2%, 10/10 | 96.2%, 10/10 |
+| conv4 (Sofia+Aria) | 66.9%, 7/10 | **76.7%, 8/10** |
+| conv5 (5 speakers) | 67.0%, 7/10, 4 labels | **60.2%, 6/10, 3 labels** |
+| convml | 71.3%, 6/9 | 71.3%, 6/9 |
+
+It helps where two voices are confusable and hurts when there are more speakers
+than labels — it emitted one *fewer* label on the 5-speaker file. Note also that
+true offline diarization (`diarize_offline`) carries the same ~6.6 min
+positional-embedding ceiling as the ASR path, so long files must use the
+streaming diarizer regardless.
+
+## Magpie batch inference / evaluation is not ported
+
+The HF model card's "Method 2 — batch inference and evaluation" is NeMo-Python
+tooling. The C++ port has no manifest or batch mode: `synthesize` takes one
+`TEXT` or one `--input` file, and the two are mutually exclusive. There is no
+evaluation harness — no UTMOS, SQuIM or speaker-similarity scoring anywhere in
+the tree. Batch evaluation means either driving `synthesize` in a loop from our
+own script, or running the NeMo Python stack separately.
+
+What did ship on the TTS side: `scripts/tts/tokenize-magpietts.py`,
+`scripts/tts/generate_mandarin_tokenizer_data.py`, and `--tokenizer-dir` for a
+custom tokenizer directory.
+
+## Text normalization: the exact requirement, and the blocker
+
+`--tts.tn-model-dir` (and the ASR-side `asr.postproc.itn_model_dir`) want a
+parent directory of language-named children, each containing:
+
+- `tokenize_and_classify.far`
+- `verbalize.far`
+- `post_process.far` — used when present
+
+The older split layout (`classify/`, `verbalize/`) is still supported.
+
+Both need a `-DNEMO_SPEECH_WITH_NORM=ON` build, which `CMakeLists.txt:136`
+refuses on Windows. `scripts/build_itn_deps.sh` builds the stack (OpenFST 1.8 +
+Sparrowhawk from pinned forks) and needs protobuf + protoc, re2, autotools and
+**gcc-12 specifically** — the script's own comment records that gcc-13 and 14
+ICE on OpenFST's template-heavy translation units at -O2.
+
+WSL is viable: **Ubuntu 26.04, 12 cores, the repo visible at
+`/mnt/c/.../NeMo-Speech.cpp`, and `gcc-12` available as 12.5.0-9ubuntu1.** The
+blocker is that this WSL has no passwordless sudo, so the package install cannot
+be driven non-interactively. Run once by hand:
+
+```bash
+wsl -d Ubuntu
+sudo apt update && sudo apt install -y build-essential gcc-12 g++-12 cmake \
+    autoconf automake libtool pkg-config libprotobuf-dev protobuf-compiler \
+    libre2-dev git
+```
+
+Then `CC=gcc-12 CXX=g++-12 scripts/build_itn_deps.sh`, and configure with
+`-DNEMO_SPEECH_WITH_NORM=ON`.
+
+Checked the naming inconsistency: `CMakeLists.txt:98` declares
+`NEMO_SPEECH_WITH_NORM` and defaults it **ON**; the `-DNEMO_SPEECH_WITH_ITN=ON`
+in `build_itn_deps.sh`'s header comment is stale and reads nothing. So the option
+is on by default and only `CMakeLists.txt:140` — the Windows guard — is turning
+it off here. On Linux it should come up without an explicit flag once the
+dependencies exist.
