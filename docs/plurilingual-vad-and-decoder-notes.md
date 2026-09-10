@@ -718,3 +718,83 @@ requested.
 3. `--language auto` for mixed audio, an explicit code when the language is
    known and single
 4. right context: leave at the default; it is inert on this path
+
+---
+
+# The "black hole": a language-switch dropout, and separation fixes it
+
+Thu, 11 Sep 2026. Traced with the owner's reference transcript
+(`French Girl Reacts... [ZFc3-CdK1vg].en.vtt`).
+
+## What is missing
+
+At **63.20 s** the narrator switches from French back to English. The reference
+reads:
+
+> First of all, I want to say that I understand everyone very well. Like,
+> there's over 8 million people in the province of Quebec...
+
+The pipeline emits `...je vais penser en anglais. There's over eight million...`
+— **3.76 s of English silently swallowed** at the switch, with the timeline
+still correct on both sides, which is why it never desyncs.
+
+## It is the switch, not the length
+
+The 45 s test clip reproduces it, far below any positional limit, so the
+offline/streaming threshold is not involved here. Cutting the span out and
+transcribing it alone returns it perfectly.
+
+Sweeping *only* the amount of French preceding the switch, every clip ending at
+the same point:
+
+| French before the switch | result | `languages` |
+|---|---|---|
+| 0.0 s | **kept** | `en-US` |
+| 0.5 s | **kept** | `en-US` |
+| 1.0 s | dropped (partial) | `en-US` |
+| 1.5 s | dropped | `[]` |
+| 2.0 s | dropped (hard) | `fr-FR` |
+| 2.5 s | dropped | `fr-FR` |
+| 3.0 s | dropped (hard) | `fr-FR` |
+| 4.0 s | **kept** | `fr-FR, en-US` |
+| 6.0 s | **kept** | `fr-FR, vi-VN` |
+
+**The failure is a band, not a slope.** With almost no French before it, the
+model reads the English fine. With plenty of French, it detects both languages
+and reads it fine. In between — roughly **1 to 3 seconds of preceding French** —
+it commits to `fr-FR` and swallows the English until it re-locks.
+
+This partially reverses the earlier "the dropouts are not language switches"
+conclusion. That verdict came from the monolingual Québécois file having *more*
+gaps than the bilingual one, which is still true — so there is more than one
+mechanism. But this particular hole is unambiguously a switch artifact, and it is
+reproducible on demand.
+
+## Vocal separation recovers it
+
+Of the four configurations tried on this file, exactly one keeps the sentence:
+
+| run | result |
+|---|---|
+| whole-file, offline | dropped |
+| whole-file + **BS-RoFormer separation** | **kept** |
+| VAD-segmented | dropped |
+| 45 s clip, no separation | dropped |
+
+```
+20
+00:01:03,760 --> 00:01:07,120
+[Speaker 1] First of all, I want to say that I
+understand everyone very well like
+```
+
+That also explains the +17 words measured earlier for the separated run (2365
+against 2348): separation is not just cleaning music, it is removing whatever
+was pushing the decoder to stay locked on French through the switch.
+
+**Practical consequence: run separation for any code-switched material**, not
+only for noisy or musical sources. It was previously treated as optional
+cleanup; on switching audio it recovers content nothing else recovers.
+
+VAD segmentation does **not** help here, which is worth noting given it helped
+with the long-form dropouts — further evidence these are two different faults.
