@@ -215,6 +215,14 @@ class RnntGreedyDecoder : public Decoder {
     // RNNT context biasing (word boosting), built per request from
     // speech_contexts. bias_node_ is the per-stream Aho-Corasick match state.
     ContextBiasingTree bias_tree_;
+    // Consecutive blank frames under the CURRENT predictor state, carried
+    // across chunks. Only meaningful with NEMO_SPEECH_RNNT_MAX_BLANK set; see
+    // rnnt_greedy_decoder.cpp for why a blank run is self-sustaining.
+    int blank_run_ = 0;
+    // Scratch for the forced non-blank argmax. Only populated when the
+    // NEMO_SPEECH_RNNT_MAX_BLANK diagnostic is active.
+    std::vector<float> forced_scratch_;
+    std::vector<int> forced_ids_;
     int bias_node_ = ContextBiasingTree::kRoot;
     bool bias_on_ = false;
     // --boosting-tree-alpha: an extra global multiplier (default 1.0, i.e. no

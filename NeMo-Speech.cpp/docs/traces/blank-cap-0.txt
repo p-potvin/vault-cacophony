@@ -1,0 +1,146 @@
+[nemo-speech] transcribe session started
+[asr] model=nemotron-3.5-asr-streaming-0.6b.q8_0 head=rnnt backend=CUDA0
+[enc ] cache-aware geometry: requested right_ctx=1 -> left_ctx=56 chunk_frames=2 right_ctx=1 (attention 58 frames, step 160 ms)
+[rnnt] CHUNK enter frame_offset=0 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=2 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=4 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=6 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=8 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=10 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=12 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=14 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=16 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=18 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=20 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=22 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=24 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=26 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=28 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=30 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=32 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=34 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=36 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=38 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=40 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=42 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=44 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=46 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=48 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=50 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=52 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[asr] mode=offline head=rnnt attention-left=56 attention-right=3 encoder-frames
+[rnnt] CHUNK enter frame_offset=0 T=151 frames (12080 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt]   t=18/151 EMIT token=2      ▁            (blank_run=18 before it, symbols_at_frame=0/10)
+[rnnt]   t=18/151 EMIT token=903    Q              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=18/151 EMIT token=68     u              (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=18/151 EMIT token=414    and            (blank_run=0 before it, symbols_at_frame=3/10)
+[rnnt]   t=19/151 EMIT token=2      ▁            (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=19/151 EMIT token=295    je             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=20/151 EMIT token=1016   ▁par         (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=21/151 EMIT token=261    le             (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=23/151 EMIT token=1059   ▁avec        (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=25/151 EMIT token=1349   ▁quel        (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=26/151 EMIT token=1047   qu             (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=26/151 EMIT token=2775   '              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=26/151 EMIT token=428    un             (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=28/151 EMIT token=6      ,              (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=29/151 EMIT token=2      ▁            (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=29/151 EMIT token=295    je             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=31/151 EMIT token=1498   ▁vai         (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=31/151 EMIT token=40     s              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=33/151 EMIT token=2      ▁            (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=33/151 EMIT token=97     p              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=33/151 EMIT token=124    en             (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=34/151 EMIT token=40     s              (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=34/151 EMIT token=130    er             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=37/151 EMIT token=2      ▁            (blank_run=3 before it, symbols_at_frame=0/10)
+[rnnt]   t=37/151 EMIT token=124    en             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=39/151 EMIT token=2      ▁            (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=39/151 EMIT token=38     a              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=39/151 EMIT token=2959   ng             (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=40/151 EMIT token=66     l              (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=40/151 EMIT token=1022   ais            (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=88/151 EMIT token=4      .              (blank_run=48 before it, symbols_at_frame=0/10)
+[rnnt]   t=88/151 EMIT token=2      ▁            (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=88/151 EMIT token=2947   <en-US>        (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=92/151 EMIT token=2845   ▁The         (blank_run=4 before it, symbols_at_frame=0/10)
+[rnnt]   t=92/151 EMIT token=311    re             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=93/151 EMIT token=2775   '              (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=93/151 EMIT token=40     s              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=96/151 EMIT token=477    ▁over        (blank_run=3 before it, symbols_at_frame=0/10)
+[rnnt]   t=99/151 EMIT token=2872   ▁eight       (blank_run=3 before it, symbols_at_frame=0/10)
+[rnnt]   t=101/151 EMIT token=9590   ▁mil         (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=102/151 EMIT token=262    li             (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=102/151 EMIT token=128    on             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=104/151 EMIT token=2975   ▁people      (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=107/151 EMIT token=2      ▁            (blank_run=3 before it, symbols_at_frame=0/10)
+[rnnt]   t=107/151 EMIT token=125    in             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=108/151 EMIT token=150    ▁the         (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=110/151 EMIT token=277    ▁pro         (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=113/151 EMIT token=141    v              (blank_run=3 before it, symbols_at_frame=0/10)
+[rnnt]   t=113/151 EMIT token=125    in             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=114/151 EMIT token=282    ce             (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=115/151 EMIT token=1639   ▁of          (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=116/151 EMIT token=2      ▁            (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=116/151 EMIT token=903    Q              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=116/151 EMIT token=68     u              (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=117/151 EMIT token=26     e              (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=118/151 EMIT token=1881   be             (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=120/151 EMIT token=73     c              (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=122/151 EMIT token=6      ,              (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=123/151 EMIT token=2      ▁            (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=123/151 EMIT token=1290   so             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=124/151 EMIT token=2      ▁            (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=124/151 EMIT token=528    it             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=124/151 EMIT token=2775   '              (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=124/151 EMIT token=40     s              (blank_run=0 before it, symbols_at_frame=3/10)
+[rnnt]   t=126/151 EMIT token=2827   ▁one         (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=127/151 EMIT token=1639   ▁of          (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=128/151 EMIT token=150    ▁the         (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=129/151 EMIT token=2      ▁            (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=129/151 EMIT token=318    mo             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=129/151 EMIT token=257    st             (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=136/151 EMIT token=2889   ▁well        (blank_run=7 before it, symbols_at_frame=0/10)
+[rnnt]   t=137/151 EMIT token=2855   ▁know        (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=139/151 EMIT token=113    n              (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=141/151 EMIT token=2      ▁            (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=141/151 EMIT token=1728   wa             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=142/151 EMIT token=129    y              (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=142/151 EMIT token=40     s              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=144/151 EMIT token=1639   ▁of          (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=146/151 EMIT token=2      ▁            (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=146/151 EMIT token=1333   spe            (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=147/151 EMIT token=38     a              (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=147/151 EMIT token=914    ki             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=147/151 EMIT token=2959   ng             (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=150/151 EMIT token=540    ▁F           (blank_run=3 before it, symbols_at_frame=0/10)
+[rnnt]   t=150/151 EMIT token=59     r              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt] CHUNK exit  t=150/151 emitted=85 token(s)
+[nemo-speech] transcribe session finished

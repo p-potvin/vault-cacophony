@@ -168,6 +168,7 @@ RnntGreedyDecoder::finalize() {
 }
 
 static bool rnnt_trace_enabled();
+static int rnnt_max_blank_run();
 
 std::vector<int>
 RnntGreedyDecoder::step(const float* enc_out, int d_model, int T, int64_t frame_offset) {
@@ -301,8 +302,67 @@ RnntGreedyDecoder::step_impl(
                 break;
             }
         }
+        // Blank frames this scan is about to consume before any emission.
+        // first_emit < 0 means the whole rest of the chunk is blank.
+        const int blanks_here = (first_emit < 0) ? remaining : first_emit;
+        const int max_blank = rnnt_max_blank_run();
+        if (max_blank > 0 && blanks_here > 0 && blank_run_ + blanks_here >= max_blank) {
+            // Force a non-blank at the frame where the blank budget runs out.
+            const int k = std::max(0, max_blank - blank_run_);
+            if (k < blanks_here) {
+                if (finalizing_ && has_punct_bias_)
+                    forced_scratch_.assign(punct_bias_.begin(), punct_bias_.end());
+                else
+                    forced_scratch_.assign(static_cast<size_t>(cfg.vocab_size), 0.0f);
+                forced_scratch_[static_cast<size_t>(blank_id)] = -1e30f;
+                const int forced_remaining = remaining - k;
+                forced_ids_.resize(static_cast<size_t>(forced_remaining));
+                if (device_enc_out != nullptr) {
+                    engine_->joint_argmax_device(
+                        *stream_state_, *device_enc_out, t + k, d_model, forced_remaining,
+                        forced_ids_.data(), forced_scratch_.data());
+                } else {
+                    engine_->joint_argmax(
+                        *stream_state_, enc_out + static_cast<size_t>(t + k) * d_model, d_model,
+                        forced_remaining, forced_ids_.data(), forced_scratch_.data());
+                }
+                ++stats_.joint_calls;
+                stats_.joint_frames += static_cast<uint64_t>(forced_remaining);
+                const int forced = forced_ids_[0];
+                if (forced != blank_id) {
+                    if (rnnt_trace_enabled()) {
+                        const char* piece = "";
+                        if (forced >= 0 && forced < static_cast<int>(vocab.size()))
+                            piece = vocab[static_cast<size_t>(forced)].c_str();
+                        std::fprintf(
+                            stderr,
+                            "[rnnt]   !! BLANK CAP: %d consecutive blank frames"
+                            " (NEMO_SPEECH_RNNT_MAX_BLANK=%d, run would have been %d)."
+                            " Forcing best non-blank token=%d %s at t=%d to unfreeze"
+                            " the predictor.\n",
+                            blank_run_ + k, max_blank, blank_run_ + blanks_here, forced, piece,
+                            t + k);
+                    }
+                    t += k;
+                    symbols_at_frame = 0;
+                    blank_run_ = 0;
+                    emitted.push_back(forced);
+                    ++stats_.emitted_tokens;
+                    last_emit_frame_ = frame_offset + t;
+                    prev_token_ = forced;
+                    active_bank_ ^= 1;
+                    predictor_valid_ = false;
+                    if (bias_on_)
+                        bias_node_ = bias_tree_.advance(bias_node_, forced);
+                    continue;
+                }
+            }
+        }
         if (first_emit < 0) {
-            // Every remaining frame is blank under this predictor state.
+            // Every remaining frame is blank under this predictor state, and
+            // the state cannot change without an emission, so the rest of the
+            // chunk is already decided.
+            blank_run_ += remaining;
             break;
         }
 
@@ -310,6 +370,7 @@ RnntGreedyDecoder::step_impl(
         // previous frame. The first non-blank is handled at its own frame.
         if (first_emit > 0)
             symbols_at_frame = 0;
+        blank_run_ = 0;  // a non-blank commits a new predictor state
         t += first_emit;
         const int token = token_ids_[static_cast<size_t>(first_emit)];
 
@@ -445,6 +506,42 @@ rnnt_trace_enabled() {
         return v != nullptr && *v != 0 && *v != '0';
     }();
     return on;
+}
+
+// Optional escape hatch from a self-sustaining blank run, gated on
+// NEMO_SPEECH_RNNT_MAX_BLANK (0 or unset = off, the shipped behaviour).
+//
+// Why a blank run can sustain itself. In RNN-T the predictor is conditioned on
+// the last EMITTED token, and a blank is not an emission: the blank path never
+// touches prev_token_ and never invalidates the predictor cache. So for the
+// entire length of a blank run the joint is evaluated against one frozen
+// predictor state. If that state is a poor prior for the audio now arriving --
+// the clearest case being the last token of one language followed by speech in
+// another -- every frame can score blank, and nothing in greedy decoding
+// perturbs the state to let it recover. The run ends only when the acoustics
+// alone outvote the stale prior.
+//
+// max_symbols_per_step cannot help here, and it is worth being precise about
+// why: it counts EMITTED symbols at a single frame and is incremented only on
+// the non-blank commit path. During a blank run the counter is pinned at zero,
+// so the cap can never fire. It bounds runaway emission, not silence.
+//
+// This knob bounds silence instead. After N consecutive blank frames it runs
+// one blank-excluded argmax and forces the best non-blank token, which commits
+// a new predictor state and breaks the lock. That is a deliberate departure
+// from greedy decoding -- it emits a token the model ranked below blank -- so
+// it is a diagnostic for whether a run is a stuck prior or a genuine judgement
+// about the audio, not a default.
+static int
+rnnt_max_blank_run() {
+    static const int n = [] {
+        const char* v = std::getenv("NEMO_SPEECH_RNNT_MAX_BLANK");
+        if (v == nullptr || *v == 0)
+            return 0;
+        const int parsed = std::atoi(v);
+        return parsed > 0 ? parsed : 0;
+    }();
+    return n;
 }
 
 std::vector<int>
