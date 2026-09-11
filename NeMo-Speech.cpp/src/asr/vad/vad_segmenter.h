@@ -35,6 +35,16 @@
 
 namespace nemo_speech::asr {
 
+// Measured effect, so this is applied deliberately rather than everywhere.
+// Scored against official subtitles:
+//
+//   code-switched FR/EN, 11.6 min : 11.0 s -> 5.2 s of speech lost, 3x faster
+//   monolingual EN podcast, 25 min: WER 19.75% -> 21.15%
+//
+// It helps when a stale language state is the problem and hurts when it is not,
+// because every cut also removes context the model was using. Enable it for
+// multilingual or code-switched input; leave it off for clean monolingual
+// material unless the speedup is worth 1.4 WER points.
 struct VadSegmenterCfg {
     // Off by default: enabling it changes transcripts on the offline path.
     // Requires a VAD model (--vad-model); without one this is inert.
