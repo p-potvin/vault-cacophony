@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <future>
 #include <map>
@@ -1745,6 +1746,35 @@ RnntModel::ensure_offline_path() {
         if (offline_cfg.offline_right_ctx < 0)
             offline_cfg.offline_right_ctx = offline_cfg.cache_right_ctx;
     }
+
+    // Debug overrides for the offline attention window.
+    //
+    // Worth knowing before reading any trace from this path: the offline
+    // encoder's context comes from the model's TRAINED values
+    // (train_left_ctx/train_right_ctx, or the explicit offline_* metadata), and
+    // NOT from the caller's streaming rnnt_right_context. A --rnnt-right-context
+    // flag therefore does not reach here at all, and two runs that differ only
+    // in that flag produce a byte-identical offline decode. These env vars are
+    // the only way to A/B the offline mask without a rebuild. -1 means
+    // unlimited: no mask is built, full bidirectional attention, which is the
+    // control case for "is the mask hiding frames the model needed?".
+    if (const char* e = std::getenv("NEMO_SPEECH_OFFLINE_LEFT_CTX"))
+        offline_cfg.offline_left_ctx = std::atoi(e);
+    if (const char* e = std::getenv("NEMO_SPEECH_OFFLINE_RIGHT_CTX"))
+        offline_cfg.offline_right_ctx = std::atoi(e);
+    if (std::getenv("NEMO_SPEECH_DEBUG_ENC")) {
+        std::fprintf(
+            stderr,
+            "[enc ] OFFLINE path built: left_ctx=%d right_ctx=%d style=%s conv=%s"
+            " d_model=%d subsampling=%d feat_in=%d\n"
+            "[enc ]   offline context comes from the model's trained values, not\n"
+            "[enc ]   from rnnt_right_context. Override with\n"
+            "[enc ]   NEMO_SPEECH_OFFLINE_LEFT_CTX / _RIGHT_CTX (-1 = unlimited).\n",
+            offline_cfg.offline_left_ctx, offline_cfg.offline_right_ctx,
+            offline_cfg.chunked_limited_attention ? "chunked_limited" : "regular",
+            offline_cfg.conv_context == ConvContext::Causal ? "causal" : "symmetric",
+            offline_cfg.d_model, offline_cfg.subsampling_factor, offline_cfg.feat_in);
+    }
     offline_encoder_ = std::make_unique<FastConformerEncoder>("encoder", offline_cfg);
     offline_encoder_root_ = std::make_unique<OfflineEncoderRoot>(
         offline_encoder_.get(), rnnt_encoder_tail_.get(), s2s_projection_.get());
@@ -1792,6 +1822,79 @@ RnntModel::infer_offline_from_mel(
     auto result = offline_encoder_batcher_->run(feats, n_frames, prompt_index);
     enc_out = std::move(result.enc);
     T_enc = result.T;
+    debug_dump_encoder_frames(enc_out, T_enc);
+}
+
+// Per-frame statistics of the joint-projected encoder output, gated on
+// NEMO_SPEECH_DEBUG_ENC. This is the exact tensor the RNNT joint consumes, so
+// it separates two very different explanations for a long run of blanks:
+//
+//   * The joint saw NORMAL, VARIED features and still chose blank. Then the
+//     silence is the model's own decision about that stretch of audio, and no
+//     amount of decoder work will recover it.
+//   * The joint saw DEGENERATE features -- collapsed norm, or near-identical
+//     frames -- which is the fingerprint of an attention mask that hid the real
+//     keys and left each query attending to a near-constant context. A greedy
+//     joint fed an almost-constant vector emits blank indefinitely, and the run
+//     ends exactly when real content comes back into the window.
+//
+// cos_prev is the discriminator. Running speech moves the encoder state
+// substantially frame to frame; a dead or masked region pins cos_prev near
+// 1.000 while l2norm flattens. Read the two columns together: a low-variance
+// region with normal norm is real silence in the audio, a low-variance region
+// whose norm also collapses is a representation problem upstream.
+void
+RnntModel::debug_dump_encoder_frames(const std::vector<float>& enc, int T) const {
+    static const bool on = [] {
+        const char* v = std::getenv("NEMO_SPEECH_DEBUG_ENC");
+        return v != nullptr && *v != 0 && *v != '0';
+    }();
+    if (!on || T <= 0 || enc.empty())
+        return;
+    const int D = static_cast<int>(enc.size() / static_cast<size_t>(T));
+    if (D <= 0)
+        return;
+    std::fprintf(
+        stderr,
+        "[enc ] ---- offline encoder output: T=%d frames x D=%d (this is the joint's input) ----\n",
+        T, D);
+    std::fprintf(
+        stderr, "[enc ] frame     ms     l2norm       mean        min        max   cos_prev\n");
+    double sum_cos = 0.0;
+    int n_cos = 0;
+    for (int t = 0; t < T; ++t) {
+        const float* f = enc.data() + static_cast<size_t>(t) * D;
+        double l2 = 0.0, mean = 0.0;
+        float mn = f[0], mx = f[0];
+        for (int i = 0; i < D; ++i) {
+            l2 += static_cast<double>(f[i]) * f[i];
+            mean += f[i];
+            mn = std::min(mn, f[i]);
+            mx = std::max(mx, f[i]);
+        }
+        l2 = std::sqrt(l2);
+        mean /= D;
+        double cos = 0.0;
+        if (t > 0) {
+            const float* prev = enc.data() + static_cast<size_t>(t - 1) * D;
+            double dot = 0.0, np = 0.0;
+            for (int i = 0; i < D; ++i) {
+                dot += static_cast<double>(f[i]) * prev[i];
+                np += static_cast<double>(prev[i]) * prev[i];
+            }
+            np = std::sqrt(np);
+            cos = (l2 > 0.0 && np > 0.0) ? dot / (l2 * np) : 0.0;
+            sum_cos += cos;
+            ++n_cos;
+        }
+        std::fprintf(
+            stderr, "[enc ] %5d %6.0f %10.4f %10.5f %10.4f %10.4f %10.4f%s\n", t, t * 80.0, l2,
+            mean, mn, mx, cos, (t > 0 && cos > 0.995) ? "  <-- near-duplicate of previous" : "");
+    }
+    if (n_cos > 0)
+        std::fprintf(
+            stderr, "[enc ] mean cos_prev over %d transitions = %.4f\n", n_cos,
+            sum_cos / n_cos);
 }
 
 void

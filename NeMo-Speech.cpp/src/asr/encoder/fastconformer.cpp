@@ -4,6 +4,8 @@
 // Portions derived from parakeet.cpp:
 // Copyright (c) 2025 Jason Ni
 // Licensed under the MIT License. See THIRD_PARTY_NOTICES.md.
+#include <cstdlib>
+
 #include "fastconformer.h"
 
 using namespace nemo_speech::asr;
@@ -1322,6 +1324,79 @@ FastConformerEncoder::build_graph_from_embeddings(
             const int L = (cfg_.offline_left_ctx < 0) ? T : cfg_.offline_left_ctx;
             const int R = (cfg_.offline_right_ctx < 0) ? T : cfg_.offline_right_ctx;
             auto bf_ctx = session_tensor_container->get_ctx_of_buffer_type(x.buft);
+
+            // Mirror the mask arithmetic on the host so the window can be read
+            // straight off the log instead of inferred from the graph. Gated on
+            // NEMO_SPEECH_DEBUG_ENC; this block builds no tensors, it only
+            // prints.
+            //
+            // The reference implementation this must match is
+            // transformers/models/nemotron_asr_streaming:
+            //
+            //     chunk_size          = right_ctx + 1
+            //     left_context_chunks = left_ctx // chunk_size
+            //     visible = (q//chunk - k//chunk) in [0, left_context_chunks]
+            //
+            // with left_ctx = config.sliding_window - 1 and right_ctx =
+            // num_lookahead_tokens. Note what that means: the window is over
+            // CHUNKS aligned to absolute frame 0, not a per-frame band. A query
+            // at the START of its chunk sees R frames of lookahead; a query at
+            // the END of the same chunk sees zero. That asymmetry is in the
+            // reference too, so it is correct, but it makes the effective
+            // lookahead position-dependent, which is worth seeing explicitly
+            // when a specific frame range misbehaves.
+            //
+            // left_context_chunks uses integer division, so any remainder in
+            // L % chunk is silently dropped: L=56, R=3 divides exactly into 14
+            // chunks, but a mismatched pair would quietly shorten the reach.
+            if (std::getenv("NEMO_SPEECH_DEBUG_ENC")) {
+                const bool chunked = cfg_.chunked_limited_attention && R >= 0;
+                std::fprintf(
+                    stderr, "[enc ] OFFLINE MASK: T=%d L=%d R=%d style=%s\n", T, L, R,
+                    chunked ? "chunked_limited" : "regular");
+                if (chunked) {
+                    const int chunk = R + 1;
+                    const int left_chunks = L / chunk;
+                    std::fprintf(
+                        stderr,
+                        "[enc ]   chunk=%d frames, left_chunks = L/chunk = %d/%d = %d"
+                        " (remainder %d frames dropped by integer division)\n"
+                        "[enc ]   max reach = (left_chunks+1)*chunk = %d keys\n",
+                        chunk, L, chunk, left_chunks, L % chunk, (left_chunks + 1) * chunk);
+                } else {
+                    std::fprintf(
+                        stderr, "[enc ]   band = [q-%d, q+%d] = %d keys\n", L, R, L + R + 1);
+                }
+                // Per-query visible span, recomputed with the SAME integer
+                // arithmetic the graph uses. Sampled rather than per-frame so
+                // the log stays readable. `ahead` is the lookahead this
+                // particular query actually gets, which is the number that
+                // varies inside a chunk.
+                std::fprintf(
+                    stderr, "[enc ]      q   visible keys     count   ahead\n");
+                const int stride = (T > 40) ? (T / 20) : 1;
+                for (int q = 0; q < T; q += stride) {
+                    int lo = T, hi = -1, n = 0;
+                    for (int k = 0; k < T; ++k) {
+                        bool vis;
+                        if (chunked) {
+                            const int d = (q / (R + 1)) - (k / (R + 1));
+                            vis = (d >= 0 && d <= L / (R + 1));
+                        } else {
+                            const int d = k - q;
+                            vis = (d >= -L && d <= R);
+                        }
+                        if (vis) {
+                            lo = std::min(lo, k);
+                            hi = std::max(hi, k);
+                            ++n;
+                        }
+                    }
+                    std::fprintf(
+                        stderr, "[enc ] %6d  [%4d..%4d] %8d %7d%s\n", q, lo, hi, n,
+                        (hi > q) ? (hi - q) : 0, (n == 0) ? "   <-- SEES NOTHING" : "");
+                }
+            }
 
             // pos = arange(T): (T,) f32.
             ggml_tensor* pos = ggml_arange(bf_ctx.ctx, 0.0f, static_cast<float>(T), 1.0f);

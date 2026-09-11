@@ -220,6 +220,11 @@ class RnntModel final : public AsrModel, public RnntEngine {
     void infer_offline(
         const float* audio, size_t n_samples, std::vector<float>& enc_out, int& T_enc,
         int prompt_index = -1);
+    // Debug-only: per-frame encoder-output statistics to stderr when
+    // NEMO_SPEECH_DEBUG_ENC is set; a no-op otherwise. See model.cpp for what
+    // the columns mean and why cos_prev is the one that matters.
+    void debug_dump_encoder_frames(const std::vector<float>& enc, int T) const;
+
     void infer_offline_from_mel(
         const float* feats, int n_frames, std::vector<float>& enc_out, int& T_enc,
         int prompt_index = -1);
