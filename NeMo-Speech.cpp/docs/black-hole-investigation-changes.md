@@ -116,11 +116,47 @@ survives but no value recovers both:
 | `en-US` | French dropped entirely, 89-frame blank run |
 | `fr-FR` / `fr-CA` | French kept, English mangled |
 
+## Settled: this is model behaviour, not our pipeline
+
+Two independent controls, each sharing nothing with the suspect component.
+
+**1. Clean upstream C++ build.** Fresh clone of `NVIDIA/NeMo-Speech.cpp` at
+`a5b6953`, its own pinned patch series applied to stock ggml (so
+`fused-attention.cu`, including `0017`/`0018`), upstream's valid presets,
+`cuda-asr`, reusing only vcpkg and sentencepiece. Reproduces the hole
+**character-for-character**.
+
+**2. HF reference implementation.** PyTorch 2.14 **CPU**, stock
+`transformers` 5.17.0, official `model.safetensors` from
+`nvidia/nemotron-3.5-asr-streaming-0.6b`, in a fresh venv. Shares no code with
+our C++ path, no GGUF, no CUDA, no patched kernels:
+
+```
+HF:    Meme dans ma tete, quand je parle avec quelqu'un, je vais penser en
+       anglais. <fr-FR> There's over eight million people in the province of
+       Quebec, so it's one of the most well known ways of speaking Fren
+ours:  Quand je parle avec quelqu'un, je vais penser en anglais. There's over
+       eight million people in the province of Quebec, so it's one of the most
+       well known ways of speaking Fr
+```
+
+Same hole, same span, and the `<fr-FR>` tag in the same place. On the segmented
+clip both agree as well: HF returns "First of all, I want to say that I
+understand everyone very well. `<en-US>` Like, there's over eight million."
+
+So the GGUF conversion, the build stack, the patched CUDA kernels, Windows, and
+CUDA itself are all exonerated. The reference does this too. Reproduce with
+`docs/traces/hf-reference-check.py`.
+
+**One real divergence remains, and it is not the hole:** HF transcribes "Meme
+dans ma tete" at the very start of the clip and we drop it. That is a separate,
+smaller bug in our first-chunk handling and worth its own investigation.
+
 ## Divergences found against upstream `a5b6953`
 
 Checked by cloning `NVIDIA/NeMo-Speech.cpp` clean and applying its pinned
-patch series to stock ggml. Three real differences, none yet shown to cause the
-hole:
+patch series to stock ggml. Three real differences. None causes the hole
+(see the controls above), but all are worth fixing:
 
 1. `CMakePresets.json` has a **committed JSON syntax error** in the `cuda-asr`
    preset -- a missing comma and a tab-indented hand edit. Upstream's parses.
