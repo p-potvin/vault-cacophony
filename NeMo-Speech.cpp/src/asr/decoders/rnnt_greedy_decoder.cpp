@@ -82,6 +82,26 @@ RnntGreedyDecoder::build_punct_bias() {
     }
 }
 
+// Everything reset() does to the LANGUAGE state, and nothing it does to the
+// TRANSCRIPT state. The recurrent predictor state lives in stream_state_, so
+// clearing prev_token_ alone would not be enough: the LSTM would still carry
+// the previous segment's context. The in-progress word is flushed first so a
+// word is never split across the boundary.
+void
+RnntGreedyDecoder::reset_context() {
+    flush_word();
+    stream_state_.reset();
+    stream_state_ = engine_->make_rnnt_stream_state();
+    if (!stream_state_)
+        throw std::runtime_error("RnntEngine returned a null stream state");
+    prev_token_ = engine_->rnnt_config().blank_id;
+    active_bank_ = 0;
+    predictor_valid_ = false;
+    token_ids_.clear();
+    blank_run_ = 0;
+    bias_node_ = ContextBiasingTree::kRoot;
+}
+
 void
 RnntGreedyDecoder::set_request_options(const AsrRequestOptions& opts) {
     set_compute_timestamps(opts.needs_word_timings());
@@ -502,6 +522,22 @@ TdtGreedyDecoder::reset() {
     words_.clear();
     cur_open_ = false;
     cur_ = WordTiming{};
+}
+
+// See RnntGreedyDecoder::reset_context(). pending_skip_ is dropped too: a
+// duration that overshot the previous segment must not skip frames at the
+// start of the next one.
+void
+TdtGreedyDecoder::reset_context() {
+    flush_word();
+    stream_state_.reset();
+    stream_state_ = engine_->make_rnnt_stream_state();
+    if (!stream_state_)
+        throw std::runtime_error("RnntEngine returned a null stream state");
+    prev_token_ = engine_->rnnt_config().blank_id;
+    active_bank_ = 0;
+    predictor_valid_ = false;
+    pending_skip_ = 0;
 }
 
 void

@@ -152,6 +152,23 @@ class Decoder {
     // alive; CTC still clears collapse state at the boundary.
     virtual void reset_utterance() {}
 
+    // Drop the decoder's language context while KEEPING everything already
+    // transcribed: accumulated word timings, statistics, and the emit cursor
+    // all survive. This is the operation an offline segment boundary needs,
+    // and neither of the other two provides it -- reset() also throws away
+    // word timings and stats, and reset_utterance() clears the words but
+    // deliberately PRESERVES the predictor context, which is the one thing
+    // that has to go.
+    //
+    // Why it matters: an RNN-T predictor is conditioned on the last emitted
+    // token and a blank is not an emission, so a decoder that has committed to
+    // one language can score blank on every following frame and never leave
+    // that state on its own. Re-entering at a silence boundary from a blank
+    // predictor is what stops a stale prior from suppressing the audio after
+    // it. Only call this at a boundary that is genuinely silent: mid-word it
+    // would discard context the model legitimately needs.
+    virtual void reset_context() {}
+
     // Consume one chunk of encoder output (d_model x T frames).
     //
     //   enc_out:     host-side buffer of shape (d_model, T) in column-major

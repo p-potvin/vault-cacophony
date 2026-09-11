@@ -100,9 +100,13 @@ Recognizer::Recognizer(RecognizerConfig cfg)
     // Self-punctuating models must bypass the separate PnC model.
     postproc_ = std::make_unique<postproc::Postprocessor>(
         cfg_.postproc, bm_.get(), vocab_self_punctuates(model_->vocab()), cfg_.batching);
+    // Offline segmentation is a third consumer of the VAD weights, alongside
+    // feature masking and VAD-driven endpointing. Without it listed here a
+    // --vad-segmentation run loads no VAD model and silently does nothing.
     const bool need_vad =
         !cfg_.vad.model_path.empty() &&
-        (cfg_.vad.masker.mask_enable || (cfg_.endpointing.enable && cfg_.endpointing.vad_based));
+        (cfg_.vad.masker.mask_enable || cfg_.vad.segmenter.enable ||
+         (cfg_.endpointing.enable && cfg_.endpointing.vad_based));
     if (need_vad) {
         vad_model_ = std::make_shared<SileroVadModel>(*bm_, cfg_.vad.model_path, cfg_.batching);
         GGMLF_LOG_INFO("[recognizer] VAD weights/session loaded once and shared across streams\n");
@@ -229,7 +233,8 @@ Recognizer::warmup() {
         static_cast<RnntModel*>(model_.get())->supports_cache_streaming();
     std::unique_ptr<AsrRunner> runner;
     if (!supports_streaming)
-        runner = std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_);
+        runner =
+            std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_, vad_model_);
     else
         runner = make_runner();
     if (model_->has_prompt()) {
@@ -593,9 +598,12 @@ Recognizer::recognize(
     if (use_streaming) {
         runner = make_runner();
     } else {
-        // Past the positional-encoding limit OfflineRunner splits the audio at
-        // quiet points and decodes segment by segment.
-        runner = std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_);
+        // OfflineRunner partitions the audio before decoding: at VAD silence
+        // when the segmenter is enabled (resetting the decoder's language
+        // context at each such boundary), and always at the quietest point
+        // when the positional-encoding budget forces a cut.
+        runner =
+            std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_, vad_model_);
     }
     log_execution_status(use_streaming);
     if (model_->has_prompt())

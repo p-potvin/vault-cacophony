@@ -150,6 +150,9 @@ class RnntGreedyDecoder : public Decoder {
         cur_open_ = false;
         bias_node_ = ContextBiasingTree::kRoot;
     }
+    // Clear the predictor context but keep the transcript so far. See
+    // Decoder::reset_context().
+    void reset_context() override;
     // Build the per-request context-biasing tree from speech_contexts.
     void set_request_options(const AsrRequestOptions& opts) override;
     // enc_out: joint encoder projection (joint_dim, T) flat-packed. The model
@@ -245,6 +248,9 @@ class TdtGreedyDecoder : public Decoder {
     explicit TdtGreedyDecoder(RnntEngine* engine);
 
     void reset() override;
+    // Clear the predictor context but keep the transcript so far. See
+    // Decoder::reset_context().
+    void reset_context() override;
     void reset_utterance() override;
     std::vector<int> step(const float* enc_out, int d_model, int T, int64_t frame_offset) override;
     int blank_id() const override { return engine_->rnnt_config().blank_id; }
