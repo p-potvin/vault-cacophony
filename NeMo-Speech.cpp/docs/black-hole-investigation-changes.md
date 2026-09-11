@@ -31,8 +31,10 @@ Built and tested only in `build-s2s`. `build-cuda` has not been rebuilt.
 | `NEMO_SPEECH_OFFLINE_LEFT_CTX` | unset | Overrides the offline encoder's left attention context. `-1` = unlimited (no mask built). |
 | `NEMO_SPEECH_OFFLINE_RIGHT_CTX` | unset | Overrides the offline encoder's right context (lookahead). `-1` = unlimited. |
 | `NEMO_SPEECH_RNNT_MAX_BLANK` | unset / `0` (off) | **Changes decoding.** After N consecutive blank frames, forces the best non-blank token to unfreeze the predictor. See below. |
+| `NEMO_SPEECH_DEBUG_BLANK_SHADOW` | unset (off) | After a blank run of N frames (a number sets N, any other non-empty value means 3), logs what the model would have emitted with blank excluded, frame by frame. Commits nothing; transcript verified byte-identical. |
 
-The first four cannot alter output. The fifth can, by design, and is off by default.
+Only `NEMO_SPEECH_RNNT_MAX_BLANK` can alter output, by design, and it is off by
+default. The rest are read-only.
 
 ## The one behavioural knob: `NEMO_SPEECH_RNNT_MAX_BLANK`
 
@@ -78,6 +80,66 @@ The trade-off is a real one: a low cap also fires inside genuine silence at the
 start of the clip and injects spurious tokens ("Wenn" for "Même"). A production
 rule would need to gate forcing on acoustic evidence rather than blank count
 alone. **This knob is not production-ready and is not enabled by default.**
+
+## The no-code answer: segment before the ASR call
+
+The lock only forms if the predictor has committed hard to the previous
+language. It cannot form across a segment boundary, because each `transcribe`
+call starts with `prev_token_ = blank`. Cutting the same audio at the switch
+removes the hole entirely, with no code change and no GGUF change:
+
+| clip | French before the switch | result |
+|---|---|---|
+| `a_60-72.wav` | ~3 s | 48-frame hole |
+| `b_62-70.wav` | ~1 s | full English recovered |
+| `c_63-68.wav` | none (cut at switch) | **exact match to ground truth** |
+| `d_exact.wav` | none | exact match |
+
+`c_63-68` returns "First of all, I want to say that I understand everyone very
+well. Like there's over eight million." -- including "want to" where the
+forced-emit diagnostic produced "wanna".
+
+This is also the real explanation for `2cdd156` ("separation fixes it"): the win
+came from segmenting, not from separating.
+
+**Recommended production change: run VAD/segmentation before the ASR call, and
+prefer boundaries at language or speaker changes. No C++ change required.**
+
+A second, weaker no-code lever is the language prompt (`--language`), which is
+one-hot fused into the encoder before decoding. It changes which language
+survives but no value recovers both:
+
+| `--language` | result |
+|---|---|
+| auto / default | French kept, English resumes late |
+| `en-US` | French dropped entirely, 89-frame blank run |
+| `fr-FR` / `fr-CA` | French kept, English mangled |
+
+## Divergences found against upstream `a5b6953`
+
+Checked by cloning `NVIDIA/NeMo-Speech.cpp` clean and applying its pinned
+patch series to stock ggml. Three real differences, none yet shown to cause the
+hole:
+
+1. `CMakePresets.json` has a **committed JSON syntax error** in the `cuda-asr`
+   preset -- a missing comma and a tab-indented hand edit. Upstream's parses.
+   The preset is unusable as shipped, so local builds were configured by hand.
+2. Our vendored `ggml/` carries `fused-relpos-attn.cu`; applying upstream's
+   current series to stock ggml produces `fused-attention.cu` instead. Different
+   generations of the same kernel.
+3. Our `ggml-patches/` is an older series than the C++ it was imported with:
+   `0014` is `cuda-relpos-extensions` vs upstream's
+   `cuda-fused-attention-extensions`, `0017-cuda-stream-interop` and
+   `0018-metal-tensor-api-dynamic-k` are **missing**, and `0007`/`0015` differ in
+   content.
+
+Note the vendored `ggml/` has no git metadata, so its provenance cannot be
+checked in place -- the comparison above had to be made against a fresh clone.
+
+Evidence argues these are not the cause: a miscompiled attention kernel would
+garble the shadow ranking, but the ranking is exactly correct, and the encoder
+features through the hole are statistically normal. Worth fixing on their own
+merits.
 
 ## Hypotheses tested and ruled out
 
