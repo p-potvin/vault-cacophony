@@ -20,7 +20,8 @@ Built and tested only in `build-s2s`. `build-cuda` has not been rebuilt.
 | `src/asr/model.cpp` | `b2354ad` | Offline encoder frame statistics + offline context overrides |
 | `src/asr/model.h` | `b2354ad` | Declaration for the above |
 | `src/asr/encoder/fastconformer.cpp` | `b2354ad` | Offline attention-mask geometry log |
-| `src/asr/decoders/rnnt_greedy_decoder.{cpp,h}` | **uncommitted** | Blank-run cap (`NEMO_SPEECH_RNNT_MAX_BLANK`) |
+| `src/asr/decoders/rnnt_greedy_decoder.{cpp,h}` | `b26235a` | Blank-run cap (`NEMO_SPEECH_RNNT_MAX_BLANK`) |
+| `src/asr/decoders/rnnt_greedy_decoder.{cpp,h}` | `60737b2` | Shadow decode (`NEMO_SPEECH_DEBUG_BLANK_SHADOW`) |
 
 ## Environment variables added
 
@@ -187,5 +188,8 @@ The diagnostics are additive and can be dropped wholesale:
 git revert b2354ad 8dcbae4
 ```
 
-The blank-run cap is currently uncommitted; `git checkout -- src/asr/decoders/`
-removes it.
+Full revert of everything from this investigation:
+
+```bash
+git revert e831234 60737b2 b26235a b2354ad 8dcbae4
+```
