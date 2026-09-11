@@ -169,6 +169,7 @@ RnntGreedyDecoder::finalize() {
 
 static bool rnnt_trace_enabled();
 static int rnnt_max_blank_run();
+static int rnnt_blank_shadow_threshold();
 
 std::vector<int>
 RnntGreedyDecoder::step(const float* enc_out, int d_model, int T, int64_t frame_offset) {
@@ -305,6 +306,53 @@ RnntGreedyDecoder::step_impl(
         // Blank frames this scan is about to consume before any emission.
         // first_emit < 0 means the whole rest of the chunk is blank.
         const int blanks_here = (first_emit < 0) ? remaining : first_emit;
+
+        // Shadow decode: what was the model ranking under the blank? Read-only.
+        const int shadow_n = rnnt_blank_shadow_threshold();
+        if (shadow_n > 0 && blanks_here >= shadow_n) {
+            const char* prev_piece = "";
+            if (prev_token_ >= 0 && prev_token_ < static_cast<int>(vocab.size()))
+                prev_piece = vocab[static_cast<size_t>(prev_token_)].c_str();
+            std::fprintf(
+                stderr,
+                "[rnnt]   ~~ SHADOW: %d blank frames from t=%d, predictor FROZEN on"
+                " token=%d %s (every frame below is scored against that one state)\n",
+                blanks_here, t, prev_token_, prev_piece);
+            if (finalizing_ && has_punct_bias_)
+                forced_scratch_.assign(punct_bias_.begin(), punct_bias_.end());
+            else
+                forced_scratch_.assign(static_cast<size_t>(cfg.vocab_size), 0.0f);
+            forced_scratch_[static_cast<size_t>(blank_id)] = -1e30f;
+            forced_ids_.resize(static_cast<size_t>(blanks_here));
+            if (device_enc_out != nullptr) {
+                engine_->joint_argmax_device(
+                    *stream_state_, *device_enc_out, t, d_model, blanks_here,
+                    forced_ids_.data(), forced_scratch_.data());
+            } else {
+                engine_->joint_argmax(
+                    *stream_state_, enc_out + static_cast<size_t>(t) * d_model, d_model,
+                    blanks_here, forced_ids_.data(), forced_scratch_.data());
+            }
+            ++stats_.joint_calls;
+            stats_.joint_frames += static_cast<uint64_t>(blanks_here);
+            std::string line;
+            for (int i = 0; i < blanks_here; ++i) {
+                const int sid = forced_ids_[static_cast<size_t>(i)];
+                const char* piece = "?";
+                if (sid >= 0 && sid < static_cast<int>(vocab.size()))
+                    piece = vocab[static_cast<size_t>(sid)].c_str();
+                char buf[128];
+                std::snprintf(
+                    buf, sizeof(buf), "%s%d:%s", line.empty() ? "" : "  ", t + i, piece);
+                line += buf;
+                // Wrap so a 50-frame run stays readable.
+                if ((i + 1) % 8 == 0 || i + 1 == blanks_here) {
+                    std::fprintf(stderr, "[rnnt]      %s\n", line.c_str());
+                    line.clear();
+                }
+            }
+        }
+
         const int max_blank = rnnt_max_blank_run();
         if (max_blank > 0 && blanks_here > 0 && blank_run_ + blanks_here >= max_blank) {
             // Force a non-blank at the frame where the blank budget runs out.
@@ -532,6 +580,33 @@ rnnt_trace_enabled() {
 // from greedy decoding -- it emits a token the model ranked below blank -- so
 // it is a diagnostic for whether a run is a stuck prior or a genuine judgement
 // about the audio, not a default.
+// Read-only companion to the blank cap, gated on NEMO_SPEECH_DEBUG_BLANK_SHADOW
+// (unset = off; set to a number to use it as the threshold, or to any other
+// non-empty value for the default of 3).
+//
+// When a blank run of at least that many frames is about to be consumed, this
+// runs ONE extra blank-excluded argmax across the run and prints, frame by
+// frame, the token the model would have emitted if blank were not on the table.
+// It commits nothing: no token is emitted, prev_token_ is untouched, the
+// predictor cache is not invalidated, and the transcript is bit-identical to a
+// run with this unset. It is purely a window into what the joint was ranking
+// second while it stayed silent.
+//
+// Read the output against the frozen predictor state named in the header line.
+// Every shadow frame in a run is scored against that ONE state, because a blank
+// does not advance it -- which is the whole reason a run can sustain itself.
+static int
+rnnt_blank_shadow_threshold() {
+    static const int n = [] {
+        const char* v = std::getenv("NEMO_SPEECH_DEBUG_BLANK_SHADOW");
+        if (v == nullptr || *v == 0 || (*v == '0' && v[1] == 0))
+            return 0;
+        const int parsed = std::atoi(v);
+        return parsed > 0 ? parsed : 3;
+    }();
+    return n;
+}
+
 static int
 rnnt_max_blank_run() {
     static const int n = [] {

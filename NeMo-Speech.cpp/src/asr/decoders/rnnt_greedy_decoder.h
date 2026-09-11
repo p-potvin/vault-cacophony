@@ -219,8 +219,9 @@ class RnntGreedyDecoder : public Decoder {
     // across chunks. Only meaningful with NEMO_SPEECH_RNNT_MAX_BLANK set; see
     // rnnt_greedy_decoder.cpp for why a blank run is self-sustaining.
     int blank_run_ = 0;
-    // Scratch for the forced non-blank argmax. Only populated when the
-    // NEMO_SPEECH_RNNT_MAX_BLANK diagnostic is active.
+    // Scratch for the forced and shadow non-blank argmax passes. Only
+    // populated when NEMO_SPEECH_RNNT_MAX_BLANK or
+    // NEMO_SPEECH_DEBUG_BLANK_SHADOW is active.
     std::vector<float> forced_scratch_;
     std::vector<int> forced_ids_;
     int bias_node_ = ContextBiasingTree::kRoot;
