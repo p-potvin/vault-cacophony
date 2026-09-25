@@ -1,0 +1,14 @@
+# environments
+.venv-comfy/
+.venv-train/
+# vendored HF space: 400 MB of checkpoints + nested git
+FontDiffuser-Gradio/ckpt/
+FontDiffuser-Gradio/.git/
+# run artefacts
+text-style-transfer/out/
+text-style-transfer/logs/
+text-style-transfer/comfy-runtime/input/
+text-style-transfer/comfy-runtime/output/
+text-style-transfer/comfy-runtime/temp/
+text-style-transfer/comfy-runtime/user/
+*.log

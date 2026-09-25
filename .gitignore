@@ -124,3 +124,7 @@ README_*.md
 # path rather than preserving machine-specific parallel fetch helpers.
 audio.cpp/tools/fast_download.py
 audio.cpp/tools/finish_download.py
+/.vscode
+*.srt
+*.vtt
+/font-cloning/text-style-transfer/examples

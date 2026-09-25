@@ -163,11 +163,61 @@ def decode_tokens_to_pcm(mimi, other_mimi, tokens: torch.Tensor) -> np.ndarray:
     return pcm[0, 0].detach().cpu().numpy()
 
 
+def _record_space_run(model: str, task: str, duration_ms: float, status: str = "ok", extra: dict | None = None) -> None:
+    """Best-effort telemetry emission from HF Space to VaultWares API."""
+    import json, os, urllib.request
+    from datetime import datetime, timezone
+
+    api_url = os.environ.get("VW_API_URL") or "https://api.vaultwares.ca"
+    api_key = os.environ.get("VW_TELEMETRY_API_KEY")
+    space_id = os.environ.get("SPACE_ID") or "clopeux/personaplex-voice"
+
+    run = {
+        "run_id": os.urandom(16).hex(),
+        "provider": "huggingface",
+        "runtime": "hf-space",
+        "model": model,
+        "task": task,
+        "project": "vault-cacophony",
+        "service": space_id,
+        "duration_ms": round(duration_ms, 2),
+        "status": status,
+        "is_free": True,
+        "cost_usd": 0.0,
+        "extra": extra or {},
+    }
+    batch = {
+        "batchIndex": 0,
+        "collectedAt": datetime.now(timezone.utc).isoformat(),
+        "schema": 1,
+        "source": "hf-space",
+        "host": space_id,
+        "runs": [run],
+    }
+    try:
+        req = urllib.request.Request(
+            f"{api_url.rstrip('/')}/api/telemetry/ai-runs/batches",
+            data=json.dumps(batch).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                **({"x-api-key": api_key} if api_key else {}),
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3.0):
+            pass
+    except Exception:
+        pass
+
+
 @spaces.GPU(duration=120)
 def generate_response(audio_input, persona: str, voice: str):
     """Process audio input and generate PersonaPlex response."""
     if audio_input is None:
         return None, "Please record audio first."
+
+    import time
+    t0 = time.monotonic()
 
     # Get lazily loaded models
     models = get_models()
@@ -272,6 +322,14 @@ def generate_response(audio_input, persona: str, voice: str):
     # Concatenate output audio
     output_audio = np.concatenate(generated_frames, axis=-1)
     output_text = "".join(generated_text).strip()
+
+    dur_ms = (time.monotonic() - t0) * 1000
+    _record_space_run(
+        model=HF_REPO,
+        task="audio-s2s",
+        duration_ms=dur_ms,
+        extra={"voice": voice, "persona_len": len(persona), "text_len": len(output_text)}
+    )
 
     return (mimi.sample_rate, output_audio), output_text
 

@@ -186,6 +186,31 @@ Make a 16 kHz mono wav out of anything:
 ffmpeg -i input.m4a -vn -ac 1 -ar 16000 output.16k.wav
 ```
 
+### Video: captions, summary, search, Q&A
+
+The picture track gets the same treatment as the audio, shaped after NVIDIA's
+[VSS blueprint](video-search-and-summarization/) summarization profile but run
+on GGUF models through Ollama instead of NIMs. Chunks of 10 s, eight frames
+each, a dense caption per chunk, then an aggregation pass into the LVS
+`{video_summary, events}` shape. Details and measurements in
+[docs/vss-local-pipeline.md](docs/vss-local-pipeline.md).
+
+```powershell
+.\scripts\Start-VideoSummary.ps1 -TargetDir "D:\Media\clip.mp4" -Scenario "screen recording" -Events "typing,window change" -Audio
+```
+
+`-Audio` folds the `.srt` the subtitle pass wrote into each chunk's prompt.
+Then search every captioned file under a folder, or ask one file a question
+and let the VLM look at the matching chunks' frames again:
+
+```bash
+.venv/Scripts/python.exe scripts/vss_pipeline.py search "D:\Media" -q "person opens a door"
+```
+
+```bash
+.venv/Scripts/python.exe scripts/vss_pipeline.py ask "D:\Media\clip.mp4" -q "what is typed into the chat?"
+```
+
 ## What it writes
 
 `<base>.srt` is ordinary SubRip. `<base>.tags.json` is the tag store: one file
@@ -211,6 +236,14 @@ language tag covers a sentence, a cue is sized to be read in the time it is on
 screen. Whoever writes first would otherwise fix the segmentation for everyone
 after. Consumers intersect instead, and a pass can run late, run again, or never
 run at all without invalidating the file.
+
+The video pass adds two tracks to the same store, `caption` (one span per
+chunk, the dense caption as its value) and `event` (the summarizer's events,
+type as value, description alongside), and two files of its own:
+`<base>.captions.jsonl`, one line per chunk in the shape VSS's rt-vlm writes,
+and `<base>.summary.json`, the LVS response envelope whose
+`choices[0].message.content` is a JSON string of `{video_summary, events}`,
+with `<base>.summary.md` beside it for reading.
 
 ## The voice store
 

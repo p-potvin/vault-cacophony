@@ -30,9 +30,25 @@ python tests\bs_roformer\run_python_reference.py `
 SafeTensors:
 
 ```powershell
-audiocpp_cli.exe --task sep --family bs_roformer `
+.\audiocpp_cli.exe --task sep --family bs_roformer `
   --model models\BS-RoFormer-ep368 --backend cuda `
-  --audio input_44k.wav --out-dir outputs\cpp-f32
+  --session-option bs_roformer.num_overlap=4 `
+  --audio "F:\amd\Models\newer pvt 2026-08-27\audio_temp.wav" `
+  --out-dir "F:\amd\Models\newer pvt 2026-08-27\bs_roformer_4" --metrics
+```
+
+```
+.\audiocpp_cli --task sep --family htdemucs --model models/htdemucs --backend cuda --audio "F:\amd\Models\newer pvt 2026-08-27\audio_temp.wav" --out-dir "F:\amd\Models\newer pvt 2026-08-27\htdemucs" --metrics
+```
+
+```
+.\audiocpp_cli --task sep --family mel_band_roformer --model models/mel-roformer-mlx --backend cuda --audio "F:\amd\Models\newer pvt 2026-08-27\audio_temp.wav" --out-dir "F:\amd\Models\newer pvt 2026-08-27\mel_band" --session-option mel_band_roformer.num_overlap=1 --metrics
+```
+```
+.\audiocpp_cli --task vad --family marblenet_vad --model assets/framework/models/marblenet_vad --backend cuda --audio "F:\amd\Models\newer pvt 2026-08-27\mel_band\vocals.wav" --segments-out "F:\amd\Models\newer pvt 2026-08-27\speech_timestamps.json" --request-option threshold=0.7 --metrics
+```
+```
+.\audiocpp_cli --task asr --family fun_asr_nano --model models/Fun-ASR-Nano-2512-GGUF/fun-asr-nano-2512-q8_0.gguf --backend cuda --audio "F:\amd\Models\newer pvt 2026-08-27\mel_band\vocals.wav" --text-out "F:\amd\Models\newer pvt 2026-08-27\speech_timestamps.json" --metrics
 ```
 
 Standalone Q8 GGUF:

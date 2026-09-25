@@ -1,0 +1,5 @@
+# Pin the CUDA torch stack so ComfyUI's unpinned requirements cannot swap it for
+# a CPU wheel or a version without Windows cu129 wheels (torchvision 0.24 has none).
+torch==2.8.0+cu129
+torchvision==0.23.0+cu129
+torchaudio==2.8.0+cu129
