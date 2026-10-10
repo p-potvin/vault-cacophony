@@ -284,7 +284,7 @@ def main():
     ap.add_argument("--max-chars", type=int, default=76,
                     help="soft cap before forcing a split; 76 is the largest value that still "
                          "wraps into two lines of --width without overflow (84 leaves 8 lines long)")
-    ap.add_argument("--max-dur", type=float, default=6.0, help="seconds before forcing a split")
+    ap.add_argument("--max-dur", type=float, default=4.0, help="seconds before forcing a split")
     ap.add_argument("--width", type=int, default=42, help="characters per displayed line")
     ap.add_argument("--merge-tokens", action="store_true",
                     help="input times sub-word pieces rather than words (nemotron)")

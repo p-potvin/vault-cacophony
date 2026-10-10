@@ -1,0 +1,100 @@
+# english-only.yaml — resident server profile for the -EnglishOnly pipelines.
+#
+# Covers ESA (English Standard Audio) and EDA (English Dirty Audio). The two
+# differ only in whether the client runs BS-RoFormer first, which is a
+# client-side stage in audio.cpp and not a server concern -- so both use this
+# file unchanged.
+#
+#   nemo-speech serve --config config/pipelines/english-only.yaml
+#
+# Precedence is defaults < this YAML < environment < CLI, so anything here can
+# be overridden per run without editing the file:
+#   nemo-speech serve --config .../english-only.yaml --asr.backend.gpu 1
+#
+# NMT is deliberately absent. -EnglishOnly means no translation, and leaving
+# nmt out keeps Riva-Translate-4B (2.7 GB) off the card entirely rather than
+# loading it to sit idle.
+
+http:
+  enabled: true
+  host: 127.0.0.1
+  port: 8123
+  threads: 4
+  max-upload-mb: 512
+  access-log: true
+  log-format: text
+  playground: false
+
+asr:
+  enabled: true
+  backend:
+    gpu: 0
+  model:
+    # nemotron-speech-streaming-en-0.6b. Cache-aware streaming, and streaming
+    # mode is strictly cheaper than offline on this model: measured 74.6 s vs
+    # 76.8 s on 45 minutes, at 1078 MiB against 2430 MiB. Use parakeet-tdt
+    # instead for pure batch throughput (RTFx 118 offline with the query-length
+    # gate) -- but it cannot stream, so it cannot serve the live surface.
+    path: nvidia/nemotron-speech-streaming-en-0.6b
+  streaming:
+    # Asymmetric on purpose. Each CTC step processes chunk + left + right to
+    # emit `chunk` seconds, so right padding is latency you pay on every cue
+    # while left padding is context you already have. 3.84 left / 0.16 right
+    # keeps the context and drops the wait.
+    chunk_size: 0.16
+    ctc_left_padding: 3.84
+    ctc_right_padding: 0.16
+    # Applies to genuine streaming only (live capture, server streams). The
+    # complete-buffer/file path now decodes offline at any length, and the
+    # offline encoder ignores asr.streaming.*, so this no longer affects
+    # subtitle generation from files.
+    #
+    # Left at the model default. The -1 (model max, 3) setting measured earlier
+    # was justified by long-form file runs that were silently on the streaming
+    # runner; with that fixed the justification is gone, and -1 costs live
+    # latency (encoder step 160 ms -> 320 ms).
+    rnnt_right_context: 1
+  decoder:
+    kind: greedy
+  # Silero VAD. The GGUF must come from this repo's own converter --
+  #   pip install "silero-vad==6.2.0"
+  #   python NeMo-Speech.cpp/convert_model.py silero --outfile <out>.gguf
+  # which writes general.architecture="vad", the vad.* hparams, and tensor
+  # names like encoder.0.conv.weight. A silero GGUF from another toolchain
+  # (e.g. vokra-core, which writes vokra.* and sr16k.encoder.0.reparam_conv.*)
+  # loads in no way at all: the binary rejects it at startup.
+  #
+  # mask_enable is the actual switch. Loading a VAD model alone does nothing.
+  # Note that turning masking on moves the RNNT path from mode=offline to
+  # mode=streaming, which is a behaviour change beyond the masking itself.
+  #
+  # Measured on the 11.6 min French/English file: masking left the long-form
+  # dropouts completely untouched -- identical gap positions and durations to
+  # the centisecond -- and moved word count 2332 -> 2336. It is not a fix for
+  # those; see docs/plurilingual-vad-and-decoder-notes.md.
+  vad:
+    model_path: NeMo-Speech.cpp/models/silero-v6.2.0-nemo.gguf
+    masker:
+      mask_enable: false
+      onset: 0.5
+      offset: 0.3
+      pad_onset_ms: 200
+      pad_offset_ms: 200
+      min_duration_off_ms: 500
+  endpointing:
+    enable: true
+    vad_based: false
+    stop_history_eou_ms: 800
+  postproc: {}
+
+# Word-level speaker tags. Roughly doubles ASR cost (83.5 s -> 157.5 s on 45
+# minutes) and still lands at 17x realtime. Comment out for the cheapest path.
+diar:
+  model_path: nvidia/diar_streaming_sortformer_4spk-v2
+  preset: streaming
+
+nmt:
+  enabled: false
+
+tts:
+  enabled: false

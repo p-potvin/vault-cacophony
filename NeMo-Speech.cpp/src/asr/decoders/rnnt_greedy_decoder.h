@@ -150,6 +150,9 @@ class RnntGreedyDecoder : public Decoder {
         cur_open_ = false;
         bias_node_ = ContextBiasingTree::kRoot;
     }
+    // Clear the predictor context but keep the transcript so far. See
+    // Decoder::reset_context().
+    void reset_context() override;
     // Build the per-request context-biasing tree from speech_contexts.
     void set_request_options(const AsrRequestOptions& opts) override;
     // enc_out: joint encoder projection (joint_dim, T) flat-packed. The model
@@ -215,6 +218,15 @@ class RnntGreedyDecoder : public Decoder {
     // RNNT context biasing (word boosting), built per request from
     // speech_contexts. bias_node_ is the per-stream Aho-Corasick match state.
     ContextBiasingTree bias_tree_;
+    // Consecutive blank frames under the CURRENT predictor state, carried
+    // across chunks. Only meaningful with NEMO_SPEECH_RNNT_MAX_BLANK set; see
+    // rnnt_greedy_decoder.cpp for why a blank run is self-sustaining.
+    int blank_run_ = 0;
+    // Scratch for the forced and shadow non-blank argmax passes. Only
+    // populated when NEMO_SPEECH_RNNT_MAX_BLANK or
+    // NEMO_SPEECH_DEBUG_BLANK_SHADOW is active.
+    std::vector<float> forced_scratch_;
+    std::vector<int> forced_ids_;
     int bias_node_ = ContextBiasingTree::kRoot;
     bool bias_on_ = false;
     // --boosting-tree-alpha: an extra global multiplier (default 1.0, i.e. no
@@ -236,6 +248,9 @@ class TdtGreedyDecoder : public Decoder {
     explicit TdtGreedyDecoder(RnntEngine* engine);
 
     void reset() override;
+    // Clear the predictor context but keep the transcript so far. See
+    // Decoder::reset_context().
+    void reset_context() override;
     void reset_utterance() override;
     std::vector<int> step(const float* enc_out, int d_model, int T, int64_t frame_offset) override;
     int blank_id() const override { return engine_->rnnt_config().blank_id; }

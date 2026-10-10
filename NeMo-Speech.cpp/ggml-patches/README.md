@@ -9,13 +9,20 @@ git submodule update --init ggml
 scripts/apply-ggml-patches.sh        # applies patches in filename order
 ```
 
-Patched CUDA builds expect the patches before CMake configuration; CPU, Metal,
-Vulkan, and stock-CUDA builds do not. `apply-ggml-patches.sh` uses `git apply`,
-skips patches that are already applied, and applies new patches in filename
-order. Later patches may build on files changed by earlier patches; 0006 carries
-the dispatch wiring for the ops/kernels introduced by 0001/0003/0005. Docker
-builds and `scripts/configure.sh` apply the series automatically; apply it
-explicitly before a raw CUDA CMake configuration.
+Patched CUDA and Metal builds expect the patches before CMake configuration.
+CPU, Vulkan, and stock-CUDA builds do not. `apply-ggml-patches.sh` uses `git
+apply`, skips patches that are already applied, and applies new patches in
+filename order. Later patches may build on files changed by earlier patches;
+0006 carries the dispatch wiring for the ops/kernels introduced by
+0001/0003/0005. Docker builds and `scripts/configure.sh` apply the series
+automatically; apply it explicitly before a raw CUDA or Metal CMake
+configuration.
+
+Metal requires only `0018-metal-tensor-api-dynamic-k.patch`. The `metal-*`
+presets apply the whole series because `apply-ggml-patches.sh` requires all of
+them or it fails. Once the submodule moves past upstream ggml `33c9ea5`, drop
+0018 as described below and remove `metal-*` from the `case` in
+`scripts/configure.sh`.
 
 ## Building against patched vs stock ggml
 
@@ -54,117 +61,48 @@ stock comparison therefore requires both a pristine ggml checkout and
 
 ## Patches
 
-- **0001-fused-relpos-attn.patch** - adds `GGML_OP_FUSED_RELPOS_ATTN`, a fused
-  FastConformer relative-position attention op (content + position-with-rel-shift
-  + scale + mask + softmax + context in one CUDA kernel). Touches `ggml.h`,
-  `ggml.c`, the CPU backend (unsupported stub + `supports_op` false); adds
-  `ggml-cuda/fused-relpos-attn.{cu,cuh}`. The kernel takes K/V/P in F32 or F16
-  (it is re-read per query, so F16 halves the dominant traffic; math stays F32)
-  and uses a warp-cooperative, vectorized score loop for d_k == 128 (the
-  thread-per-key scalar loop is load-issue-bound and left as the generic
-  fallback). For the SM100 streaming shape (`d_k=128`, `q=2`, `kv=72`), an
-  occupancy query selects between one block per query and a two-query block
-  that reuses K/V after the grid exceeds one resident wave. Other CUDA shapes
-  retain the generic fused kernel.
-  The op is stride-general: Q/K/V/P may be non-contiguous views
-  (only d_k rows must be contiguous; the CUDA op derives all addressing from
-  tensor `nb[]`), `merge_heads` emits a head-merged output layout whose
-  permute view is a contiguous `(n_feat, q, batch)` matrix, and the rel-pos
-  table length assert is `>=` so one precomputed table serves shorter tail
-  chunks — together this lets the cache-aware streaming encoder call the
-  kernel directly on the fused-QKV output and feat-major K/V windows with
-  zero staging copies. Wired into the encoder behind
-  `NEMO_SPEECH_FUSED_RELPOS_ATTN`.
+- **0001-fused-relpos-attn.patch** - adds relative-position fused attention for
+  CUDA, including stride-aware inputs, F16 K/V/P storage, head-merged output,
+  and the `NEMO_SPEECH_FUSED_RELPOS_ATTN` encoder path.
 
-- **0002-nvfp4-warp-quantizer.patch** - reworks the CUDA NVFP4 MMQ activation
-  quantizer. Upstream uses one thread per 16-element sub-block (serial) plus a
-  5-candidate scale search, which dominates small-batch streaming GEMMs. Adds a
-  single-pass warp-cooperative kernel (~8x threads, MXFP4-style) gated by
-  `NEMO_SPEECH_NVFP4_WARP`, a `NEMO_SPEECH_NVFP4_SCALE_SEARCH` width knob (1..5), and a
-  byte-exact self-check (`NEMO_SPEECH_NVFP4_SELFCHECK`). The native-FP4 MMQ path is
-  Blackwell-1200-only; these knobs are inert on architectures using the generic
-  path.
+- **0002-nvfp4-residual-activations.patch** - keeps the native NVFP4 weight
+  path while reducing activation-quantization error. Each activation
+  sub-block is quantized once to FP4, its reconstruction residual is quantized
+  to a second FP4 block, and both contributions are accumulated by the same
+  MMQ tile. The correction is restricted to NVFP4; MXFP4 and non-native paths
+  retain their upstream behavior. Backend correctness tests use the standard
+  quantized-matmul tolerance rather than the previous relaxed NVFP4 threshold.
 
-- **0003-norm-mul-add-fusion.patch** - fused LayerNorm kernel
-  (`norm_mul_add_f32`): `GGML_OP_NORM` + row-vector gamma `MUL` + optional
-  row-vector beta `ADD` in one launch (upstream only fuses `RMS_NORM`).
-  Restricted to the classic affine pattern (ne0-length contiguous vectors).
-  Eligibility + dispatch live in patch 0006. Graph code must emit non-inplace
-  mul/add for the fusion to match (inplace ops are views).
+- **0003-norm-mul-add-fusion.patch** - fuses affine LayerNorm with row-vector
+  scale and optional bias.
 
-- **0004-conv2d-dw-f16-kernel.patch** - `conv2d-dw.cu` accepts an F16 kernel
-  (weights) with F32 input/output (templated kernel type). Lets the encoder's
-  depthwise convs run the direct CUDA kernel instead of im2col + GEMM while
-  keeping converter-produced F16 conv weights.
+- **0004-conv2d-dw-f16-kernel.patch** - supports F16 weights in the direct
+  depthwise-convolution CUDA kernel with F32 input and output.
 
-- **0005-skinny-q8-gemm.patch** - adds `ggml-cuda/skinny-q8.{cu,cuh}`: a
-  Q8_0 x F32 GEMM specialized for skinny activations (9 <= N <= 64, the
-  streaming-encoder shape where mul_mat_q runs latency-bound). int8 tensor-core
-  `mma.m16n8k32` with per-q8-block scaling, K128 two-buffer cp.async pipeline,
-  once-per-tensor weight repack into aligned planes (cached; weight buffers
-  only), warp-coalesced activation quantizer, deterministic K-split reduction
-  for small-M shapes, one grid.z launch for all 64-column outer-batch tiles,
-  and an optional fused row-vector bias epilogue. It is enabled by default; logical
-  per-sequence-width dispatch prevents outer batch size from selecting different
-  math (`GGML_SKINNY_Q8_OUTER_BATCH=1` opts into dense outer-batch flattening -
-  use with `GGML_SKINNY_Q8_INPLACE=0` under a multi-stream scheduler). Accepts
-  serialized tensor-planar Q8 weights
-  (`GGML_TENSOR_FLAG_Q8_PLANAR`, see 0006) without a runtime repack. Kill
-  switch: `GGML_SKINNY_Q8=0`. Turing and older GPUs retain stock block-Q8
-  matmul; wide planar Q8 fails explicitly because its tensor-wide layout has
-  no stock fallback. The repack is in-place by default (reuses the
-  weight buffer, saving the ~1.07 GB cudaMalloc duplicate on parakeet-xxl),
-  which is correct and fast for the streaming-ASR encoder runtime. Two
-  caveats for the llama.cpp NMT decoder, which the NMT pipeline handles by
-  setting an env var process-wide before any service warms up: (1) the
-  in-place D2D memcpy is a stream-ordering hazard under llama.cpp's
-  multi-stream graph-split scheduling (it corrupts the GEMM even though the
-  repacked bytes are correct), and (2) the kernel is tuned for the encoder's
-  N=9..64 shape, so for the decoder's N=1 decode it is ~17% slower than stock
-  mmvq. So: NMT without ASR sets `GGML_SKINNY_Q8=0` (disable skinny entirely;
-  correct and faster); NMT alongside ASR sets `GGML_SKINNY_Q8_INPLACE=0`
-  (keep the encoder's skinny, force the safe separate-buffer layout).
+- **0005-skinny-q8-gemm.patch** - adds a Q8_0 x F32 GEMM for skinny streaming
+  activations, including planar weights, deterministic K-split reduction, and
+  an optional bias epilogue. `GGML_SKINNY_Q8` controls dispatch;
+  `GGML_SKINNY_Q8_INPLACE=0` uses separate repack storage when required by a
+  multi-stream scheduler.
 
-- **0006-cuda-dispatch-wiring.patch** - `ggml-cuda.cu` + `common.cuh` +
-  `mmvq.cu`/`vecdotq.cuh` + the `ggml.h` flag: the CUDA-backend wiring for
-  the patches above (fused-relpos op dispatch and `supports_op`,
-  `GGML_OP_NORM` fusion acceptance + eval-loop dispatch, skinny-q8 mul_mat
-  dispatch hook and the skinny GEMM+bias fusion), plus the streaming Q8
-  weight/epilogue work: the serialized tensor-planar Q8 layout
-  (`GGML_TENSOR_FLAG_Q8_PLANAR`; planar Q8_0 vec-dot + planar MMVQ dispatch,
-  `VDR_Q8_0_Q8_1_MMVQ` 2->4; GGUFs produced with
-  `convert_model.py --outtype q8_0 --q8-layout planar`) and the Q8
-  narrow bias/SiLU epilogue fusion for the two-frame streaming chunk
-  (`GGML_CUDA_Q8_NARROW_EPILOGUE`, default on: MUL_MAT+UNARY and
-  MUL_MAT+ADD+SILU fusion with broadcast Linear-bias support, plus
-  flattened-outer-batch MMVQ eligibility). Also carries the documented
-  sm_110 finding on the Blackwell FP4 gate in `common.cuh`.
+- **0006-cuda-dispatch-wiring.patch** - wires fused attention, affine
+  LayerNorm, skinny-Q8, planar-Q8, and narrow bias/SiLU epilogues into the CUDA
+  backend.
 
-- **0007-magpietts-nanocodec.patch** - adds the CUDA operations used by
-  MagpieTTS and NanoCodec, including grouped transposed convolution and Snake;
-  bounds the keyed CUDA graph cache with configurable sweep and idle-eviction
-  intervals; and adds SM110/Jetson Thor architecture handling.
+- **0007-magpietts-nanocodec.patch** - adds grouped transposed convolution and
+  Snake for MagpieTTS and NanoCodec, two-column MMVF epilogues for paired CFG,
+  bounded CUDA graph caching, and CUDA architecture handling.
 
-- **0008-cublas-bf16-projections.patch** - recognizes shared F32/F16/BF16
-  weights broadcast over contiguous outer activation dimensions and presents
-  `[K,T,B,...]` as one `[K,T*B*...]` cuBLAS GEMM. For BF16 projections it also
-  folds row bias and optional SiLU/rounding into the required output conversion.
-  Native BF16 epilogues dispatch only on NVIDIA SM80+; older architectures keep
-  the established conversion and elementwise paths.
+- **0008-cublas-bf16-projections.patch** - flattens contiguous outer activation
+  dimensions into shared-weight cuBLAS GEMMs and folds supported BF16 projection
+  epilogues into output conversion.
 
-- **0009-fastconformer-cuda-fusions.patch** - adds the CUDA sigmoid GLU used by
-  the convolution module, fuses Macaron `residual + scale * ff`, and lets fused
-  affine LayerNorm write the BF16 projection input directly. The graph rewrites
-  are behind `NEMO_SPEECH_FASTCONFORMER_CUDA_FUSIONS`; BF16 output requires
-  NVIDIA SM80+, and the 256-thread specialization for 1024-wide LayerNorm rows
-  is selected only on SM90+.
+- **0009-fastconformer-cuda-fusions.patch** - adds sigmoid GLU, Macaron
+  residual, affine LayerNorm conversion, and BF16 projection fusions for
+  FastConformer.
 
-- **0010-cuda-pad-large-batch-grid.patch** - flattens CUDA PAD's tensor-slice
-  launch into `grid.x`. Upstream maps `ne2 * ne3` onto `grid.z`, which exceeds
-  CUDA's 65,535-block z-dimension limit for Nemotron's 256-channel causal
-  subsampling tensors at batch sizes of 256 or larger. The flattened launch
-  preserves the same indexing while allowing the large batches required for
-  throughput sweeps.
+- **0010-cuda-pad-large-batch-grid.patch** - flattens CUDA PAD launches into
+  `grid.x` so large batch dimensions do not exceed the `grid.z` limit.
 
 - **0011-cuda-graph-shape-key.patch** - keys cached CUDA graph executables by
   the host graph identity plus a structural signature containing node count and
@@ -210,6 +148,15 @@ stock comparison therefore requires both a pristine ggml checkout and
   axes after the flattened Conv1D matrix multiplication. The upstream direct
   reshape interleaves those axes for batches larger than one; batch one keeps
   its original zero-copy path.
+
+- **0019-cuda-graph-dynamic-update.patch** - refreshes CUDA graph node
+  parameters when a cached graph is replayed so dynamic pointers and launch
+  geometry do not retain values from an earlier execution.
+
+- **0020-bf16-convolution.patch** - adds BF16 im2col and direct depthwise
+  convolution support, then fuses bias, BF16 output rounding, and optional
+  ReLU epilogues. This preserves the VoiceChat perception stem's native BF16
+  behavior without adding standalone conversion kernels.
 
 ## Regenerating after editing ggml
 

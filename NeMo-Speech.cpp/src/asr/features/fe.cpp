@@ -234,9 +234,12 @@ class MelSpectrogramExtractor::GpuBatcher {
               return owner_->compute_gpu_batch_via_session(std::move(requests));
           }) {}
 
-    BatchResult run(const float* audio, size_t n_samples, bool reflect_left, bool normalize) {
+    BatchResult run(
+        const float* audio, size_t n_samples, size_t valid_samples, bool reflect_left,
+        bool normalize) {
         BatchRequest request;
         request.audio.assign(audio, audio + n_samples);
+        request.valid_samples = valid_samples;
         request.reflect_left = reflect_left;
         request.normalize = normalize;
         return queue_.run({n_samples, reflect_left, normalize}, std::move(request));
@@ -291,6 +294,94 @@ nemo_speech::asr::BatchMetrics
 MelSpectrogramExtractor::batch_metrics() const {
     return batcher_ ? batcher_->metrics() : nemo_speech::asr::BatchMetrics{};
 }
+
+// Optional sliding-window per-feature normalization.
+//
+// The default NeMo behaviour computes one mean/variance per mel bin across the
+// whole call. On long-form input that makes normalization a function of the
+// entire file: measured on a 25.5 min recording, appending audio at 20:00
+// changed the transcript at 2:00, and marginal spans dropped out of the decode
+// (docs/plurilingual-vad-and-decoder-notes.md).
+//
+// NEMO_SPEECH_NORM_WINDOW_S > 0 switches to statistics gathered over a centered
+// window of that many seconds around each frame, so a frame is normalized by
+// its own neighbourhood and long files stop behaving differently from short
+// ones. 0 (the default) keeps the whole-call behaviour exactly.
+//
+// Implemented with prefix sums so the cost stays O(n_mels * n_frames)
+// regardless of window size.
+double
+norm_window_seconds() {
+    static const double seconds = [] {
+        if (const char* s = std::getenv("NEMO_SPEECH_NORM_WINDOW_S")) {
+            char* end = nullptr;
+            const double v = std::strtod(s, &end);
+            if (end != s && v >= 0.0)
+                return v;
+        }
+        return 0.0;
+    }();
+    return seconds;
+}
+
+// Normalize `features` (frame-major, n_mels per frame) in place over the first
+// `valid` frames, zeroing frames past `valid`. `half_window` <= 0 reproduces
+// the whole-call path bit-for-bit.
+void
+normalize_frames(
+    float* features, int n_mels, int n_frames, int valid, int half_window) {
+    std::vector<double> sum(static_cast<size_t>(valid) + 1, 0.0);
+    std::vector<double> sumsq(static_cast<size_t>(valid) + 1, 0.0);
+    for (int m = 0; m < n_mels; ++m) {
+        if (half_window > 0) {
+            sum[0] = 0.0;
+            sumsq[0] = 0.0;
+            for (int f = 0; f < valid; ++f) {
+                const double x = features[static_cast<size_t>(m) + static_cast<size_t>(f) * n_mels];
+                sum[f + 1] = sum[f] + x;
+                sumsq[f + 1] = sumsq[f] + x * x;
+            }
+        }
+        double mean = 0.0;
+        double inv_std = 1.0;
+        if (half_window <= 0) {
+            double acc = 0.0;
+            for (int f = 0; f < valid; ++f)
+                acc += features[static_cast<size_t>(m) + static_cast<size_t>(f) * n_mels];
+            mean = valid > 0 ? acc / valid : 0.0;
+            double var = 0.0;
+            for (int f = 0; f < valid; ++f) {
+                const double d =
+                    features[static_cast<size_t>(m) + static_cast<size_t>(f) * n_mels] - mean;
+                var += d * d;
+            }
+            if (valid > 1)
+                var /= valid - 1;
+            inv_std = 1.0 / (std::sqrt(var) + 1e-5);
+        }
+        for (int f = 0; f < n_frames; ++f) {
+            const size_t idx = static_cast<size_t>(m) + static_cast<size_t>(f) * n_mels;
+            if (f >= valid) {
+                features[idx] = 0.0f;
+                continue;
+            }
+            if (half_window > 0) {
+                const int lo = std::max(0, f - half_window);
+                const int hi = std::min(valid, f + half_window + 1);
+                const int n = hi - lo;
+                const double s = sum[hi] - sum[lo];
+                const double sq = sumsq[hi] - sumsq[lo];
+                mean = n > 0 ? s / n : 0.0;
+                double var = n > 1 ? (sq - s * s / n) / (n - 1) : 0.0;
+                if (var < 0.0)
+                    var = 0.0;
+                inv_std = 1.0 / (std::sqrt(var) + 1e-5);
+            }
+            features[idx] = static_cast<float>((features[idx] - mean) * inv_std);
+        }
+    }
+}
+
 
 void
 MelSpectrogramExtractor::init_window() {
@@ -358,6 +449,15 @@ void
 MelSpectrogramExtractor::compute(
     const float* audio, size_t n_samples, std::vector<float>& features, int& n_frames,
     bool reflect_left, bool normalize) const {
+    compute_padded(audio, n_samples, n_samples, features, n_frames, reflect_left, normalize);
+}
+
+void
+MelSpectrogramExtractor::compute_padded(
+    const float* audio, size_t n_samples, size_t valid_samples, std::vector<float>& features,
+    int& n_frames, bool reflect_left, bool normalize) const {
+    if (valid_samples > n_samples)
+        throw std::invalid_argument("valid audio length exceeds padded length");
     // `normalize` is a call-site request (streaming can explicitly suppress
     // utterance normalization); the model metadata is authoritative about
     // whether normalization exists at all.
@@ -385,11 +485,12 @@ MelSpectrogramExtractor::compute(
     // CPU-only builds fall through to the radix-2 FFT path below.
     if (n_samples > 0 && session_) {
         if (batcher_) {
-            auto result = batcher_->run(audio, n_samples, reflect_left, normalize);
+            auto result = batcher_->run(audio, n_samples, valid_samples, reflect_left, normalize);
             features = std::move(result.features);
             n_frames = result.n_frames;
         } else {
-            compute_gpu_via_session(audio, n_samples, features, n_frames, reflect_left, normalize);
+            compute_gpu_via_session(
+                audio, n_samples, valid_samples, features, n_frames, reflect_left, normalize);
         }
         return;
     }
@@ -401,9 +502,10 @@ MelSpectrogramExtractor::compute(
     // framing. Matches NeMo's order (`preemph(audio)` then `torch.stft`);
     // applying it after padding biases the reflected/zero edges. First sample
     // kept as `y[0] = x[0]`.
-    std::vector<float> pre(audio, audio + n_samples);
-    if (cfg_.preemph != 0.0f && n_samples >= 2) {
-        for (size_t i = n_samples - 1; i > 0; --i) {
+    std::vector<float> pre(n_samples, 0.0f);
+    std::copy_n(audio, valid_samples, pre.data());
+    if (cfg_.preemph != 0.0f && valid_samples >= 2) {
+        for (size_t i = valid_samples - 1; i > 0; --i) {
             pre[i] = pre[i] - cfg_.preemph * pre[i - 1];
         }
     }
@@ -466,7 +568,7 @@ MelSpectrogramExtractor::compute(
         }
     }
 
-    const int valid = std::min(static_cast<int>(n_samples) / hop, n_frames);
+    const int valid = std::min(static_cast<int>(valid_samples) / hop, n_frames);
     if (cfg_.mask_invalid_frames) {
         for (int f = valid; f < n_frames; ++f) {
             std::fill_n(features.data() + static_cast<size_t>(f) * cfg_.n_mels, cfg_.n_mels, 0.0f);
@@ -481,25 +583,10 @@ MelSpectrogramExtractor::compute(
     // NeMo normalizes only the valid `floor(samples / hop)` frames, uses an
     // unbiased variance, and masks the final centered/padded frame. This is
     // observably different from normalizing every STFT frame.
-    for (int m = 0; m < cfg_.n_mels; m++) {
-        double sum = 0.0;
-        for (int f = 0; f < valid; f++)
-            sum += features[static_cast<size_t>(m) + static_cast<size_t>(f) * cfg_.n_mels];
-        const double mean = valid > 0 ? sum / valid : 0.0;
-        double var = 0.0;
-        for (int f = 0; f < valid; f++) {
-            const double d =
-                features[static_cast<size_t>(m) + static_cast<size_t>(f) * cfg_.n_mels] - mean;
-            var += d * d;
-        }
-        if (valid > 1)
-            var /= valid - 1;
-        const double inv_std = 1.0 / (std::sqrt(var) + 1e-5);
-        for (int f = 0; f < n_frames; f++) {
-            const size_t idx = static_cast<size_t>(m) + static_cast<size_t>(f) * cfg_.n_mels;
-            features[idx] = f < valid ? static_cast<float>((features[idx] - mean) * inv_std) : 0.0f;
-        }
-    }
+    const int hop_cpu = static_cast<int>(cfg_.window_stride * cfg_.sample_rate);
+    const int half_cpu =
+        hop_cpu > 0 ? static_cast<int>(norm_window_seconds() * cfg_.sample_rate / hop_cpu / 2) : 0;
+    normalize_frames(features.data(), cfg_.n_mels, n_frames, valid, half_cpu);
 }
 
 bool
@@ -578,10 +665,11 @@ read_wav_mono_16k(const std::string& path, std::vector<float>& out_samples, int&
 
 void
 MelSpectrogramExtractor::compute_gpu_via_session(
-    const float* audio, size_t n_samples, std::vector<float>& features, int& n_frames,
-    bool reflect_left, bool normalize) const {
+    const float* audio, size_t n_samples, size_t valid_samples, std::vector<float>& features,
+    int& n_frames, bool reflect_left, bool normalize) const {
     BatchRequest request;
     request.audio.assign(audio, audio + n_samples);
+    request.valid_samples = valid_samples;
     request.reflect_left = reflect_left;
     request.normalize = normalize;
     std::vector<BatchRequest> requests;
@@ -616,18 +704,19 @@ MelSpectrogramExtractor::compute_gpu_batch_via_session(std::vector<BatchRequest>
     std::vector<float> pre(input_item * requests.size(), 0.0f);
     for (size_t b = 0; b < requests.size(); ++b) {
         const auto& request = requests[b];
-        if (request.audio.size() != n_samples || request.reflect_left != reflect_left ||
-            request.normalize != normalize)
+        if (request.audio.size() != n_samples || request.valid_samples > n_samples ||
+            request.reflect_left != reflect_left || request.normalize != normalize)
             throw std::runtime_error("GPU frontend batch contains incompatible inputs");
         float* dst = pre.data() + b * input_item;
-        if (n_samples == 0)
+        if (request.valid_samples == 0)
             continue;
         dst[0] = request.audio[0];
         if (cfg_.preemph != 0.0f) {
-            for (size_t i = 1; i < n_samples; ++i)
+            for (size_t i = 1; i < request.valid_samples; ++i)
                 dst[i] = request.audio[i] - cfg_.preemph * request.audio[i - 1];
-        } else if (n_samples > 1) {
-            std::memcpy(dst + 1, request.audio.data() + 1, (n_samples - 1) * sizeof(float));
+        } else if (request.valid_samples > 1) {
+            std::memcpy(
+                dst + 1, request.audio.data() + 1, (request.valid_samples - 1) * sizeof(float));
         }
     }
 
@@ -664,7 +753,7 @@ MelSpectrogramExtractor::compute_gpu_batch_via_session(std::vector<BatchRequest>
         auto& features = results[b].features;
         results[b].n_frames = n_frames;
         features.assign(packed.begin() + b * output_item, packed.begin() + (b + 1) * output_item);
-        const int valid = std::min(static_cast<int>(n_samples) / hop, n_frames);
+        const int valid = std::min(static_cast<int>(requests[b].valid_samples) / hop, n_frames);
         if (cfg_.mask_invalid_frames) {
             for (int f = valid; f < n_frames; ++f) {
                 std::fill_n(features.data() + static_cast<size_t>(f) * n_mels, n_mels, 0.0f);
@@ -672,24 +761,9 @@ MelSpectrogramExtractor::compute_gpu_batch_via_session(std::vector<BatchRequest>
         }
         if (!normalize)
             continue;
-        for (int m = 0; m < n_mels; ++m) {
-            double sum = 0.0;
-            for (int f = 0; f < valid; ++f) sum += features[(size_t)m + (size_t)f * n_mels];
-            const double mean = valid > 0 ? sum / valid : 0.0;
-            double var = 0.0;
-            for (int f = 0; f < valid; ++f) {
-                const double d = features[(size_t)m + (size_t)f * n_mels] - mean;
-                var += d * d;
-            }
-            if (valid > 1)
-                var /= valid - 1;
-            const double inv_std = 1.0 / (std::sqrt(var) + 1e-5);
-            for (int f = 0; f < n_frames; ++f) {
-                const size_t idx = (size_t)m + (size_t)f * n_mels;
-                features[idx] =
-                    f < valid ? static_cast<float>((features[idx] - mean) * inv_std) : 0.0f;
-            }
-        }
+        const int half_b =
+            hop > 0 ? static_cast<int>(norm_window_seconds() * cfg_.sample_rate / hop / 2) : 0;
+        normalize_frames(features.data(), n_mels, n_frames, valid, half_b);
     }
     return results;
 }

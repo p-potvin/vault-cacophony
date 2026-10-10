@@ -5,9 +5,10 @@ Reads <name>.srt and generates <name>.<lang>.srt for one or more target language
 Timings and cue synchronisation are preserved exactly.
 
 Key Features:
-1. Sentence-level Context: Cues are merged into full grammatical sentences for
-   high translation accuracy, then redistributed proportionally across original cues.
-2. 100% Offline: Runs locally with zero web requests or API rate limits.
+1. Sentence-level Context: Cues are merged into bounded grammatical sentences using
+   pause gaps and optional Silero TE punctuation restoration for high translation accuracy,
+   then redistributed proportionally across original cues.
+2. 100% Offline: Runs locally on CUDA with zero web requests or API rate limits.
 """
 
 from __future__ import annotations
@@ -16,7 +17,16 @@ import argparse
 import re
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
+
+from riva_engine import RivaEngine, DEFAULT_MODEL_PATH, clean_console_text
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # Split after . ! ? or … when followed by space/end of text
 SENT_END = re.compile(r"(?<=[.!?…])\s+")
@@ -24,6 +34,17 @@ CUE_RE = re.compile(
     r"(?P<idx>\d+)\s*\n(?P<time>[\d:,]+\s*-->\s*[\d:,]+)\s*\n(?P<text>.*?)(?=\n\s*\n|\Z)",
     re.DOTALL,
 )
+
+
+def parse_timestamp(ts: str) -> float:
+    """Convert SRT timestamp string (00:01:23,456) to seconds."""
+    ts = ts.strip().replace(",", ".")
+    parts = ts.split(":")
+    if len(parts) == 3:
+        return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+    elif len(parts) == 2:
+        return float(parts[0]) * 60 + float(parts[1])
+    return float(ts)
 
 
 def parse_srt(text: str) -> List[Tuple[str, str, str]]:
@@ -47,6 +68,16 @@ def split_proportional(text: str, weights: List[int]) -> List[str]:
     if n == 1 or not words:
         return [text] + [""] * (n - 1)
 
+    # If fewer words than cues, distribute words across cues without leaving cues empty if possible
+    if len(words) <= n:
+        out = []
+        for idx in range(n):
+            if idx < len(words):
+                out.append(words[idx])
+            else:
+                out.append("")
+        return out
+
     out, i = [], 0
     consumed = 0.0
     for k, w in enumerate(weights):
@@ -60,51 +91,127 @@ def split_proportional(text: str, weights: List[int]) -> List[str]:
     return out
 
 
-def build_sentences(cues: List[Tuple[str, str, str]]) -> Tuple[List[str], List[List[Tuple[int, int]]]]:
-    """Build sentences from cues while tracking cue span coverage."""
-    joined, marks = [], []
-    pos = 0
-    for ci, (_, _, text) in enumerate(cues):
-        if joined:
-            joined.append(" ")
-            pos += 1
-        joined.append(text)
-        marks.append((pos, pos + len(text), ci))
-        pos += len(text)
-    full = "".join(joined)
+_SILERO_TE_CACHE = None
 
-    sentences, spans = [], []
-    start = 0
-    for m in list(SENT_END.finditer(full)) + [None]:
-        end = m.start() if m else len(full)
-        s = full[start:end].strip()
-        if s:
-            overlaps = []
-            for cs, ce, ci in marks:
-                lo, hi = max(cs, start), min(ce, end)
-                if hi > lo:
-                    overlaps.append((ci, hi - lo))
-            if overlaps:
-                sentences.append(s)
-                spans.append(overlaps)
-        start = m.end() if m else end
+
+def get_silero_te():
+    """Lazily load Silero TE (Text Enhancer) punctuation restoration model."""
+    global _SILERO_TE_CACHE
+    if _SILERO_TE_CACHE is False:
+        return None
+    if _SILERO_TE_CACHE is not None:
+        return _SILERO_TE_CACHE
+    try:
+        import torch
+        model, _, languages, _, apply_te = torch.hub.load(
+            "snakers4/silero-models", "silero_te", trust_repo=True, verbose=False
+        )
+        _SILERO_TE_CACHE = (model, languages, apply_te)
+        return _SILERO_TE_CACHE
+    except Exception:
+        _SILERO_TE_CACHE = False
+        return None
+
+
+def restore_punctuation(text: str, lang: str = "en") -> str:
+    """Apply Silero punctuation and capitalization if supported."""
+    te = get_silero_te()
+    if not te or not text.strip():
+        return text
+    _, languages, apply_te = te
+    lang_code = lang.lower().split("-")[0]
+    if lang_code in languages:
+        try:
+            return apply_te(text, lan=lang_code)
+        except Exception:
+            return text
+    return text
+
+
+def build_sentences(
+    cues: List[Tuple[str, str, str]],
+    source_lang: str = "en",
+    max_cues_per_chunk: int = 3,
+    max_chars_per_chunk: int = 140,
+    gap_threshold: float = 0.5,
+    use_punct: bool = True,
+) -> Tuple[List[str], List[List[Tuple[int, int]]]]:
+    """Build bounded sentences from cues with pause-gap & punctuation segmentation."""
+    if not cues:
+        return [], []
+
+    # Parse timestamps for pause-gap detection
+    cue_times = []
+    for _, time_str, text in cues:
+        times = time_str.split("-->")
+        start_sec = parse_timestamp(times[0]) if len(times) >= 1 else 0.0
+        end_sec = parse_timestamp(times[1]) if len(times) >= 2 else 0.0
+        cue_times.append((start_sec, end_sec))
+
+    # Segment cues into chunks based on pause gaps and max cues/chars
+    chunks = []
+    curr_chunk = [0]
+    curr_chars = len(cues[0][2])
+
+    for i in range(1, len(cues)):
+        prev_end = cue_times[i - 1][1]
+        curr_start = cue_times[i][0]
+        gap = curr_start - prev_end
+        text_len = len(cues[i][2])
+
+        # Break chunk if pause gap >= threshold, or max cues reached, or character limit reached
+        if (
+            gap >= gap_threshold
+            or len(curr_chunk) >= max_cues_per_chunk
+            or (curr_chars + text_len) > max_chars_per_chunk
+        ):
+            chunks.append(curr_chunk)
+            curr_chunk = [i]
+            curr_chars = text_len
+        else:
+            curr_chunk.append(i)
+            curr_chars += text_len
+    if curr_chunk:
+        chunks.append(curr_chunk)
+
+    sentences = []
+    spans = []
+
+    for chunk_indices in chunks:
+        chunk_cues = [cues[ci] for ci in chunk_indices]
+        joined = " ".join(c[2] for c in chunk_cues)
+
+        if use_punct:
+            joined = restore_punctuation(joined, lang=source_lang)
+
+        # Map character weights to each cue
+        weights = [max(1, len(cues[ci][2])) for ci in chunk_indices]
+        span_entries = [(ci, w) for ci, w in zip(chunk_indices, weights)]
+
+        sentences.append(joined)
+        spans.append(span_entries)
+
     return sentences, spans
 
 
 def translate_cues(
     cues: List[Tuple[str, str, str]],
-    engine,
+    engine: RivaEngine,
     target_lang: str,
     source_lang: str = "en",
     per_cue: bool = False,
+    use_punct: bool = True,
 ) -> List[Tuple[str, str, str]]:
-    """Translate cues to the target language."""
+    """Translate cues to the target language preserving original cue boundaries."""
+    if not cues:
+        return []
+
     if per_cue:
         texts = [c[2] for c in cues]
         translated = engine.translate_batch(texts, target_lang=target_lang, source_lang=source_lang)
         return [(c[0], c[1], trans) for c, trans in zip(cues, translated)]
 
-    sentences, spans = build_sentences(cues)
+    sentences, spans = build_sentences(cues, source_lang=source_lang, use_punct=use_punct)
     if not sentences:
         return cues
 
@@ -117,10 +224,15 @@ def translate_cues(
             if piece:
                 parts[ci].append(piece)
 
-    return [
-        (c[0], c[1], " ".join(parts[i]).strip() or c[2])
-        for i, c in enumerate(cues)
-    ]
+    out_cues = []
+    for i, c in enumerate(cues):
+        cue_text = " ".join(parts[i]).strip()
+        # Fallback to direct translation if proportional split resulted in empty text
+        if not cue_text:
+            cue_text = engine.translate(c[2], target_lang=target_lang, source_lang=source_lang)
+        out_cues.append((c[0], c[1], cue_text))
+
+    return out_cues
 
 
 def main():
@@ -129,7 +241,8 @@ def main():
     parser.add_argument("--langs", required=True, help="Comma-separated target language codes (e.g. es,fr,de)")
     parser.add_argument("--source", default="en", help="Source language code (default: en)")
     parser.add_argument("--model", help="Path to Riva GGUF model")
-    parser.add_argument("--per-cue", action="store_true", help="Translate cue-by-cue instead of sentences")
+    parser.add_argument("--per-cue", action="store_true", help="Translate cue-by-cue instead of chunked sentences")
+    parser.add_argument("--no-punct", action="store_true", help="Disable Silero TE punctuation restoration")
     parser.add_argument("--out-dir", help="Optional output directory")
     parser.add_argument("--overwrite", "-w", action="store_true", help="Overwrite existing translated files")
     parser.add_argument("--skip-completed", "--skip-existing", "--skip-if-translated", action="store_true", help="Skip translation if output already exists")
@@ -140,7 +253,7 @@ def main():
         print(f"[!] Error: SRT file not found: {srt_path}", file=sys.stderr)
         sys.exit(1)
 
-    with open(srt_path, encoding="utf-8") as f:
+    with open(srt_path, encoding="utf-8", errors="replace") as f:
         cues = parse_srt(f.read())
 
     if not cues:
@@ -156,32 +269,31 @@ def main():
     for lang in target_langs:
         dest_file = out_dir / f"{base_stem}.{lang}.srt"
         if dest_file.exists() and not args.overwrite and args.skip_completed:
-            print(f"[*] Subtitles already exist for '{lang}': {dest_file} (skipped)")
+            print(clean_console_text(f"[*] Subtitles already exist for '{lang}': {dest_file.name} (skipped)"))
         else:
             needed_langs.append(lang)
 
     if not needed_langs:
-        print(f"[*] All requested translations already exist for {srt_path.name}")
+        print(clean_console_text(f"[*] All requested translations already exist for {srt_path.name}"))
         return
-
-    from riva_engine import RivaEngine, DEFAULT_MODEL_PATH
 
     model_path = args.model or DEFAULT_MODEL_PATH
     engine = RivaEngine(model_path=model_path)
 
     for lang in needed_langs:
-        print(f"[*] Translating to '{lang}' ({len(cues)} cues)...")
+        print(clean_console_text(f"[*] Translating to '{lang}' ({len(cues)} cues)..."))
         translated_cues = translate_cues(
             cues,
             engine=engine,
             target_lang=lang,
             source_lang=args.source,
             per_cue=args.per_cue,
+            use_punct=not args.no_punct,
         )
         dest_file = out_dir / f"{base_stem}.{lang}.srt"
         with open(dest_file, "w", encoding="utf-8") as f:
             f.write(render_srt(translated_cues))
-        print(f"    -> Wrote {dest_file}")
+        print(clean_console_text(f"    -> Wrote {dest_file}"))
 
 
 if __name__ == "__main__":

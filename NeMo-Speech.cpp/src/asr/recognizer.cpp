@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
+#include <cstdlib>
 #include "recognizer.h"
 
 #include <algorithm>
@@ -99,9 +100,13 @@ Recognizer::Recognizer(RecognizerConfig cfg)
     // Self-punctuating models must bypass the separate PnC model.
     postproc_ = std::make_unique<postproc::Postprocessor>(
         cfg_.postproc, bm_.get(), vocab_self_punctuates(model_->vocab()), cfg_.batching);
+    // Offline segmentation is a third consumer of the VAD weights, alongside
+    // feature masking and VAD-driven endpointing. Without it listed here a
+    // --vad-segmentation run loads no VAD model and silently does nothing.
     const bool need_vad =
         !cfg_.vad.model_path.empty() &&
-        (cfg_.vad.masker.mask_enable || (cfg_.endpointing.enable && cfg_.endpointing.vad_based));
+        (cfg_.vad.masker.mask_enable || cfg_.vad.segmenter.enable ||
+         (cfg_.endpointing.enable && cfg_.endpointing.vad_based));
     if (need_vad) {
         vad_model_ = std::make_shared<SileroVadModel>(*bm_, cfg_.vad.model_path, cfg_.batching);
         GGMLF_LOG_INFO("[recognizer] VAD weights/session loaded once and shared across streams\n");
@@ -228,7 +233,8 @@ Recognizer::warmup() {
         static_cast<RnntModel*>(model_.get())->supports_cache_streaming();
     std::unique_ptr<AsrRunner> runner;
     if (!supports_streaming)
-        runner = std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_);
+        runner =
+            std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_, vad_model_);
     else
         runner = make_runner();
     if (model_->has_prompt()) {
@@ -563,16 +569,41 @@ Recognizer::recognize(
     // Vulkan RNNT support was originally validated on the cache-aware graph.
     // Keep that compatibility route until the offline graph has Vulkan parity
     // coverage; CTC and offline-only TDT remain offline.
+    const bool vulkan_requires_streaming = vulkan && model_->head_kind() != HeadKind::Ctc;
+    // Length alone no longer forces the streaming runner on this complete-buffer
+    // path. Measured on nemotron-3.5, whose limit is 399.9 s: a 395 s prefix
+    // decodes offline at 1074 words / 18.3 s dropped, and appending 10 s pushes
+    // the *same* 0-395 s audio onto the streaming runner and down to 1060 words
+    // / 25.0 s dropped. Ten seconds at the end deleted words six minutes
+    // earlier, because those ten seconds changed which decoder ran.
+    //
+    // OfflineRunner already handles over-limit input: max_offline_samples_()
+    // binary-searches the largest length inside the positional-encoding budget
+    // and offline_segments_() cuts there, snapping each boundary to the
+    // quietest 100 ms window. Offline-only models (parakeet-tdt) already got
+    // that; cache-aware ones were diverted past it.
+    //
+    // This is the file/complete-buffer path only. Genuine streaming
+    // (streaming_recognize, live capture, server streams) builds its runner
+    // unconditionally and is unaffected. Set NEMO_SPEECH_LONGFORM_STREAMING=1
+    // to restore the previous length-triggered behaviour.
+    static const bool longform_streaming = [] {
+        const char* s = std::getenv("NEMO_SPEECH_LONGFORM_STREAMING");
+        return s != nullptr && *s != 0 && *s != '0';
+    }();
     const bool use_streaming =
-        (exceeds_offline_limit || (vulkan && model_->head_kind() != HeadKind::Ctc)) &&
+        ((longform_streaming && exceeds_offline_limit) || vulkan_requires_streaming) &&
         supports_streaming;
     std::unique_ptr<AsrRunner> runner;
     if (use_streaming) {
         runner = make_runner();
     } else {
-        // Past the positional-encoding limit OfflineRunner splits the audio at
-        // quiet points and decodes segment by segment.
-        runner = std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_);
+        // OfflineRunner partitions the audio before decoding: at VAD silence
+        // when the segmenter is enabled (resetting the decoder's language
+        // context at each such boundary), and always at the quietest point
+        // when the positional-encoding budget forces a cut.
+        runner =
+            std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_, vad_model_);
     }
     log_execution_status(use_streaming);
     if (model_->has_prompt())

@@ -45,7 +45,7 @@ def translate_text_content(text: str, engine: RivaEngine, target_lang: str, sour
 def main():
     parser = argparse.ArgumentParser(description="Translate text files with Riva-Translate-4B GGUF.")
     parser.add_argument("--input", "-i", required=True, help="Input text file path")
-    parser.add_argument("--langs", "-t", required=True, help="Comma-separated target languages (e.g. es,fr,de)")
+    parser.add_argument("--langs", "-t", required=True, help="Comma-separated target languages (es, fr, de)")
     parser.add_argument("--source", "-s", default="en", help="Source language (default: en)")
     parser.add_argument("--model", default=DEFAULT_MODEL_PATH, help="Path to Riva GGUF model")
     parser.add_argument("--out-dir", "-o", help="Optional output directory")

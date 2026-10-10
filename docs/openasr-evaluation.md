@@ -118,6 +118,39 @@ uses the same calculation independently per supplied dataset label. The report
 includes the normalizer and metric names so a result remains attributable to
 this baseline.
 
+## Normalizer selection
+
+`--normalizer` chooses the text normalizer and defaults to `english`, which is
+the Open ASR leaderboard's English path and the right choice for English-only
+material.
+
+Use `--normalizer basic` for non-English or code-switched references. The
+English normalizer applies English-only number, contraction and filler rules; on
+mixed-language text it rewrites the English half of a sentence and leaves the
+rest raw. Measured on the 155 `enspa_dev` references, 137 normalize differently
+under the two settings, and the asymmetry is visible in a single row:
+
+```
+reference : ...coming at twelve eh van a traer cuatro chiles eh they charged me uh ciento cincuenta
+english   : ...coming at 12     eh van a traer cuatro chiles eh they charged me    ciento cincuenta
+```
+
+`twelve` becomes `12` while `cuatro` and `ciento cincuenta` are untouched, and
+the English filler `uh` is dropped while Spanish fillers are not. That biases any
+comparison between conditions pinned to different languages.
+
+Neither normalizer is strictly correct for code-switched text — `basic` also
+splits `what's` into `what s`. Pick one, apply it to every condition being
+compared, and read the chosen path back from `methodology.normalizer` in the
+report.
+
+```powershell
+.\.venv-openasr-eval\Scripts\python.exe scripts\evaluate_openasr.py `
+  --input D:\benchmarks\enspa-predictions.jsonl `
+  --normalizer basic `
+  --output D:\benchmarks\enspa-wer.json
+```
+
 ## Scope boundary
 
 Matching the normalizer and WER calculation makes a local comparison compatible

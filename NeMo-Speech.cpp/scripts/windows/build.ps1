@@ -88,6 +88,10 @@ param(
     [switch]$Grpc,
     [switch]$Nmt,
     [switch]$Flashlight,
+    # Full-duplex NemotronLabs VoiceChat (src/s2s). Upstream added this in
+    # a5b6953 but only wired it into configure.sh / CMakePresets, so the Windows
+    # path needs its own switch. Shares the llama backend with NMT.
+    [switch]$S2S,
     [switch]$TtsJa,
     [switch]$TtsZh,
     [switch]$AsrOnly,
@@ -128,6 +132,7 @@ $BuildNmt = $false
 $BuildHttp = $false
 $BuildGrpc = $false
 $BuildFlashlight = $false
+$BuildS2S = $false
 $BuildTtsJa = $false
 $BuildTtsZh = $false
 $BuildTests = $false
@@ -157,6 +162,10 @@ switch ($Profile) {
 $BuildGrpc = $BuildGrpc -or $Grpc.IsPresent
 $BuildNmt = $BuildNmt -or $Nmt.IsPresent
 $BuildFlashlight = $BuildFlashlight -or $Flashlight.IsPresent
+$BuildS2S = $BuildS2S -or $S2S.IsPresent
+# S2S shares the llama backend with NMT (CMakeLists: WITH_NMT OR BUILD_S2S),
+# so pulling it in without NMT would leave the backend unbuilt.
+if ($BuildS2S) { $BuildNmt = $true }
 $BuildTtsJa = $BuildTtsJa -or $TtsJa.IsPresent
 $BuildTtsZh = $BuildTtsZh -or $TtsZh.IsPresent
 $BuildHttp = $BuildHttp -or $Http.IsPresent -or $HttpTls.IsPresent
@@ -211,16 +220,15 @@ if ($BuildHttpTls) { $VcpkgFeatures.Add('http-tls') }
 if ($BuildExamples) { $VcpkgFeatures.Add('examples') }
 
 Write-Host "==> nemo-speech Windows build" -ForegroundColor Cyan
-Write-Host "    backend=$Backend profile=$Profile asr=$BuildAsr diar=$BuildDiar tts=$BuildTts nmt=$BuildNmt http=$BuildHttp grpc=$BuildGrpc flashlight=$BuildFlashlight tts-ja=$BuildTtsJa tts-zh=$BuildTtsZh tests=$BuildTests examples=$BuildExamples tools=$BuildTools"
+Write-Host "    backend=$Backend profile=$Profile asr=$BuildAsr diar=$BuildDiar tts=$BuildTts nmt=$BuildNmt http=$BuildHttp grpc=$BuildGrpc flashlight=$BuildFlashlight s2s=$BuildS2S tts-ja=$BuildTtsJa tts-zh=$BuildTtsZh tests=$BuildTests examples=$BuildExamples tools=$BuildTools"
 Write-Host "    config=$Config compiler=$Compiler host=$HostArch target=$TargetArch build=$BuildDir jobs=$Jobs cublas-shim=$($CublasShim.IsPresent)"
 Write-Host "    vcpkg=$($VcpkgFeatures -join ',') triplet=$VcpkgTriplet"
 if ($DryRun) { return }
 
-# --- 1. Refresh environment from registry (choco/installers land there) ---------
 $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
 $user    = [Environment]::GetEnvironmentVariable('Path', 'User')
 $process = $env:Path
-$env:Path = "$machine;$user;$process"
+$env:Path = ("$machine;$user;$process" -split ';' | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique) -join ';'
 $vk = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
 if (-not $vk) { $vk = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'User') }
 if ($vk) { $env:VULKAN_SDK = $vk }
@@ -244,10 +252,18 @@ $vcvarsBat = if ($HostArch -eq 'ARM64' -and $TargetArch -eq 'x64') {
     'vcvars64.bat'
 }
 $vcvars = Join-Path $vsPath "VC\Auxiliary\Build\$vcvarsBat"
-if (-not (Test-Path $vcvars)) { throw "$vcvarsBat not found at $vcvars" }
-Write-Host "==> importing MSVC env from $vsPath ($vcvarsBat)"
-cmd /c "`"$vcvars`" >NUL 2>&1 && set" | ForEach-Object {
-    if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
+$tmpBat = [System.IO.Path]::GetTempFileName() + ".bat"
+try {
+    "@call `"$vcvars`" >nul`r`n@set" | Set-Content $tmpBat
+    $envLines = @(& cmd.exe /c $tmpBat)
+    foreach ($line in $envLines) {
+        if ($line -match '^([^=]+)=(.*)$') {
+            [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2], 'Process')
+            Set-Item -Path "env:$($Matches[1])" -Value $Matches[2]
+        }
+    }
+} finally {
+    Remove-Item $tmpBat -ErrorAction SilentlyContinue
 }
 
 foreach ($tool in 'git', 'cl', 'cmake', 'ninja') {
@@ -393,6 +409,7 @@ $cmakeArgs = @(
     "-DNEMO_SPEECH_BUILD_GRPC=$(ConvertTo-CMakeBool $BuildGrpc)",
     "-DNEMO_SPEECH_WITH_GRPC=$(ConvertTo-CMakeBool $BuildGrpc)",
     "-DNEMO_SPEECH_WITH_FLASHLIGHT=$(ConvertTo-CMakeBool $BuildFlashlight)",
+    "-DNEMO_SPEECH_BUILD_S2S=$(ConvertTo-CMakeBool $BuildS2S)",
     '-DNEMO_SPEECH_WITH_NORM=OFF',
     "-DNEMO_SPEECH_TTS_WITH_JA=$(ConvertTo-CMakeBool $BuildTtsJa)",
     "-DNEMO_SPEECH_TTS_WITH_ZH=$(ConvertTo-CMakeBool $BuildTtsZh)",

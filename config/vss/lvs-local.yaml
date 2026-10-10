@@ -1,0 +1,108 @@
+# lvs-local.yaml -- prompts and defaults for scripts/vss_pipeline.py.
+#
+# This is the local stand-in for the VSS blueprint's LVS profile (rt-vlm +
+# lvs-server + LLM NIM). The prompt sections mirror the knobs LVS exposes as
+# environment variables -- LVS_PROMPT_VLM_ROLE, LVS_PROMPT_VLM_INSTRUCTION,
+# LVS_PROMPT_VLM_CONSTRAINTS, LVS_PROMPT_VLM_STRUCTURED_OUTPUT -- and the two
+# aggregation prompts come verbatim from the VSS agent's INIT_SUMMARIZE_PROMPT.
+# Template variables: {scenario}, {events}, {objects_of_interest}.
+#
+# Precedence: defaults in the script < this file < command line.
+
+ollama:
+  url: http://127.0.0.1:11434
+  # Both are already pulled on this box. They are resident together: 3.5 GB
+  # for the VLM at 16k context and 2 GB for the LLM. Set llm_model to null to
+  # aggregate with the VLM itself and keep one model on the card; measured on
+  # the 30 s clip that produced five events that were not in any caption,
+  # where llama3.2:3b on the 166 s clip stayed on what the captions said.
+  vlm_model: qwen3-vl:2b
+  llm_model: llama3.2:3b
+  # KV budget. Measured: 8 frames at 512 px on qwen3-vl:2b through Ollama is
+  # 8952 prompt tokens (about 1100 per frame), so 8k rejects every chunk with
+  # exceed_context_size_error. 16k holds 8 frames, the prompt and the answer;
+  # raise it with --num-frames-per-chunk, or drop frame_max_side.
+  num_ctx: 16384
+  keep_alive: 10m
+  temperature: 0.2
+  top_p: 0.7
+  seed: 1
+  # A 2B VLM shown a static screen repeats one sentence until the context is
+  # full: 7423 tokens and 72 s per chunk, and the JSON never closes. 1024 is
+  # room for a dozen events; the parser closes a response that is cut off.
+  num_predict: 1024
+  repeat_penalty: 1.1
+  timeout_s: 900
+
+chunking:
+  # VSS defaults: 10 s chunks, no overlap. num_frames is the fixed-frames mode
+  # of num_frames_per_second_or_fixed_frames_chunk.
+  chunk_duration: 10
+  chunk_overlap_duration: 0
+  num_frames_per_chunk: 8
+  # Longest side of each frame handed to the VLM.
+  frame_max_side: 512
+  jpeg_quality: 4
+
+summarization:
+  # LVS config.yaml: max_events_per_batch 50.
+  max_events_per_batch: 50
+  # Ask the VLM for the VSS JSON event list when events are given. Off, every
+  # chunk gets the free-form dense caption prompt instead.
+  structured_output: true
+
+prompts:
+  # Free-form dense caption, used when no --event is given (VSS INIT_SUMMARIZE_PROMPT.prompt).
+  caption: "Write a concise and clear dense caption for the provided video."
+
+  vlm_role: >-
+    You are an advanced intelligent video analysis system specialized in
+    analyzing {scenario} and generating captions.
+  vlm_instruction: >-
+    Focus on detecting these events: {events}. Also watch for these objects of
+    interest: {objects_of_interest}. Describe all events and objects of
+    interest throughout the video.
+  vlm_audio_instruction: >-
+    Additionally, the audio transcript for this chunk is provided below. Use it
+    to describe what is said and incorporate it into your event descriptions.
+  vlm_constraints: ""
+  vlm_structured_output: |-
+    Provide the result in json format with 'seconds' for time depiction for each event.
+    Use keywords 'start_time', 'end_time', 'description', "type" in the json output.
+    "type" should be the event type and chosen from [{events}] only. You MUST include
+    'type', 'start_time', 'end_time', 'description' in json output. Times are absolute
+    seconds from the start of the whole video, within the chunk window given above.
+
+    [
+    {
+     "start_time": t_start, #(MANDATORY)
+     "end_time": t_end, #(MANDATORY)
+     "type": Choose from [{events}] #(MANDATORY)
+     "description": EVENT1, #(MANDATORY)
+    },
+    ]
+
+  caption_summarization: >-
+    Aggregate the following captions in the format
+    **start_timestamp-end_timestamp**event_description. If any two adjacent
+    end_timestamp1 and start_timestamp2 is within a few tenths of a second, and
+    the event_description creates a continuous scene, merge the captions in the
+    format **start_timestamp1-end_timestamp2**event_description. You MUST make
+    sure the timestamp range enclose the entire event.
+  summary_aggregation: >-
+    Aggregate the following captions in the format
+    **start_timestamp-end_timestamp**event_description. If any two adjacent
+    end_timestamp1 and start_timestamp2 is within a few tenths of a second, and
+    the event_description creates a continuous scene, merge the captions in the
+    format **start_timestamp1-end_timestamp2**event_description
+  # Final pass: the LVS response shape, {video_summary, events}.
+  final_summary: >-
+    You are summarizing a video for the scenario "{scenario}". Below are
+    time-stamped event descriptions covering the whole video, in order. Write a
+    clear narrative summary of the video in a few paragraphs, then list the
+    notable events with their time ranges in seconds. Event types must be chosen
+    from [{events}]. Do not invent events that are not in the descriptions.
+  qa: >-
+    Answer the question about the video using the frames shown and the
+    time-stamped descriptions below. Cite the time in seconds when you refer to
+    something. If the frames and descriptions do not contain the answer, say so.

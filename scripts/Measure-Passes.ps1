@@ -218,6 +218,26 @@ function Measure-Stage {
     Write-Host ("  {0,-10} {1,7:N2}s wall   {2,7:N1}x realtime{3}" -f `
         $Name, $best, ($Media / $best), $spread) -ForegroundColor Green
 
+    # Direct test telemetry
+    $telemetryModule = Join-Path $PSScriptRoot "VwTelemetry.psm1"
+    if (Test-Path -LiteralPath $telemetryModule) {
+        Import-Module $telemetryModule -Force -ErrorAction SilentlyContinue
+        if (Get-Command Write-VwModelRun -ErrorAction SilentlyContinue) {
+            $taskInfo = Get-VwAudioCppTask $Arguments
+            Write-VwModelRun @{
+                provider      = "audiocpp"
+                runtime       = "audio.cpp"
+                model         = $Name
+                task          = if ($taskInfo.task) { ConvertTo-VwTaskName $taskInfo.task } else { "audio-bench" }
+                duration_ms   = [math]::Round($best * 1000, 2)
+                audio_seconds = $Media
+                status        = "ok"
+                project       = "vault-cacophony"
+                service       = "measure-passes"
+            }
+        }
+    }
+
     if ($Cpu) {
         Write-Host "             CPU stage (onnxruntime); no CUDA trace" -ForegroundColor DarkGray
         return

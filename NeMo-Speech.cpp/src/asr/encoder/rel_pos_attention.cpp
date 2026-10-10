@@ -12,6 +12,7 @@
 #include <ggml.h>
 
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -243,7 +244,36 @@ RelPositionMultiHeadAttention::build_graph_masked(
     // ggml_backend_sched_split_graph aborts with no backend able to take the
     // node. use_gpu=true guarantees the GPU backend exists (BackendManager
     // throws otherwise), and the scheduler places the op there.
-    const bool use_fused = session->params.use_gpu;
+    //
+    // Shape gate as well. The fused kernel is tuned for short cache-aware
+    // windows -- the patch documents a warp-cooperative score loop for
+    // d_k == 128 and an occupancy query for the streaming shape (q = 2,
+    // kv = 72) -- and "other CUDA shapes retain the generic fused kernel".
+    // An offline full-context pass is the opposite shape: q is the whole
+    // utterance, and there the generic kernel loses badly to the unfused
+    // formulation below, which is batched cuBLAS GEMMs plus softmax and is
+    // exactly what large matrices want.
+    //
+    // Measured on 45 minutes of podcast, Parakeet TDT offline, best of two:
+    // fused 48.9 s (RTFx 55.2) against unfused 22.7 s (RTFx 118.9) -- 2.15x.
+    // The same option is worth +44% on the streaming path, so turning it off
+    // globally trades one workload for the other. Gating on query length keeps
+    // both: short windows take the fused kernel, long ones take cuBLAS.
+    //
+    // NEMO_SPEECH_RELPOS_MAX_Q overrides the threshold (0 disables the fused
+    // path entirely) so it can be swept without a rebuild.
+    static const int64_t fused_max_q = [] {
+        if (const char* s = std::getenv("NEMO_SPEECH_RELPOS_MAX_Q")) {
+            char* end = nullptr;
+            const long v = std::strtol(s, &end, 10);
+            if (end != s && v >= 0) {
+                return static_cast<int64_t>(v);
+            }
+        }
+        return static_cast<int64_t>(512);
+    }();
+    const int64_t q_len = input_tensor.tensor->ne[1];
+    const bool use_fused = session->params.use_gpu && q_len <= fused_max_q;
     if (use_fused) {
         // Canonical contiguous [d_k, len, n_head, batch] operands. Bias add and
         // rel-shift happen inside the kernel, so q_can is passed pre-bias.

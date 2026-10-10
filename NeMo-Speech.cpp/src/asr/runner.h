@@ -210,7 +210,8 @@ class OfflineRunner final : public AsrRunner {
    public:
     OfflineRunner(
         AsrModel* model, const RecognizerConfig& cfg,
-        std::shared_ptr<const FlashlightResources> flashlight = nullptr);
+        std::shared_ptr<const FlashlightResources> flashlight = nullptr,
+        std::shared_ptr<SileroVadModel> vad = nullptr);
 
     void feed_audio(const float* samples, size_t n_samples) override;
     StreamingUpdate step() override { return {}; }
@@ -222,13 +223,31 @@ class OfflineRunner final : public AsrRunner {
     void force_eou() override {}
 
    private:
+    // One decode unit. `reset_before` marks a boundary the segmenter chose at
+    // real silence, where the decoder's language context is dropped before the
+    // segment runs. Boundaries forced by the positional-encoding budget can
+    // land mid-speech and leave it false, so they keep the old behaviour.
+    struct Segment {
+        size_t off = 0;
+        size_t len = 0;
+        bool reset_before = false;
+    };
+
     void pad_audio_to_bucket_();
     size_t max_offline_samples_() const;
     size_t snap_to_quiet_(size_t target, size_t search_span) const;
     std::vector<std::pair<size_t, size_t>> offline_segments_() const;
+    // Silence-aware partition of audio_. Falls back to offline_segments_()
+    // when the segmenter is disabled or no VAD model was supplied.
+    std::vector<Segment> segments_for_decode_() const;
+    // Per-512-sample-window speech bits from Silero, binarized with the
+    // configured hysteresis. Empty if no VAD model.
+    std::vector<bool> vad_speech_windows_(int& window_size) const;
 
     AsrModel* model_;
     DecoderConfig decoder_cfg_;
+    VadSegmenterCfg seg_cfg_;
+    std::shared_ptr<SileroVadModel> vad_;
     std::unique_ptr<Decoder> ctc_decoder_;
     AsrRequestOptions opts_;
     std::vector<float> audio_;

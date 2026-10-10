@@ -1,0 +1,356 @@
+[nemo-speech] transcribe session started
+[asr] model=nemotron-3.5-asr-streaming-0.6b.q8_0 head=rnnt backend=CUDA0
+[enc ] cache-aware geometry: requested right_ctx=1 -> left_ctx=56 chunk_frames=2 right_ctx=1 (attention 58 frames, step 160 ms)
+[rnnt] CHUNK enter frame_offset=0 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=2 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=4 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=6 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=8 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=10 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=12 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=14 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=16 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=18 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=20 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=22 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=24 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=26 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=28 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=30 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=32 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=34 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=36 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=38 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=40 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=42 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=44 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=46 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=48 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=50 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[rnnt] CHUNK enter frame_offset=52 T=2 frames (160 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt] CHUNK exit  t=0/2 emitted=0 token(s)
+[asr] mode=offline head=rnnt attention-left=56 attention-right=3 encoder-frames
+[enc ] OFFLINE path built: left_ctx=56 right_ctx=3 style=chunked_limited conv=causal d_model=1024 subsampling=8 feat_in=128
+[enc ]   offline context comes from the model's trained values, not
+[enc ]   from rnnt_right_context. Override with
+[enc ]   NEMO_SPEECH_OFFLINE_LEFT_CTX / _RIGHT_CTX (-1 = unlimited).
+[enc ] OFFLINE MASK: T=151 L=56 R=3 style=chunked_limited
+[enc ]   chunk=4 frames, left_chunks = L/chunk = 56/4 = 14 (remainder 0 frames dropped by integer division)
+[enc ]   max reach = (left_chunks+1)*chunk = 60 keys
+[enc ]      q   visible keys     count   ahead
+[enc ]      0  [   0..   3]        4       3
+[enc ]      7  [   0..   7]        8       0
+[enc ]     14  [   0..  15]       16       1
+[enc ]     21  [   0..  23]       24       2
+[enc ]     28  [   0..  31]       32       3
+[enc ]     35  [   0..  35]       36       0
+[enc ]     42  [   0..  43]       44       1
+[enc ]     49  [   0..  51]       52       2
+[enc ]     56  [   0..  59]       60       3
+[enc ]     63  [   4..  63]       60       0
+[enc ]     70  [  12..  71]       60       1
+[enc ]     77  [  20..  79]       60       2
+[enc ]     84  [  28..  87]       60       3
+[enc ]     91  [  32..  91]       60       0
+[enc ]     98  [  40..  99]       60       1
+[enc ]    105  [  48.. 107]       60       2
+[enc ]    112  [  56.. 115]       60       3
+[enc ]    119  [  60.. 119]       60       0
+[enc ]    126  [  68.. 127]       60       1
+[enc ]    133  [  76.. 135]       60       2
+[enc ]    140  [  84.. 143]       60       3
+[enc ]    147  [  88.. 147]       60       0
+[enc ] OFFLINE MASK: T=151 L=56 R=3 style=chunked_limited
+[enc ]   chunk=4 frames, left_chunks = L/chunk = 56/4 = 14 (remainder 0 frames dropped by integer division)
+[enc ]   max reach = (left_chunks+1)*chunk = 60 keys
+[enc ]      q   visible keys     count   ahead
+[enc ]      0  [   0..   3]        4       3
+[enc ]      7  [   0..   7]        8       0
+[enc ]     14  [   0..  15]       16       1
+[enc ]     21  [   0..  23]       24       2
+[enc ]     28  [   0..  31]       32       3
+[enc ]     35  [   0..  35]       36       0
+[enc ]     42  [   0..  43]       44       1
+[enc ]     49  [   0..  51]       52       2
+[enc ]     56  [   0..  59]       60       3
+[enc ]     63  [   4..  63]       60       0
+[enc ]     70  [  12..  71]       60       1
+[enc ]     77  [  20..  79]       60       2
+[enc ]     84  [  28..  87]       60       3
+[enc ]     91  [  32..  91]       60       0
+[enc ]     98  [  40..  99]       60       1
+[enc ]    105  [  48.. 107]       60       2
+[enc ]    112  [  56.. 115]       60       3
+[enc ]    119  [  60.. 119]       60       0
+[enc ]    126  [  68.. 127]       60       1
+[enc ]    133  [  76.. 135]       60       2
+[enc ]    140  [  84.. 143]       60       3
+[enc ]    147  [  88.. 147]       60       0
+[enc ] ---- offline encoder output: T=151 frames x D=640 (this is the joint's input) ----
+[enc ] frame     ms     l2norm       mean        min        max   cos_prev
+[enc ]     0      0     3.2002   -0.08633    -0.6028     0.2860     0.0000
+[enc ]     1     80     2.9308   -0.08048    -0.4289     0.1245     0.8745
+[enc ]     2    160     4.6822    0.05306    -0.4268     0.7356     0.0309
+[enc ]     3    240     3.7191   -0.09757    -0.7602     0.1957     0.1760
+[enc ]     4    320     7.6416    0.15385    -0.5637     1.1044    -0.1000
+[enc ]     5    400     3.7151   -0.08821    -0.8150     0.2174    -0.0385
+[enc ]     6    480     3.6573   -0.09222    -0.7650     0.1642     0.9267
+[enc ]     7    560     2.9516   -0.07578    -0.8123     0.2274     0.7407
+[enc ]     8    640     3.7018   -0.08708    -0.8069     0.2168     0.6176
+[enc ]     9    720     3.7282   -0.08436    -0.6783     0.1769     0.9498
+[enc ]    10    800     3.4633   -0.07852    -0.7007     0.1970     0.9606
+[enc ]    11    880     2.9458   -0.06604    -0.7209     0.2165     0.7912
+[enc ]    12    960     3.8072   -0.08291    -0.9709     0.2322     0.9043
+[enc ]    13   1040     3.5009   -0.06910    -0.9044     0.2114     0.9401
+[enc ]    14   1120     3.8596   -0.05936    -0.9539     0.3291     0.6504
+[enc ]    15   1200     4.7141   -0.08911    -1.1120     0.6058     0.3751
+[enc ]    16   1280     3.0590   -0.05634    -0.7096     0.3003     0.7961
+[enc ]    17   1360     3.4566   -0.08238    -0.5642     0.3036     0.7325
+[enc ]    18   1440     4.6269   -0.10084    -0.7787     0.2957     0.8224
+[enc ]    19   1520     3.5740   -0.06521    -0.7851     0.2479     0.5390
+[enc ]    20   1600     4.9206   -0.08443    -1.1962     0.3473     0.3719
+[enc ]    21   1680     2.5766   -0.05089    -0.3559     0.1925     0.4992
+[enc ]    22   1760     3.2930   -0.07491    -0.6661     0.2487     0.7807
+[enc ]    23   1840     4.1290   -0.08833    -0.7433     0.3046     0.8909
+[enc ]    24   1920     3.2232   -0.06012    -0.6318     0.3370     0.9211
+[enc ]    25   2000     4.0291   -0.06089    -0.7839     0.2943     0.5380
+[enc ]    26   2080     3.3512   -0.04837    -1.0218     0.2383     0.5972
+[enc ]    27   2160     3.2729   -0.07860    -0.5413     0.2013     0.6296
+[enc ]    28   2240     4.0853   -0.08834    -0.7174     0.3307     0.8606
+[enc ]    29   2320     4.3154   -0.08944    -0.8467     0.3425     0.7385
+[enc ]    30   2400     4.1138   -0.07925    -1.0327     0.3440     0.9068
+[enc ]    31   2480     3.7459   -0.08428    -1.1250     0.2481     0.7340
+[enc ]    32   2560     3.6745   -0.07299    -1.1059     0.3388     0.9379
+[enc ]    33   2640     4.5211   -0.08232    -0.9689     0.3722     0.5130
+[enc ]    34   2720     2.7417   -0.06055    -0.3370     0.2936     0.5711
+[enc ]    35   2800     2.8650   -0.05740    -0.4931     0.3213     0.9221
+[enc ]    36   2880     3.3012   -0.07497    -0.8318     0.1822     0.7261
+[enc ]    37   2960     3.7034   -0.06449    -0.7450     0.2996     0.8532
+[enc ]    38   3040     2.6795   -0.04434    -0.4730     0.2616     0.7266
+[enc ]    39   3120     4.3280   -0.03528    -0.9593     0.6481     0.6416
+[enc ]    40   3200     3.2032   -0.03039    -0.4423     0.3452     0.4883
+[enc ]    41   3280     2.8381   -0.04116    -0.4031     0.2287     0.8888
+[enc ]    42   3360     2.5547   -0.06601    -0.3946     0.1800     0.8051
+[enc ]    43   3440     3.0816   -0.08779    -0.4965     0.2123     0.9084
+[enc ]    44   3520     3.1932   -0.08822    -0.6090     0.1776     0.9605
+[enc ]    45   3600     3.6112   -0.10008    -0.7154     0.1469     0.9576
+[enc ]    46   3680     4.3722   -0.12150    -0.6874     0.2037     0.7466
+[enc ]    47   3760     4.3922   -0.11285    -0.7607     0.2136     0.9708
+[enc ]    48   3840     3.9468   -0.09830    -0.8101     0.2264     0.9573
+[enc ]    49   3920     3.5072   -0.07004    -0.9908     0.2640     0.6022
+[enc ]    50   4000     3.7268   -0.07549    -0.9306     0.2542     0.6623
+[enc ]    51   4080     3.0663   -0.07997    -0.6798     0.1876     0.7195
+[enc ]    52   4160     2.9520   -0.07499    -0.5521     0.2258     0.9385
+[enc ]    53   4240     3.5707   -0.07958    -0.8165     0.2194     0.8460
+[enc ]    54   4320     3.4766   -0.07604    -0.8433     0.1890     0.9750
+[enc ]    55   4400     4.1545   -0.10672    -0.9184     0.2963     0.6407
+[enc ]    56   4480     4.4531   -0.10478    -1.0658     0.3338     0.9602
+[enc ]    57   4560     3.2672   -0.06989    -0.6209     0.3059     0.6606
+[enc ]    58   4640     3.7027   -0.08418    -0.9208     0.2535     0.6218
+[enc ]    59   4720     2.6092   -0.07287    -0.6788     0.1289     0.7589
+[enc ]    60   4800     3.6149   -0.08374    -0.6647     0.2306     0.6697
+[enc ]    61   4880     3.0030   -0.07295    -0.6339     0.1830     0.9525
+[enc ]    62   4960     2.9348   -0.08152    -0.6035     0.1798     0.7079
+[enc ]    63   5040     2.7655   -0.07447    -0.4541     0.1529     0.8878
+[enc ]    64   5120     3.5685   -0.07649    -0.8275     0.2336     0.6637
+[enc ]    65   5200     3.4547   -0.07425    -0.7667     0.2259     0.9748
+[enc ]    66   5280     2.9785   -0.07506    -0.7873     0.1978     0.8028
+[enc ]    67   5360     4.4362   -0.10834    -0.8497     0.2308     0.6356
+[enc ]    68   5440     3.8549   -0.08946    -0.8262     0.2189     0.9400
+[enc ]    69   5520     3.1042   -0.06780    -0.5735     0.2970     0.7684
+[enc ]    70   5600     3.0257   -0.06891    -0.5647     0.2186     0.9506
+[enc ]    71   5680     2.6404   -0.07538    -0.5605     0.1323     0.8342
+[enc ]    72   5760     3.3116   -0.09045    -0.8222     0.1660     0.8173
+[enc ]    73   5840     4.1566   -0.08822    -1.0537     0.3060     0.9039
+[enc ]    74   5920     3.8960   -0.08332    -0.9317     0.2793     0.9798
+[enc ]    75   6000     3.4422   -0.09423    -0.7972     0.2291     0.8027
+[enc ]    76   6080     3.3311   -0.08712    -0.7823     0.2164     0.9328
+[enc ]    77   6160     3.3402   -0.07826    -0.8125     0.2343     0.9438
+[enc ]    78   6240     2.7979   -0.07020    -0.7724     0.1594     0.8936
+[enc ]    79   6320     2.6621   -0.07085    -0.7050     0.1890     0.9155
+[enc ]    80   6400     3.4075   -0.09388    -0.9008     0.1647     0.8496
+[enc ]    81   6480     4.1839   -0.09806    -1.0311     0.2888     0.8573
+[enc ]    82   6560     3.1017   -0.06859    -0.7996     0.1967     0.8509
+[enc ]    83   6640     4.2386   -0.10181    -1.0585     0.2261     0.6802
+[enc ]    84   6720     4.2991   -0.09776    -1.0940     0.2534     0.9752
+[enc ]    85   6800     3.0894   -0.08772    -0.6776     0.1703     0.7367
+[enc ]    86   6880     2.9335   -0.08533    -0.6915     0.2185     0.8806
+[enc ]    87   6960     3.2574   -0.09301    -0.6793     0.1365     0.8292
+[enc ]    88   7040     3.6440   -0.08325    -0.6889     0.1685     0.8558
+[enc ]    89   7120     4.1327   -0.08775    -0.6669     0.2063     0.8562
+[enc ]    90   7200     2.8165   -0.06556    -0.3771     0.1757     0.7406
+[enc ]    91   7280     3.6869   -0.08968    -0.7111     0.2252     0.7275
+[enc ]    92   7360     3.8461   -0.08866    -0.6536     0.2949     0.9511
+[enc ]    93   7440     3.1879   -0.08007    -0.4667     0.2332     0.8421
+[enc ]    94   7520     2.9199   -0.07812    -0.5208     0.2133     0.9160
+[enc ]    95   7600     4.4823   -0.12110    -0.8859     0.2215     0.7802
+[enc ]    96   7680     4.2230   -0.09606    -0.8226     0.3644     0.9454
+[enc ]    97   7760     2.9935   -0.06948    -0.5281     0.2083     0.8177
+[enc ]    98   7840     3.9690   -0.10453    -0.8812     0.2572     0.7494
+[enc ]    99   7920     4.2152   -0.09854    -0.9302     0.2638     0.8068
+[enc ]   100   8000     3.1956   -0.08299    -0.6562     0.2005     0.8618
+[enc ]   101   8080     4.3665   -0.10771    -0.8722     0.2673     0.6141
+[enc ]   102   8160     3.0184   -0.05588    -0.5758     0.2172     0.5989
+[enc ]   103   8240     2.9115   -0.07942    -0.6653     0.1441     0.8110
+[enc ]   104   8320     4.4274   -0.10260    -1.0523     0.3841     0.6699
+[enc ]   105   8400     3.0906   -0.08443    -0.6127     0.1522     0.8277
+[enc ]   106   8480     2.8265   -0.08328    -0.6216     0.1773     0.9031
+[enc ]   107   8560     3.7097   -0.07445    -0.7358     0.2311     0.6211
+[enc ]   108   8640     3.1288   -0.06164    -0.5822     0.2234     0.7019
+[enc ]   109   8720     2.8081   -0.06452    -0.4928     0.1653     0.9399
+[enc ]   110   8800     4.8767   -0.10614    -1.0298     0.3366     0.4776
+[enc ]   111   8880     4.2587   -0.09903    -0.8852     0.2694     0.9803
+[enc ]   112   8960     4.6578   -0.09070    -0.9742     0.3507     0.9542
+[enc ]   113   9040     4.2064   -0.07467    -0.6824     0.4609     0.6384
+[enc ]   114   9120     3.1656   -0.06348    -0.5279     0.4046     0.7619
+[enc ]   115   9200     3.5956   -0.06912    -0.8510     0.2375     0.6811
+[enc ]   116   9280     4.8156   -0.09089    -0.7559     0.4724     0.3835
+[enc ]   117   9360     4.9453   -0.08542    -0.8216     0.4601     0.9665
+[enc ]   118   9440     3.4702   -0.05082    -0.7349     0.3161     0.6089
+[enc ]   119   9520     3.3415   -0.04148    -0.4861     0.3411     0.9225
+[enc ]   120   9600     2.6529   -0.03959    -0.4950     0.2807     0.6392
+[enc ]   121   9680     3.2887   -0.08541    -0.8498     0.1888     0.7205
+[enc ]   122   9760     4.0650   -0.09903    -0.8077     0.2099     0.8303
+[enc ]   123   9840     4.4620   -0.09367    -0.8131     0.2819     0.9128
+[enc ]   124   9920     3.5278   -0.06894    -0.8412     0.2686     0.6389
+[enc ]   125  10000     3.4191   -0.07748    -0.6965     0.2982     0.9173
+[enc ]   126  10080     4.2325   -0.09037    -1.3056     0.3051     0.6377
+[enc ]   127  10160     3.2333   -0.05992    -0.8057     0.2104     0.6736
+[enc ]   128  10240     3.1098   -0.06663    -0.4860     0.2284     0.7886
+[enc ]   129  10320     3.2153   -0.06227    -0.6065     0.2344     0.6803
+[enc ]   130  10400     3.2001   -0.05781    -0.6526     0.2345     0.9795
+[enc ]   131  10480     2.8772   -0.06163    -0.6254     0.1924     0.9694
+[enc ]   132  10560     3.1726   -0.05204    -0.5961     0.2592     0.9594
+[enc ]   133  10640     2.6053   -0.06414    -0.4990     0.1665     0.8260
+[enc ]   134  10720     4.1711   -0.11158    -1.0653     0.2498     0.6867
+[enc ]   135  10800     4.7899   -0.12690    -1.0587     0.2874     0.9740
+[enc ]   136  10880     5.2185   -0.11383    -1.2055     0.2971     0.9251
+[enc ]   137  10960     4.6796   -0.11030    -1.1118     0.4091     0.6193
+[enc ]   138  11040     4.2417   -0.09533    -1.0313     0.3668     0.9739
+[enc ]   139  11120     2.8722   -0.04921    -0.6313     0.2586     0.6977
+[enc ]   140  11200     3.4755   -0.07536    -0.9695     0.4961     0.6119
+[enc ]   141  11280     4.1576   -0.07153    -1.0309     0.4251     0.9218
+[enc ]   142  11360     3.2070   -0.06009    -0.6455     0.2832     0.6983
+[enc ]   143  11440     2.6125   -0.07181    -0.4265     0.1705     0.8332
+[enc ]   144  11520     3.7567   -0.06925    -0.9538     0.2591     0.6687
+[enc ]   145  11600     3.2805   -0.07433    -0.7907     0.2077     0.7253
+[enc ]   146  11680     4.3964   -0.07444    -0.7945     0.3415     0.7353
+[enc ]   147  11760     3.9799   -0.04638    -0.7466     0.3796     0.4939
+[enc ]   148  11840     3.0375   -0.06695    -0.5559     0.2867     0.8539
+[enc ]   149  11920     2.7246   -0.07394    -0.6360     0.2120     0.8395
+[enc ]   150  12000     5.2148   -0.09987    -1.1955     0.6097     0.5677
+[enc ] mean cos_prev over 150 transitions = 0.7645
+[rnnt] CHUNK enter frame_offset=0 T=151 frames (12080 ms) blank_id=13087 max_symbols_per_step=10 prev_token=13087 boosting=off
+[rnnt]   t=18/151 EMIT token=2      ▁            (blank_run=18 before it, symbols_at_frame=0/10)
+[rnnt]   t=18/151 EMIT token=903    Q              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=18/151 EMIT token=68     u              (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=18/151 EMIT token=414    and            (blank_run=0 before it, symbols_at_frame=3/10)
+[rnnt]   t=19/151 EMIT token=2      ▁            (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=19/151 EMIT token=295    je             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=20/151 EMIT token=1016   ▁par         (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=21/151 EMIT token=261    le             (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=23/151 EMIT token=1059   ▁avec        (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=25/151 EMIT token=1349   ▁quel        (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=26/151 EMIT token=1047   qu             (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=26/151 EMIT token=2775   '              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=26/151 EMIT token=428    un             (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=28/151 EMIT token=6      ,              (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=29/151 EMIT token=2      ▁            (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=29/151 EMIT token=295    je             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=31/151 EMIT token=1498   ▁vai         (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=31/151 EMIT token=40     s              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=33/151 EMIT token=2      ▁            (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=33/151 EMIT token=97     p              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=33/151 EMIT token=124    en             (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=34/151 EMIT token=40     s              (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=34/151 EMIT token=130    er             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=37/151 EMIT token=2      ▁            (blank_run=3 before it, symbols_at_frame=0/10)
+[rnnt]   t=37/151 EMIT token=124    en             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=39/151 EMIT token=2      ▁            (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=39/151 EMIT token=38     a              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=39/151 EMIT token=2959   ng             (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=40/151 EMIT token=66     l              (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=40/151 EMIT token=1022   ais            (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=88/151 EMIT token=4      .              (blank_run=48 before it, symbols_at_frame=0/10)
+[rnnt]   t=88/151 EMIT token=2      ▁            (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=88/151 EMIT token=2947   <en-US>        (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=92/151 EMIT token=2845   ▁The         (blank_run=4 before it, symbols_at_frame=0/10)
+[rnnt]   t=92/151 EMIT token=311    re             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=93/151 EMIT token=2775   '              (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=93/151 EMIT token=40     s              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=96/151 EMIT token=477    ▁over        (blank_run=3 before it, symbols_at_frame=0/10)
+[rnnt]   t=99/151 EMIT token=2872   ▁eight       (blank_run=3 before it, symbols_at_frame=0/10)
+[rnnt]   t=101/151 EMIT token=9590   ▁mil         (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=102/151 EMIT token=262    li             (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=102/151 EMIT token=128    on             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=104/151 EMIT token=2975   ▁people      (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=107/151 EMIT token=2      ▁            (blank_run=3 before it, symbols_at_frame=0/10)
+[rnnt]   t=107/151 EMIT token=125    in             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=108/151 EMIT token=150    ▁the         (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=110/151 EMIT token=277    ▁pro         (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=113/151 EMIT token=141    v              (blank_run=3 before it, symbols_at_frame=0/10)
+[rnnt]   t=113/151 EMIT token=125    in             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=114/151 EMIT token=282    ce             (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=115/151 EMIT token=1639   ▁of          (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=116/151 EMIT token=2      ▁            (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=116/151 EMIT token=903    Q              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=116/151 EMIT token=68     u              (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=117/151 EMIT token=26     e              (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=118/151 EMIT token=1881   be             (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=120/151 EMIT token=73     c              (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=122/151 EMIT token=6      ,              (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=123/151 EMIT token=2      ▁            (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=123/151 EMIT token=1290   so             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=124/151 EMIT token=2      ▁            (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=124/151 EMIT token=528    it             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=124/151 EMIT token=2775   '              (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=124/151 EMIT token=40     s              (blank_run=0 before it, symbols_at_frame=3/10)
+[rnnt]   t=126/151 EMIT token=2827   ▁one         (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=127/151 EMIT token=1639   ▁of          (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=128/151 EMIT token=150    ▁the         (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=129/151 EMIT token=2      ▁            (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=129/151 EMIT token=318    mo             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=129/151 EMIT token=257    st             (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=136/151 EMIT token=2889   ▁well        (blank_run=7 before it, symbols_at_frame=0/10)
+[rnnt]   t=137/151 EMIT token=2855   ▁know        (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=139/151 EMIT token=113    n              (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=141/151 EMIT token=2      ▁            (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=141/151 EMIT token=1728   wa             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=142/151 EMIT token=129    y              (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=142/151 EMIT token=40     s              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=144/151 EMIT token=1639   ▁of          (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=146/151 EMIT token=2      ▁            (blank_run=2 before it, symbols_at_frame=0/10)
+[rnnt]   t=146/151 EMIT token=1333   spe            (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=147/151 EMIT token=38     a              (blank_run=1 before it, symbols_at_frame=0/10)
+[rnnt]   t=147/151 EMIT token=914    ki             (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt]   t=147/151 EMIT token=2959   ng             (blank_run=0 before it, symbols_at_frame=2/10)
+[rnnt]   t=150/151 EMIT token=540    ▁F           (blank_run=3 before it, symbols_at_frame=0/10)
+[rnnt]   t=150/151 EMIT token=59     r              (blank_run=0 before it, symbols_at_frame=1/10)
+[rnnt] CHUNK exit  t=150/151 emitted=85 token(s)
+[nemo-speech] transcribe session finished

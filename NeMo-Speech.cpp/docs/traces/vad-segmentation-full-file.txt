@@ -1,0 +1,30 @@
+[vad ] segmenter: 21754 windows (32 ms each), 21415 speech / 339 silence
+[vad ]   longest silent run 832 ms (need >= 300 ms to cut)
+[vad ]   10 candidate cuts -> 27 segments
+[vad ]       0.00 -    27.70 s ( 27.70 s)
+[vad ]      27.70 -    55.40 s ( 27.70 s)
+[vad ]      55.40 -    84.05 s ( 28.65 s)
+[vad ]      84.05 -   112.45 s ( 28.40 s)
+[vad ]     112.45 -   141.65 s ( 29.20 s)
+[vad ]     141.65 -   169.79 s ( 28.14 s)
+[vad ]     169.79 -   172.32 s (  2.53 s)  <- decoder context reset
+[vad ]     172.32 -   201.52 s ( 29.20 s)  <- decoder context reset
+[vad ]     201.52 -   230.47 s ( 28.95 s)
+[vad ]     230.47 -   257.28 s ( 26.81 s)
+[vad ]     257.28 -   285.78 s ( 28.50 s)  <- decoder context reset
+[vad ]     285.78 -   314.83 s ( 29.05 s)
+[vad ]     314.83 -   342.48 s ( 27.65 s)
+[vad ]     342.48 -   370.33 s ( 27.85 s)
+[vad ]     370.33 -   398.18 s ( 27.85 s)
+[vad ]     398.18 -   427.48 s ( 29.30 s)
+[vad ]     427.48 -   455.13 s ( 27.65 s)
+[vad ]     455.13 -   482.83 s ( 27.70 s)
+[vad ]     482.83 -   509.93 s ( 27.10 s)
+[vad ]     509.93 -   539.74 s ( 29.81 s)
+[vad ]     539.74 -   546.30 s (  6.56 s)  <- decoder context reset
+[vad ]     546.30 -   570.66 s ( 24.35 s)  <- decoder context reset
+[vad ]     570.66 -   598.21 s ( 27.55 s)  <- decoder context reset
+[vad ]     598.21 -   627.11 s ( 28.90 s)
+[vad ]     627.11 -   655.86 s ( 28.75 s)
+[vad ]     655.86 -   668.19 s ( 12.34 s)
+[vad ]     668.19 -   696.11 s ( 27.92 s)  <- decoder context reset

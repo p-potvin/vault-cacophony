@@ -598,8 +598,8 @@ BufferedStreamRunner::process_window(size_t win_start, size_t win_end, bool is_l
 
 OfflineRunner::OfflineRunner(
     AsrModel* model, const RecognizerConfig& cfg,
-    std::shared_ptr<const FlashlightResources> flashlight)
-    : model_(model), decoder_cfg_(cfg.decoder) {
+    std::shared_ptr<const FlashlightResources> flashlight, std::shared_ptr<SileroVadModel> vad)
+    : model_(model), decoder_cfg_(cfg.decoder), seg_cfg_(cfg.vad.segmenter), vad_(std::move(vad)) {
     if (!model_)
         throw std::invalid_argument("OfflineRunner: null model");
     if (cfg.batching.offline_bucket_ms > 0) {
@@ -667,6 +667,131 @@ OfflineRunner::offline_segments_() const {
     return segments;
 }
 
+std::vector<bool>
+OfflineRunner::vad_speech_windows_(int& window_size) const {
+    std::vector<bool> speech;
+    window_size = 0;
+    if (!vad_)
+        return speech;
+    SileroVad vad(vad_);
+    window_size = vad.window_size();
+    std::vector<float> probs;
+    vad.feed_audio(audio_.data(), audio_.size(), probs);
+    vad.flush(probs);
+    // Onset/offset hysteresis, the same shape VadMasker uses: a single noisy
+    // window cannot flip the state, which keeps cuts off word edges.
+    speech.reserve(probs.size());
+    bool in_speech = false;
+    for (const float p : probs) {
+        if (in_speech ? (p < seg_cfg_.offset) : (p > seg_cfg_.onset))
+            in_speech = !in_speech;
+        speech.push_back(in_speech);
+    }
+    return speech;
+}
+
+std::vector<OfflineRunner::Segment>
+OfflineRunner::segments_for_decode_() const {
+    const size_t max_seg = max_offline_samples_();
+    std::vector<Segment> out;
+
+    if (!seg_cfg_.enable || !vad_ || audio_.empty()) {
+        for (const auto& [off, len] : offline_segments_())
+            out.push_back(Segment{off, len, /*reset_before=*/false});
+        return out;
+    }
+
+    int win = 0;
+    const std::vector<bool> speech = vad_speech_windows_(win);
+    if (speech.empty() || win <= 0) {
+        for (const auto& [off, len] : offline_segments_())
+            out.push_back(Segment{off, len, /*reset_before=*/false});
+        return out;
+    }
+
+    const double sr = static_cast<double>(model_->sample_rate());
+    const size_t min_sil_win =
+        std::max<size_t>(1, static_cast<size_t>(seg_cfg_.min_silence_ms * sr / 1000.0 / win));
+    const size_t max_len =
+        std::min(max_seg, static_cast<size_t>(seg_cfg_.max_segment_sec * sr));
+    const size_t min_len = static_cast<size_t>(seg_cfg_.min_segment_sec * sr);
+
+    // Candidate cuts: the midpoint of every silent run long enough to be a real
+    // pause. Midpoint (not edge) so both neighbours keep silence padding.
+    std::vector<size_t> cuts;
+    size_t run_start = 0;
+    bool in_run = false;
+    for (size_t i = 0; i <= speech.size(); ++i) {
+        const bool silent = (i < speech.size()) && !speech[i];
+        if (silent && !in_run) {
+            in_run = true;
+            run_start = i;
+        } else if (!silent && in_run) {
+            in_run = false;
+            if (i - run_start >= min_sil_win)
+                cuts.push_back((run_start + i) / 2 * static_cast<size_t>(win));
+        }
+    }
+
+    size_t off = 0;
+    size_t next_cut = 0;
+    // Whether the cut that OPENS the current segment was a real silence cut.
+    // The forced fallback below can land mid-word, and resetting the decoder
+    // there would throw away context the model legitimately needs -- so the
+    // reset flag has to follow the preceding cut, not merely "not the first".
+    bool opened_at_silence = false;
+    while (audio_.size() - off > max_len) {
+        // Latest eligible cut that keeps this segment within max_len and still
+        // leaves a segment of at least min_len.
+        size_t chosen = 0;
+        while (next_cut < cuts.size() && cuts[next_cut] <= off + min_len) ++next_cut;
+        for (size_t i = next_cut; i < cuts.size() && cuts[i] <= off + max_len; ++i)
+            chosen = cuts[i];
+        if (chosen > off) {
+            out.push_back(Segment{off, chosen - off, opened_at_silence});
+            off = chosen;
+            opened_at_silence = true;
+        } else {
+            // No pause in reach: fall back to the quietest window, and do NOT
+            // reset there -- the cut may be mid-word and the following audio
+            // genuinely continues the same utterance.
+            size_t cut = snap_to_quiet_(off + max_len, max_len / 10);
+            cut = std::max(cut, off + max_len / 2);
+            out.push_back(Segment{off, cut - off, opened_at_silence});
+            off = cut;
+            opened_at_silence = seg_cfg_.reset_on_forced_cut;
+        }
+    }
+    out.push_back(Segment{off, audio_.size() - off, opened_at_silence});
+
+    if (std::getenv("NEMO_SPEECH_DEBUG_VAD_SEG")) {
+        size_t speech_windows = 0, longest_sil = 0, cur_sil = 0;
+        for (const bool sp : speech) {
+            if (sp) {
+                speech_windows++;
+                cur_sil = 0;
+            } else {
+                longest_sil = std::max(longest_sil, ++cur_sil);
+            }
+        }
+        const double win_ms = win * 1000.0 / sr;
+        std::fprintf(
+            stderr,
+            "[vad ] segmenter: %zu windows (%.0f ms each), %zu speech / %zu silence\n"
+            "[vad ]   longest silent run %.0f ms (need >= %.0f ms to cut)\n"
+            "[vad ]   %zu candidate cuts -> %zu segments\n",
+            speech.size(), win_ms, speech_windows, speech.size() - speech_windows,
+            longest_sil * win_ms, seg_cfg_.min_silence_ms, cuts.size(), out.size());
+        for (const auto& s : out) {
+            std::fprintf(
+                stderr, "[vad ]   %8.2f - %8.2f s (%6.2f s)%s\n", s.off / sr,
+                (s.off + s.len) / sr, s.len / sr,
+                s.reset_before ? "  <- decoder context reset" : "");
+        }
+    }
+    return out;
+}
+
 void
 OfflineRunner::pad_audio_to_bucket_() {
     if (bucket_samples_ == 0 || audio_.empty())
@@ -703,7 +828,7 @@ OfflineRunner::finalize() {
     // decoded segment by segment through one stateful decoder with cumulative
     // frame offsets - the same contract the streaming runners use, so
     // transcripts and word timings stitch without any seam handling here.
-    const auto segments = offline_segments_();
+    const auto segments = segments_for_decode_();
     std::unique_ptr<Decoder> owned_decoder;
     Decoder* decoder = nullptr;
     std::vector<int> tokens;
@@ -713,7 +838,13 @@ OfflineRunner::finalize() {
         decoder->set_compute_timestamps(opts_.enable_word_time_offsets);
         decoder->set_request_options(opts_);
         int64_t frame_offset = 0;
-        for (const auto& [off, len] : segments) {
+        for (const auto& [off, len, reset_before] : segments) {
+            // A silence boundary: drop the decoder's language context but keep
+            // everything transcribed so far. CTC is stateless across frames, so
+            // this is a no-op there; it is kept for symmetry and for stateful
+            // CTC decoders (Flashlight beam search carries an LM state).
+            if (reset_before)
+                decoder->reset_context();
             std::vector<int> seg_tokens;
             if (auto* greedy = dynamic_cast<GreedyCtcDecoder*>(decoder)) {
                 std::vector<int32_t> best_ids;
@@ -746,7 +877,12 @@ OfflineRunner::finalize() {
         // applies no such bias, and this model already self-punctuates.
         const auto decode_begin = std::chrono::steady_clock::now();
         int64_t frame_offset = 0;
-        for (const auto& [off, len] : segments) {
+        for (const auto& [off, len, reset_before] : segments) {
+            // The point of the whole exercise: re-enter the next segment from a
+            // blank predictor so a stale language state cannot suppress it.
+            // frame_offset keeps advancing, so word timings still stitch.
+            if (reset_before)
+                decoder->reset_context();
             std::vector<float> enc;
             int T = 0;
             transducer->infer_offline(audio_.data() + off, len, enc, T, prompt_index_);
@@ -805,6 +941,15 @@ CacheStreamRunner::CacheStreamRunner(
     // attn_mask sizing and chunk-shift math. Same derivation the encoder uses
     // (make_cache_aware_config), so the two can't drift.
     enc_cfg_ = make_cache_aware_config(model->encoder_config(), right_ctx);
+    if (std::getenv("NEMO_SPEECH_DEBUG_RNNT"))
+        std::fprintf(
+            stderr,
+            "[enc ] cache-aware geometry: requested right_ctx=%d -> left_ctx=%d"
+            " chunk_frames=%d right_ctx=%d (attention %d frames, step %.0f ms)\n",
+            right_ctx, enc_cfg_.cache_left_ctx, enc_cfg_.cache_chunk_frames,
+            enc_cfg_.cache_right_ctx,
+            enc_cfg_.cache_left_ctx + enc_cfg_.cache_chunk_frames,
+            enc_cfg_.cache_chunk_frames * 80.0);
 
     // The per-stream K/V/conv cache is device-resident (cache_state_), allocated
     // lazily on first encode. Only attn_mask stays host-side - it's a per-call

@@ -1,0 +1,19 @@
+# Headless fallback runtime: reuse the Comfy Desktop model library on D: read-only.
+comfy_desktop_models:
+  base_path: D:\comfyUI\resources\ComfyUI\models
+  is_default: true
+  checkpoints: checkpoints/
+  clip_vision: clip_vision/
+  configs: configs/
+  controlnet: controlnet/
+  diffusion_models: |
+    diffusion_models/
+    unet/
+  embeddings: embeddings/
+  loras: loras/
+  model_patches: model_patches/
+  text_encoders: |
+    text_encoders/
+    clip/
+  upscale_models: upscale_models/
+  vae: vae/

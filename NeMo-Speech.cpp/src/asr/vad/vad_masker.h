@@ -23,6 +23,7 @@
 
 #include "parameter_parser.h"
 #include "silero_vad.h"
+#include "vad_segmenter.h"
 
 namespace nemo_speech::asr {
 
@@ -64,9 +65,11 @@ struct VadMaskerCfg {
 struct VadConfig {
     std::string model_path;  // empty = no VAD loaded
     VadMaskerCfg masker;
+    VadSegmenterCfg segmenter;
     void Register(common::ParameterParser& p) {
         p.Register("model_path", &model_path, "Silero VAD GGUF path", {"--vad-model"});
         p.Register("masker", masker);
+        p.Register("segmenter", segmenter);
     }
 };
 
