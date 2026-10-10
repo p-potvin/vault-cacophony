@@ -128,3 +128,8 @@ audio.cpp/tools/finish_download.py
 *.srt
 *.vtt
 /font-cloning/text-style-transfer/examples
+/font-cloning/FontDiffuser-Gradio
+/font-cloning/Ref2Font
+/video-search-and-summarization
+audio.cpp/local.README.md
+*local.README.md

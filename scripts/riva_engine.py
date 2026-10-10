@@ -305,7 +305,7 @@ class RivaEngine:
     def __init__(
         self,
         model_path: str = DEFAULT_MODEL_PATH,
-        n_ctx: int = 4096,
+        n_ctx: int = 1024,
         n_gpu_layers: int = -1,
         verbose: bool = False,
     ):
@@ -342,7 +342,7 @@ class RivaEngine:
         text: str,
         target_lang: str,
         source_lang: str = "en",
-        max_tokens: int = 256,
+        max_tokens: int = 512,
         temperature: float = 0.0,
     ) -> str:
         """Translate a single string using Riva-Translate-4B-Instruct-v2."""
@@ -376,7 +376,7 @@ class RivaEngine:
         texts: List[str],
         target_lang: str,
         source_lang: str = "en",
-        max_tokens: int = 256,
+        max_tokens: int = 512,
         temperature: float = 0.0,
     ) -> List[str]:
         """Translate a list of strings preserving original ordering."""
@@ -403,7 +403,7 @@ def main():
     parser.add_argument("--model", default=DEFAULT_MODEL_PATH, help="Path to Riva GGUF model")
     parser.add_argument("--from-lang", "-s", default="en", help="Source language (default: en)")
     parser.add_argument("--to-lang", "-t", required=True, help="Target language (e.g. es, fr, de)")
-    parser.add_argument("--ctx", type=int, default=4096, help="Context length")
+    parser.add_argument("--ctx", type=int, default=1024, help="Context length")
     parser.add_argument("--gpu-layers", type=int, default=-1, help="GPU layers to offload (-1=all)")
     args = parser.parse_args()
 
