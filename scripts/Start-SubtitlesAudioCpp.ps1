@@ -153,6 +153,12 @@ $AsrModel = if ($Engine -eq "nemotron") {
 } else {
     Join-Path $AudioCpp "models\Parakeet-TDT-0.6B-v3-GGUF\parakeet-tdt-0.6b-v3-q8_0.gguf"
 }
+# The shared model store (%LOCALAPPDATA%\VaultWares\models, as setup-audiocpp-service.ps1 resolves it) when the
+# model is not under audio.cpp\models.
+if (-not (Test-Path -LiteralPath $AsrModel)) {
+    $stored = Join-Path (Join-Path $env:LOCALAPPDATA "VaultWares\models") ($AsrModel.Substring((Join-Path $AudioCpp "models").Length + 1))
+    if (Test-Path -LiteralPath $stored) { $AsrModel = $stored }
+}
 $ToSrt    = Join-Path $PSScriptRoot "words_to_srt.py"
 $ToLang   = Join-Path $PSScriptRoot "translate_srt.py"
 $ToSpeakers = Join-Path $PSScriptRoot "speakers.py"
