@@ -16,9 +16,11 @@
         words_to_srt.py cues from word gaps, <lang> tags -> .tags.json
         translate_srt.py deep_translator
 
-    Separation is ON by default here, unlike the CrispASR version: at ~8x
-    realtime a 16-minute video costs ~2 min, against ~2.5 hours on CrispASR's
-    CPU path and ~35 min for PyTorch demucs at shifts=1.
+    Separation is OFF by default (operator, Fri 23 Oct 2026: not every file
+    should pay for it); -Separate turns it on for audio buried under music. At
+    ~8x realtime a 16-minute video costs ~2 min, against ~2.5 hours on
+    CrispASR's CPU path and ~35 min for PyTorch demucs at shifts=1.
+    -NoSeparate is still accepted (it is the default now).
 
     The separator is BS-RoFormer at one inference pass (-Separator htdemucs for
     the old one). It beats htdemucs where separation actually matters -- speech
@@ -41,7 +43,7 @@
     .\Start-SubtitlesAudioCpp.ps1 -TargetDir "D:\Media" -Recurse -Langs "en"
 
 .EXAMPLE
-    .\Start-SubtitlesAudioCpp.ps1 -TargetDir "D:\wavs" -NoSeparate -Langs "fr,es"
+    .\Start-SubtitlesAudioCpp.ps1 -TargetDir "D:\Concerts" -Separate -Langs "fr,es"
 #>
 [CmdletBinding()]
 param(
@@ -52,6 +54,9 @@ param(
     [Alias("r")][switch]$Recurse,
     [string]$Langs = "",
     [switch]$SkipExisting,
+    # Vocals off the music with -Separator first; off unless asked for.
+    [switch]$Separate,
+    # The old way to turn separation off, now the default; kept so existing callers still work.
     [switch]$NoSeparate,
     # BS-RoFormer replaced htdemucs on the audio that is actually hard. Speech
     # over music at 0 dB, WER after separation: htdemucs 26.4%, BS-RoFormer
@@ -143,6 +148,8 @@ $Cli      = Join-Path $AudioCpp "audiocpp_cli.exe"
 # command before calling it.
 $script:VwAudioSeconds = 0.0
 Import-Module (Join-Path $PSScriptRoot "VwTelemetry.psm1") -Force -ErrorAction SilentlyContinue
+# Off unless -Separate (and -NoSeparate still wins): the rest of the script reads $NoSeparate.
+$NoSeparate = $NoSeparate -or -not $Separate
 $SepModel = if ($Separator -eq "bs_roformer") {
     Join-Path $AudioCpp "models\BS-RoFormer-ep368-GGUF\bs-roformer-ep368-q8_0.gguf"
 } else {
@@ -167,7 +174,7 @@ foreach ($p in @($Cli, $AsrModel, $Python, $ToSrt, $ToLang)) {
     if (-not (Test-Path -LiteralPath $p)) { Write-Error "missing: $p"; exit 1 }
 }
 if (-not $NoSeparate -and -not (Test-Path -LiteralPath $SepModel)) {
-    Write-Error "missing separation model: $SepModel (or pass -NoSeparate)"; exit 1
+    Write-Error "missing separation model: $SepModel (or drop -Separate)"; exit 1
 }
 foreach ($exe in @("ffmpeg","ffprobe")) {
     if (-not (Get-Command $exe -ErrorAction SilentlyContinue)) { Write-Error "$exe not on PATH"; exit 1 }

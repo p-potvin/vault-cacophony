@@ -111,11 +111,11 @@ Add the speaker pass, and translations:
 .\scripts\Start-SubtitlesAudioCpp.ps1 -TargetDir "D:\Media\episode.mkv" -Speakers -Langs "fr,es"
 ```
 
-Skip separation when the audio is already clean dialogue — it is the expensive
-stage:
+Separation is off by default. Turn it on with `-Separate` when speech is buried
+under music — it is the expensive stage (BS-RoFormer, ~8x realtime):
 
 ```powershell
-.\scripts\Start-SubtitlesAudioCpp.ps1 -TargetDir "D:\podcasts" -NoSeparate
+.\scripts\Start-SubtitlesAudioCpp.ps1 -TargetDir "D:\Concerts" -Separate
 ```
 
 Read a tag store, and ask what every track says at one moment:

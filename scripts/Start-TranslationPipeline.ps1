@@ -148,7 +148,8 @@ foreach ($f in $files) {
     if ($SkipCompleted) {
         $pyArgs += @("--skip-completed")
     }
-    if ($NoSeparate) {
+    # Separation is opt-in (-Separate), like Start-SubtitlesAudioCpp.ps1; -NoSeparate still wins.
+    if ($NoSeparate -or -not $Separate) {
         $pyArgs += @("--no-separate")
     } else {
         $pyArgs += @("--separator", $Separator, "--sep-passes", $SepPasses)
