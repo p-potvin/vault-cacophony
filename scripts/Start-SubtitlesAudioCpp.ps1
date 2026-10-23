@@ -46,6 +46,8 @@
 [CmdletBinding()]
 param(
     [Alias("Folder","Directory")][string]$TargetDir = $PWD.Path,
+    # A text file of media paths, one per line: exactly these files (e.g. the videos a catalog has no subtitles for).
+    [string]$FileList,
     [string]$OutputDir,
     [Alias("r")][switch]$Recurse,
     [string]$Langs = "",
@@ -345,8 +347,12 @@ New-Item -ItemType Directory -Force -Path $Tmp | Out-Null
 # path in hand -- a player asking for one sidecar, a context menu on one file --
 # would otherwise have to hand over its parent and hope the extension filter
 # spared the rest of the folder.
-if (-not (Test-Path -LiteralPath $TargetDir)) { Write-Error "not found: $TargetDir"; exit 1 }
-if ((Get-Item -LiteralPath $TargetDir) -is [System.IO.DirectoryInfo]) {
+if ($FileList) {
+    $files = @(Get-Content -LiteralPath $FileList -Encoding UTF8 | Where-Object { $_.Trim() } |
+               Where-Object { Test-Path -LiteralPath $_.Trim() } | ForEach-Object { Get-Item -LiteralPath $_.Trim() })
+    if (-not $files) { Write-Host "no media files in $FileList"; exit 0 }
+} elseif (-not (Test-Path -LiteralPath $TargetDir)) { Write-Error "not found: $TargetDir"; exit 1 }
+elseif ((Get-Item -LiteralPath $TargetDir) -is [System.IO.DirectoryInfo]) {
     $files = Get-ChildItem -LiteralPath $TargetDir -File -Recurse:$Recurse |
              Where-Object { $Extensions -contains $_.Extension.ToLower() }
     if (-not $files) { Write-Host "no media files under $TargetDir"; exit 0 }
