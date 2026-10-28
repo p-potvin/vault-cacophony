@@ -93,7 +93,10 @@ CREATE TABLE IF NOT EXISTS voice (
     samples  INTEGER NOT NULL DEFAULT 1,
     created  TEXT,
     updated  TEXT,
-    notes    TEXT DEFAULT ''
+    notes    TEXT DEFAULT '',
+    ref_wav  TEXT DEFAULT '',
+    ref_text TEXT DEFAULT '',
+    habits   TEXT DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS observation (
@@ -132,9 +135,16 @@ class VoiceStore:
         self.db = sqlite3.connect(self.path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(DDL)
+        self._ensure_columns()
         self.db.execute("INSERT OR IGNORE INTO meta VALUES ('schema', ?)", (str(SCHEMA),))
         self.db.commit()
         self._migrate_json()
+
+    def _ensure_columns(self):
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(voice)").fetchall()}
+        for col, default in (("ref_wav", "''"), ("ref_text", "''"), ("habits", "'{}'")):
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE voice ADD COLUMN {col} TEXT DEFAULT {default}")
 
     def close(self):
         self.db.close()
@@ -192,7 +202,7 @@ class VoiceStore:
 
     # -- writing -----------------------------------------------------------
 
-    def enroll(self, name, embedding, notes="", observation_id=None):
+    def enroll(self, name, embedding, notes="", observation_id=None, ref_wav="", ref_text="", habits=None):
         """Add a vector to a voice, averaging it into whatever is already there.
 
         Enrolling the same person again averages rather than replaces, so a
@@ -200,24 +210,61 @@ class VoiceStore:
         """
         embedding = _unit(embedding)
         row = self.db.execute("SELECT * FROM voice WHERE name = ?", (name,)).fetchone()
+        habits_json = json.dumps(habits, ensure_ascii=False) if isinstance(habits, dict) else (habits or "")
         if row is None:
             centroid, samples, created = embedding, 1, _stamp()
+            habits_val = habits_json or "{}"
         else:
             samples = int(row["samples"]) + 1
             centroid = _unit(_vector(row["centroid"]) * (samples - 1) / samples
                              + embedding / samples)
             created = row["created"]
             notes = notes or row["notes"]
+            ref_wav = ref_wav or (row["ref_wav"] if "ref_wav" in row.keys() else "")
+            ref_text = ref_text or (row["ref_text"] if "ref_text" in row.keys() else "")
+            habits_val = habits_json or (row["habits"] if "habits" in row.keys() and row["habits"] else "{}")
         self.db.execute(
-            "INSERT INTO voice (name, centroid, samples, created, updated, notes) "
-            "VALUES (?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
+            "INSERT INTO voice (name, centroid, samples, created, updated, notes, ref_wav, ref_text, habits) "
+            "VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
             "centroid=excluded.centroid, samples=excluded.samples, "
-            "updated=excluded.updated, notes=excluded.notes",
-            (name, _blob(centroid), samples, created, _stamp(), notes or ""))
+            "updated=excluded.updated, notes=excluded.notes, "
+            "ref_wav=excluded.ref_wav, ref_text=excluded.ref_text, habits=excluded.habits",
+            (name, _blob(centroid), samples, created, _stamp(), notes or "", ref_wav or "", ref_text or "", habits_val))
         if observation_id is not None:
             self.attribute(observation_id, name)
         self.db.commit()
         return samples
+
+    def set_habits(self, name, habits, ref_wav=None, ref_text=None):
+        """Attach or update a VocalHabitProfile JSON dict (and optional reference audio/text) on an enrolled voice."""
+        habits_json = json.dumps(habits, ensure_ascii=False) if isinstance(habits, dict) else str(habits or "{}")
+        row = self.db.execute("SELECT * FROM voice WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            # Create placeholder zero-centroid row if not yet enrolled from audio
+            zero = np.zeros(EMB_DIM, dtype=np.float32)
+            zero[0] = 1.0
+            self.db.execute(
+                "INSERT INTO voice (name, centroid, samples, created, updated, notes, ref_wav, ref_text, habits) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (name, _blob(zero), 0, _stamp(), _stamp(), "habit profile preset",
+                 str(ref_wav or ""), str(ref_text or ""), habits_json))
+        else:
+            rw = str(ref_wav) if ref_wav is not None else (row["ref_wav"] or "")
+            rt = str(ref_text) if ref_text is not None else (row["ref_text"] or "")
+            self.db.execute(
+                "UPDATE voice SET habits = ?, ref_wav = ?, ref_text = ?, updated = ? WHERE name = ?",
+                (habits_json, rw, rt, _stamp(), name))
+        self.db.commit()
+
+    def get_habits(self, name):
+        """Return the parsed VocalHabitProfile dict for `name`, or None."""
+        row = self.db.execute("SELECT habits FROM voice WHERE name = ?", (name,)).fetchone()
+        if not row or not row["habits"]:
+            return None
+        try:
+            return json.loads(row["habits"])
+        except (TypeError, ValueError):
+            return None
 
     def observe(self, embedding, windows=None, **fields):
         """Record one stretch of attributed speech. Returns its row id.
