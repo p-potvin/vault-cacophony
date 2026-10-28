@@ -157,9 +157,10 @@ class VoiceStore:
 
     # -- reading -----------------------------------------------------------
 
-    def voices(self):
-        """[(name, centroid, row)] for every enrolled voice."""
-        rows = self.db.execute("SELECT * FROM voice ORDER BY name").fetchall()
+    def voices(self, enrolled_only: bool = True):
+        """[(name, centroid, row)] for every enrolled voice (default samples > 0)."""
+        sql = "SELECT * FROM voice WHERE samples > 0 ORDER BY name" if enrolled_only else "SELECT * FROM voice ORDER BY name"
+        rows = self.db.execute(sql).fetchall()
         return [(r["name"], _vector(r["centroid"]), r) for r in rows]
 
     def identify(self, embedding, threshold=MATCH_THRESHOLD, margin=MARGIN):

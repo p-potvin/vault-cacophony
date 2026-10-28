@@ -260,14 +260,16 @@ class SmartVocalPicker:
                     return full
                 if full in ("[break]", "[pause]"):
                     return "..."
-                if full in ("[sighs]", "[sighing]"):
+                if full in ("[sighs]", "[sighing]", "[sarcastic]", "[skeptical]", "[soft tone]", "[dissatisfaction]"):
                     return "[sigh]"
                 if full in ("[laughs]", "[laughing]", "[chuckling]", "[chuckle]"):
                     return "[laughter]"
-                if full in ("[gasping]", "[gasp]"):
+                if full in ("[gasping]", "[gasp]", "[surprised]"):
                     return "[surprise-ah]"
-                if full in ("[clear throat]",):
+                if full in ("[clear throat]", "[confirmation]", "[confident]", "[excited]"):
                     return "[confirmation-en]"
+                if full in ("[in a hurry tone]", "[hurry]", "[fast]"):
+                    return "[question-en]"
                 return ""
 
             cleaned = re.sub(r"\[[^\]]+\]", _omni_bracket, cleaned)
@@ -301,7 +303,7 @@ class SmartVocalPicker:
         injected_throat: List[str] = []
         used_fillers: set[str] = set()
 
-        is_barge_in = transition_type == "interruption"
+        is_barge_in = transition_type.lower() == "interruption"
         throat_cfg = prof.throat_habits
         can_throat = self._can_emit_throat(prof.persona_name, turn_num, throat_cfg.cooldown_turns)
 

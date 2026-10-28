@@ -147,8 +147,8 @@ class HfDialogueBrain:
             messages.append({"role": "user", "content": f"[Director cue for {speaker_name}: {directive}]"})
 
         effective_tokens = max_tokens
-        if effective_tokens < 800 and ("gpt-oss" in self.model.lower() or "deepinfra" in self.model.lower()):
-            effective_tokens = 900
+        if effective_tokens < 600 and ("gpt-oss" in self.model.lower() or "deepinfra" in self.model.lower()):
+            effective_tokens = 750
 
         if stream:
             stream_resp = self._chat_completion_with_fallback(
@@ -157,11 +157,39 @@ class HfDialogueBrain:
                 temperature=self.temperature,
                 stream=True,
             )
-            collected = []
+            collected_content: List[str] = []
+            collected_reasoning: List[str] = []
             for chunk in stream_resp:
-                delta = chunk.choices[0].delta.content or ""
-                collected.append(delta)
-            raw = "".join(collected)
+                delta = chunk.choices[0].delta
+                c = getattr(delta, "content", None)
+                if c:
+                    collected_content.append(c)
+                else:
+                    r = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                    if r:
+                        collected_reasoning.append(r)
+            if collected_content:
+                raw = "".join(collected_content)
+            else:
+                reasoning = "".join(collected_reasoning)
+                forbidden = {
+                    (target_utterance or "").strip().lower(),
+                    (prev_utterance or "").strip().lower(),
+                }
+                quoted = [
+                    q.strip()
+                    for q in re.findall(r'["\u201c]([^"\u201d]{10,160})["\u201d]', reasoning)
+                    if q.strip().lower() not in forbidden
+                ]
+                if quoted:
+                    raw = quoted[-1]
+                else:
+                    lines = [
+                        line.strip()
+                        for line in reasoning.strip().split("\n")
+                        if line.strip() and not line.startswith("User") and not line.startswith("Rule")
+                    ]
+                    raw = lines[-1] if lines else ""
         else:
             resp = self._chat_completion_with_fallback(
                 messages=messages,

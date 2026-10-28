@@ -237,8 +237,18 @@ def run_benchmark(
 
     primary_bottleneck = "TTS Engine" if total_tts_time >= total_llm_time else "HF LLM Inference"
 
+    status_file = out_dir / "run_status.json"
+    actual_completed_turns = turns
+    if status_file.exists():
+        try:
+            status_data = json.loads(status_file.read_text(encoding="utf-8"))
+            actual_completed_turns = int(status_data.get("completed_turns", turns))
+        except Exception:
+            pass
+
     report = {
-        "turns_completed": turns,
+        "turns_completed": actual_completed_turns,
+        "turns_requested": turns,
         "batch_size": batch_size,
         "batches_run": len(timings["llm_times"]),
         "engine_type": engine_type,

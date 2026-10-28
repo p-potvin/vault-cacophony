@@ -322,6 +322,25 @@ class TtsEngine:
                     print(f"  [!] Warning warming OmniVoice server: {exc}")
         return urls
 
+    def shutdown_servers(self) -> None:
+        """Terminate all warm audiocpp_server.exe processes started by this engine instance."""
+        with self._server_lock:
+            for port, proc in list(self._server_procs.items()):
+                if proc and proc.poll() is None:
+                    try:
+                        if sys.platform == "win32":
+                            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+                        else:
+                            proc.terminate()
+                            proc.wait(timeout=2.0)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+            self._server_procs.clear()
+            self._fish_server_proc = None
+
     def synthesize(
         self,
         text: str,

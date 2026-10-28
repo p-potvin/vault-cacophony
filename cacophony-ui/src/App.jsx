@@ -212,7 +212,9 @@ export default function App() {
     }
     const overrides = []
     for (const p of personas.slice(0, numSpeakers)) {
-      if (!p.engine && !p.voice) continue // untouched -> preset defaults
+      const defaultSpeed = opts?.personas[p.index]?.speed_ratio ?? 1.0
+      const hasSpeedChange = p.speed !== undefined && Math.abs(p.speed - defaultSpeed) > 0.001
+      if (!p.engine && !p.voice && !hasSpeedChange) continue // untouched -> preset defaults
       const entry = { index: p.index }
       if (p.engine) entry.engine = p.engine
       const eng = p.engine || engineType
@@ -222,7 +224,7 @@ export default function App() {
           entry.voice_ref = { wav: refsByName[p.voice].wav, text: refsByName[p.voice].text }
         }
       }
-      if (p.speed && Math.abs(p.speed - (opts?.personas[p.index]?.speed_ratio ?? 1.0)) > 0.001) {
+      if (hasSpeedChange) {
         entry.speed_ratio = p.speed
       }
       overrides.push(entry)
@@ -337,7 +339,7 @@ export default function App() {
                   <input type="number" step="0.05" min="0" className={inputCls} value={rt60} onChange={(e) => setRt60(parseFloat(e.target.value) || 0)} />
                 </Field>
                 <Field label="gpu device">
-                  <input type="number" className={inputCls} value={gpuDevice} onChange={(e) => setGpuDevice(parseInt(e.target.value) || -1)} />
+                  <input type="number" className={inputCls} value={gpuDevice} onChange={(e) => setGpuDevice(Number.isNaN(parseInt(e.target.value, 10)) ? -1 : parseInt(e.target.value, 10))} />
                 </Field>
               </div>
               <div className="flex items-center gap-3">

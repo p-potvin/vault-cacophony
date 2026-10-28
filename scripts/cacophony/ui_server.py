@@ -57,6 +57,7 @@ class RunManager:
         self.lines: list[str] = []
         self.subscribers: list[queue.Queue] = []
         self.proc: subprocess.Popen | None = None
+        self._starting: bool = False
         self.run_id: str | None = None
         self.result: dict | None = None
         self.out_dir: str | None = None
@@ -95,23 +96,35 @@ class RunManager:
     # -- lifecycle ----------------------------------------------------------
     @property
     def running(self) -> bool:
-        return self.proc is not None and self.proc.poll() is None
+        return self._starting or (self.proc is not None and self.proc.poll() is None)
 
     def start(self, config: dict) -> tuple[str | None, str | None]:
         """Launch a run. Returns (run_id, error)."""
         with self.lock:
             if self.running:
                 return None, "a run is already in progress"
+            self._starting = True
             self.lines = []
             self.result = None
             self.run_id = uuid.uuid4().hex[:8]
             rid = self.run_id
 
-        cmd, out_dir = build_command(config)
-        self.out_dir = out_dir
-        env = os.environ.copy()
-        env["PYTHONIOENCODING"] = "utf-8"
         try:
+            cmd, out_dir = build_command(config)
+            self.out_dir = str(out_dir)
+
+            # Clean stale prior run artifacts so failed runs never display previous audio
+            if out_dir.exists():
+                for artifact in ("cacophony_master.wav", "timeline_manifest.json", "transcript.txt", "run_status.json"):
+                    stale = out_dir / artifact
+                    if stale.exists():
+                        try:
+                            stale.unlink()
+                        except OSError:
+                            pass
+
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
             proc = subprocess.Popen(
                 cmd,
                 cwd=str(REPO_DIR),
@@ -122,9 +135,15 @@ class RunManager:
                 errors="replace",
                 bufsize=1,
             )
-        except Exception as e:  # pragma: no cover
+            with self.lock:
+                self.proc = proc
+                self._starting = False
+        except Exception as e:
+            with self.lock:
+                self._starting = False
+                self.run_id = None
             return None, f"failed to launch: {e}"
-        self.proc = proc
+
         self.broadcast_event({"kind": "started", "run_id": rid, "out_dir": str(self.out_dir)})
         self.append(f"[ui] run {rid} started: {os.path.basename(cmd[0])} " + " ".join(cmd[1:]))
 
@@ -135,8 +154,8 @@ class RunManager:
                 if line:
                     self.append(line)
             code = proc.wait()
-            out_dir = Path(self.out_dir) if self.out_dir else None
-            status_path = out_dir / "run_status.json" if out_dir else None
+            out_p = Path(self.out_dir) if self.out_dir else None
+            status_path = out_p / "run_status.json" if out_p else None
             try:
                 run_status = json.loads(status_path.read_text(encoding="utf-8")) if status_path and status_path.exists() else None
             except (OSError, json.JSONDecodeError):
@@ -145,16 +164,18 @@ class RunManager:
                 "code": code,
                 "run_status": run_status,
                 "run_id": rid,
-                "out_dir": str(out_dir) if out_dir else None,
-                "master_wav": str(out_dir / "cacophony_master.wav") if out_dir and (out_dir / "cacophony_master.wav").exists() else None,
-                "transcript": str(out_dir / "transcript.txt") if out_dir and (out_dir / "transcript.txt").exists() else None,
-                "manifest": str(out_dir / "timeline_manifest.json") if out_dir and (out_dir / "timeline_manifest.json").exists() else None,
-                "transcript_text": (out_dir / "transcript.txt").read_text(encoding="utf-8") if out_dir and (out_dir / "transcript.txt").exists() else "",
+                "out_dir": str(out_p) if out_p else None,
+                "master_wav": str(out_p / "cacophony_master.wav") if out_p and (out_p / "cacophony_master.wav").exists() else None,
+                "transcript": str(out_p / "transcript.txt") if out_p and (out_p / "transcript.txt").exists() else None,
+                "manifest": str(out_p / "timeline_manifest.json") if out_p and (out_p / "timeline_manifest.json").exists() else None,
+                "transcript_text": (out_p / "transcript.txt").read_text(encoding="utf-8") if out_p and (out_p / "transcript.txt").exists() else "",
             }
-            self.result = result
+            with self.lock:
+                if self.run_id == rid:
+                    self.result = result
+                    self.proc = None
             self.append(f"[ui] run {rid} finished (code {code})")
             self.broadcast_event({"kind": "done", **result})
-            self.proc = None
 
         threading.Thread(target=pump, daemon=True).start()
         return rid, None
@@ -164,12 +185,19 @@ class RunManager:
             proc = self.proc
         if proc is None or proc.poll() is not None:
             return False
-        self.append("[ui] stop requested; terminating run...")
+        self.append("[ui] stop requested; terminating run process tree...")
         try:
-            proc.terminate()
-            proc.wait(timeout=10)
+            # Kill the process and any child processes (including warm tts servers)
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+            else:
+                proc.terminate()
+                proc.wait(timeout=5)
         except Exception:
-            proc.kill()
+            try:
+                proc.kill()
+            except Exception:
+                pass
         return True
 
 
@@ -178,11 +206,14 @@ RUNS = RunManager()
 
 def build_command(config: dict) -> tuple[list[str], Path]:
     """Translate the UI config JSON into orchestrator CLI args."""
-    out_dir = (config.get("out_dir") or "cacophony_output/ui_run").strip()
-    out_dir = out_dir.replace("\\", "/")
-    out_path = Path(out_dir)
-    if not out_path.is_absolute():
-        out_path = REPO_DIR / out_path
+    raw_out = (config.get("out_dir") or "cacophony_output/ui_run").strip().replace("\\", "/")
+    base_out = (REPO_DIR / "cacophony_output").resolve()
+    target_path = (REPO_DIR / raw_out).resolve()
+    try:
+        target_path.relative_to(base_out)
+        out_path = target_path
+    except ValueError:
+        out_path = base_out / "ui_run"
     # keep the value relative for display but resolve against the repo
     out_arg = str(out_path.relative_to(REPO_DIR)) if out_path.is_relative_to(REPO_DIR) else str(out_path)
 
@@ -239,6 +270,7 @@ def build_command(config: dict) -> tuple[list[str], Path]:
                     entry["voice_ref_text"] = ref["text"]
             elif eng == "cosyvoice" and vname and vname != "default":
                 entry["preset_voice"] = vname
+                entry["voice_ref_wav"] = None
         elif eng == "magpie" and vname and vname != "default":
             entry["voice_name"] = vname
         overrides.append(entry)
@@ -366,7 +398,8 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             rel = (qs.get("path") or [""])[0]
             target = (REPO_DIR / rel).resolve()
-            if not target.is_relative_to(REPO_DIR) or not target.exists():
+            allowed_root = (REPO_DIR / "cacophony_output").resolve()
+            if not target.is_relative_to(allowed_root) or not target.exists():
                 return self._error("file not found", 404)
             if target.suffix == ".wav":
                 return self._send_file(target, "audio/wav")
@@ -394,6 +427,8 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/start":
             try:
                 length = int(self.headers.get("Content-Length", 0))
+                if length <= 0 or length > 2 * 1024 * 1024:
+                    return self._error("request entity too large or invalid", 413)
                 config = json.loads(self.rfile.read(length) or b"{}")
             except Exception:
                 return self._error("invalid JSON body")

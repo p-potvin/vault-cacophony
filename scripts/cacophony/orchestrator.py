@@ -219,6 +219,11 @@ def parse_args():
     ap.add_argument("--seed-topic", type=str, default=None, help="Opening conversation starter (defaults to the selected script's seed)")
     ap.add_argument("--script", type=str, default="testbench", choices=list(STORY_SCRIPTS.keys()), help="Story script blueprint (default testbench)")
     ap.add_argument("--personas-json", type=str, default=None, help="JSON file of per-persona overrides [{index, engine, voice_name, voice_pack_gguf, voice_ref_wav, voice_ref_text, speed_ratio, description}]")
+    ap.add_argument("--answering-mode", action="store_true", default=False, help="Have the LLM generate responses directly in character as the answering persona instead of a director script batch")
+    ap.add_argument("--stream", action="store_true", default=True, help="Stream LLM tokens in real time (default True)")
+    ap.add_argument("--no-stream", dest="stream", action="store_false", help="Disable streaming LLM tokens")
+    ap.add_argument("--allow-prosody-tags", action="store_true", default=True, help="Allow inline vocal prosody tags from the LLM (default True)")
+    ap.add_argument("--no-prosody-tags", dest="allow_prosody_tags", action="store_false", help="Strip prosody tags from LLM responses")
     return ap.parse_args()
 
 
@@ -455,8 +460,13 @@ class CacophonyOrchestrator:
                 print(f"\n[*] Target duration reached: {current_timeline_end:.2f}s >= {self.args.duration_sec:.2f}s after {turn_idx} turns.")
                 break
 
-            # Batched Producer + Dual-GPU Parallel TTS Pipeline when batch_size > 1 and brain supports batching
-            use_batch = batch_size > 1 and hasattr(self.brain, "generate_turns_batch") and hasattr(self.tts, "synthesize_batch_parallel")
+            # Batched Producer + Dual-GPU Parallel TTS Pipeline when batch_size > 1 and not in answering mode
+            use_batch = (
+                batch_size > 1
+                and not getattr(self.args, "answering_mode", False)
+                and hasattr(self.brain, "generate_turns_batch")
+                and hasattr(self.tts, "synthesize_batch_parallel")
+            )
             if use_batch:
                 remaining = self.args.turns - turn_idx
                 cur_batch_n = min(batch_size, remaining)
@@ -597,7 +607,10 @@ class CacophonyOrchestrator:
             if bounce_mode and prev_speaker and target:
                 print(f"  > [BOUNCE] {speaker.name} bouncing off {prev_speaker} ({bounce_mode}) regarding {target.name}'s point")
 
-            print(f"\n[Turn {turn_num} | Improvised | t={current_timeline_end:.1f}s] {speaker.name} ({speaker.voice_name}, speed={speaker.speed_ratio:.2f}x)...")
+            mode_tag = "Answering" if getattr(self.args, "answering_mode", False) else "Improvised"
+            print(f"\n[Turn {turn_num} | {mode_tag}: {speaker.name} -> {target.name if target else 'ALL'} | t={current_timeline_end:.1f}s] ({speaker.voice_name}, speed={speaker.speed_ratio:.2f}x)...")
+            stream_enabled = getattr(self.args, "stream", True)
+            allow_prosody = getattr(self.args, "allow_prosody_tags", True)
             utterance_text, diagnostic = _generate_turn_once(
                 self.brain,
                 speaker_name=speaker.name,
@@ -610,8 +623,8 @@ class CacophonyOrchestrator:
                 bounce_mode=bounce_mode,
                 narrative_hint=self.seed_topic,
                 max_tokens=250,
-                stream=False,
-                allow_prosody_tags=False,
+                stream=stream_enabled,
+                allow_prosody_tags=allow_prosody,
             )
             if diagnostic:
                 self.run_error = diagnostic
@@ -622,7 +635,7 @@ class CacophonyOrchestrator:
                 TransitionType.TURN_HOLD.value if turn_num == 1
                 else (TransitionType.INTERRUPTION.value if action_type == "interject" else TransitionType.INTERLEAVED_REPLY.value)
             )
-            if effective_engine in ("omnivoice", "omni", "fish_audio", "fish", "fish-s2") and not utterance_text.startswith("["):
+            if effective_engine in ("omnivoice", "omni", "fish_audio", "fish", "fish-s2"):
                 ann = self.smart_picker.annotate_turn(
                     clean_text=utterance_text,
                     speaker_name=speaker.name,
