@@ -133,3 +133,11 @@ audio.cpp/tools/finish_download.py
 /video-search-and-summarization
 audio.cpp/local.README.md
 *local.README.md
+
+# Cacophony run artefacts: generated audio, manifests and transcripts.
+cacophony_output/
+cacophony_test_run/
+
+# Reference voice WAVs the pipeline reads at runtime. Kept out of this public
+# repo for the same reason samples/ is: these are voice recordings, not source.
+voices-store/

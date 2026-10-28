@@ -10,6 +10,6 @@ export default defineConfig({
   server: {
     // `npm run dev` proxies to the python server so the UI can be developed
     // with hot reload while the real conversation runs behind it.
-    proxy: { '/api': { target: 'http://127.0.0.1:8750', changeOrigin: true } },
+    proxy: { '/api': { target: 'http://127.0.0.1:8753', changeOrigin: true } },
   },
 })

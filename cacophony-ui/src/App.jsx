@@ -1,16 +1,16 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 
 /* ------------------------------------------------------------------ */
-/* event stream                                                        */
+/* live run stream (SSE)                                               */
 /* ------------------------------------------------------------------ */
 
-function useCacophony() {
-  const [state, setState] = useState({
-    running: false, agents: [], seed: '', turns: [], speaking: null,
-    metrics: {}, artifact: [],
-  })
+function useRunStream() {
   const [connected, setConnected] = useState(false)
-  const [history, setHistory] = useState([]) // metrics samples for the trace
+  const [running, setRunning] = useState(false)
+  const [log, setLog] = useState([])
+  const [result, setResult] = useState(null)
+  const [runId, setRunId] = useState(null)
+  const [outDir, setOutDir] = useState(null)
 
   useEffect(() => {
     const es = new EventSource('/api/events')
@@ -19,257 +19,416 @@ function useCacophony() {
     es.onmessage = (e) => {
       let ev
       try { ev = JSON.parse(e.data) } catch { return }
-
-      // The server replays a snapshot on connect so a refresh mid-run does
-      // not land on an empty screen.
-      if (ev.kind === 'snapshot') { setState(ev.state); return }
-
-      setState((s) => {
-        const n = { ...s }
-        switch (ev.kind) {
-          case 'started': n.running = true; n.turns = []; n.speaking = null; break
-          case 'done': n.running = false; n.speaking = null; break
-          case 'agents': n.agents = ev.agents || []; break
-          case 'seed': n.seed = ev.text || ''; break
-          case 'said':
-            n.turns = [...s.turns, { turn: ev.turn, speaker: ev.speaker, text: ev.text, llm_s: ev.llm_s }]
-            break
-          case 'heard':
-            n.turns = s.turns.map((t) => t.turn === ev.turn
-              ? { ...t, heard: ev.text, misheard: ev.misheard, asr_s: ev.asr_s } : t)
-            break
-          case 'speaking': n.speaking = { speaker: ev.speaker, turn: ev.turn, duration: ev.duration }; break
-          case 'spoke': n.speaking = null; break
-          case 'metrics': n.metrics = ev.data || {}; break
-          case 'artifact': n.artifact = [...s.artifact, { speaker: ev.speaker, text: ev.text }]; break
-          default: break
-        }
-        return n
-      })
-
-      if (ev.kind === 'metrics' && ev.data) {
-        setHistory((h) => [...h.slice(-119), {
-          t: ev.t,
-          vram: ev.data.vram_used_mb || 0,
-          vramTotal: ev.data.vram_total_mb || 12288,
-          util: ev.data.gpu_util || 0,
-          ram: ev.data.ram_total_mb || 0,
-        }])
+      if (ev.kind === 'line') {
+        setLog((l) => [...l.slice(-1499), ev.text])
+      } else if (ev.kind === 'started') {
+        setRunning(true); setLog([]); setResult(null)
+        setRunId(ev.run_id); setOutDir(ev.out_dir)
+      } else if (ev.kind === 'done') {
+        setRunning(false); setResult(ev)
       }
     }
     return () => es.close()
   }, [])
-
-  return { state, connected, history }
+  return { connected, running, log, result, runId, outDir }
 }
 
 /* ------------------------------------------------------------------ */
-/* pieces                                                              */
+/* small ui pieces                                                     */
 /* ------------------------------------------------------------------ */
 
-const PALETTE = [
-  { ring: 'text-orange-400', bg: 'bg-orange-500/10', border: 'border-orange-500/40', dot: 'bg-orange-400', text: 'text-orange-300' },
-  { ring: 'text-cyan-400', bg: 'bg-cyan-500/10', border: 'border-cyan-500/40', dot: 'bg-cyan-400', text: 'text-cyan-300' },
-]
-
-function Avatar({ agent, idx, speaking, lastLine }) {
-  const c = PALETTE[idx % PALETTE.length]
-  const initials = (agent?.name || '?').slice(0, 2).toUpperCase()
+function Field({ label, children, hint }) {
   return (
-    <div className={`flex-1 rounded-2xl border ${c.border} ${speaking ? c.bg : 'bg-zinc-900/60'} p-5 transition-colors duration-300`}>
-      <div className="flex items-center gap-4">
-        <div className={`relative grid h-16 w-16 shrink-0 place-items-center rounded-full border-2 ${c.border} ${c.ring} ${speaking ? 'ring-speak' : ''}`}>
-          <span className={`text-lg font-semibold ${c.text}`}>{initials}</span>
-        </div>
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="truncate text-lg font-semibold text-zinc-100">{agent?.name || '—'}</span>
-            {speaking && (
-              <span className={`inline-flex items-center gap-1 rounded-full ${c.bg} px-2 py-0.5 text-[11px] font-medium ${c.text}`}>
-                <span className={`h-1.5 w-1.5 animate-pulse rounded-full ${c.dot}`} />speaking
-              </span>
-            )}
-          </div>
-          <div className="mt-0.5 truncate font-mono text-xs text-zinc-500">
-            {agent?.model} · voice {agent?.voice}
-          </div>
-        </div>
-      </div>
-      <p className="mt-4 line-clamp-3 min-h-[3.5rem] text-sm leading-relaxed text-zinc-400">
-        {lastLine || <span className="text-zinc-600">…</span>}
-      </p>
+    <label className="block">
+      <span className="mb-1 block text-[11px] font-medium uppercase tracking-wider text-zinc-500">{label}</span>
+      {children}
+      {hint && <span className="mt-1 block text-[11px] text-zinc-600">{hint}</span>}
+    </label>
+  )
+}
+
+const inputCls =
+  'w-full rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-1.5 text-sm text-zinc-100 outline-none ' +
+  'focus:border-cyan-600/60 focus:ring-1 focus:ring-cyan-600/40 disabled:opacity-40'
+
+const selectCls = inputCls + ' [&>option]:bg-zinc-900'
+
+function Section({ title, children }) {
+  return (
+    <div className="rounded-2xl border border-zinc-800 bg-zinc-950/60 p-4">
+      <h2 className="mb-3 text-xs font-semibold uppercase tracking-widest text-zinc-500">{title}</h2>
+      <div className="space-y-3">{children}</div>
     </div>
   )
 }
 
-function Sparkline({ points, max, className = '' }) {
-  if (!points.length) return <div className="h-10" />
-  const w = 240, h = 40
-  const d = points.map((v, i) => {
-    const x = (i / Math.max(1, points.length - 1)) * w
-    const y = h - (Math.min(v, max) / (max || 1)) * h
-    return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`
-  }).join(' ')
-  return (
-    <svg viewBox={`0 0 ${w} ${h}`} className={`h-10 w-full ${className}`} preserveAspectRatio="none">
-      <path d={`${d} L${w},${h} L0,${h} Z`} fill="currentColor" opacity="0.12" />
-      <path d={d} fill="none" stroke="currentColor" strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
-    </svg>
-  )
-}
+function PersonaRow({ p, globalEngine, engines, kokoroVoices, magpieVoices, cosyRefs, cosyBaked, onChange }) {
+  const engine = p.engine || ''
+  const effectiveEngine = engine || globalEngine || 'omnivoice'
+  const voiceOptions = useMemo(() => {
+    const base = [{ value: 'default', label: `default (${p.defaultVoice || 'preset'})` }]
+    if (effectiveEngine === 'omnivoice' || effectiveEngine === 'fish_audio')
+      return [
+        ...base,
+        ...cosyRefs.map((r) => ({ value: r.name, label: `${r.source === 'voices-store' ? 'store' : 'sample'} · ${r.name}` })),
+      ]
+    if (effectiveEngine === 'kokoro') return [...base, ...kokoroVoices.map((v) => ({ value: v, label: v }))]
+    if (effectiveEngine === 'magpie') return [...base, ...magpieVoices.map((v) => ({ value: v, label: v }))]
+    if (effectiveEngine === 'cosyvoice')
+      return [
+        ...base,
+        ...cosyRefs.map((r) => ({ value: r.name, label: `clone · ${r.name}` })),
+        ...cosyBaked.map((v) => ({ value: v, label: `baked · ${v}` })),
+      ]
+    return base
+  }, [effectiveEngine, p.defaultVoice, kokoroVoices, magpieVoices, cosyRefs, cosyBaked])
 
-function Meter({ label, value, sub, points, max, tone }) {
+  const voice = p.voice === '' ? 'default' : p.voice
   return (
-    <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
-      <div className="flex items-baseline justify-between">
-        <span className="text-xs font-medium uppercase tracking-wider text-zinc-500">{label}</span>
-        <span className="font-mono text-sm text-zinc-200">{value}</span>
+    <div className="rounded-xl border border-zinc-800/80 bg-zinc-900/40 p-3">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-sm font-semibold text-zinc-200">{p.name}</span>
+        <span className="font-mono text-[10px] text-zinc-600">#{p.index}</span>
       </div>
-      <div className={tone}><Sparkline points={points} max={max} /></div>
-      <div className="font-mono text-[11px] text-zinc-600">{sub}</div>
+      <div className="grid grid-cols-[1fr_1.4fr_64px] gap-2">
+        <select
+          className={selectCls}
+          value={engine}
+          onChange={(e) => onChange({ ...p, engine: e.target.value, voice: e.target.value === engine ? p.voice : '' })}
+        >
+          <option value="">inherit (global)</option>
+          {engines.map((en) => <option key={en} value={en}>{en}</option>)}
+        </select>
+        <select
+          className={selectCls}
+          value={voice}
+          onChange={(e) => onChange({ ...p, voice: e.target.value === 'default' ? '' : e.target.value })}
+        >
+          {voiceOptions.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+        </select>
+        <input
+          type="number" step="0.05" min="0.6" max="1.6"
+          className={inputCls} title="speaking pace"
+          value={p.speed}
+          onChange={(e) => onChange({ ...p, speed: parseFloat(e.target.value) || 1.0 })}
+        />
+      </div>
     </div>
   )
 }
 
-function Transcript({ turns, agents }) {
+function LogView({ log, result }) {
   const ref = useRef(null)
-  useEffect(() => { ref.current?.scrollTo({ top: ref.current.scrollHeight, behavior: 'smooth' }) }, [turns.length])
-  const idxOf = (name) => Math.max(0, agents.findIndex((a) => a.name === name))
+  useEffect(() => { ref.current?.scrollTo({ top: ref.current.scrollHeight }) }, [log.length])
   return (
-    <div ref={ref} className="h-full space-y-3 overflow-y-auto pr-1">
-      {turns.length === 0 && (
-        <p className="py-10 text-center text-sm text-zinc-600">waiting for the first turn…</p>
-      )}
-      {turns.map((t) => {
-        const c = PALETTE[idxOf(t.speaker) % PALETTE.length]
-        return (
-          <div key={t.turn} className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3">
-            <div className="flex items-center gap-2">
-              <span className={`h-2 w-2 rounded-full ${c.dot}`} />
-              <span className={`text-xs font-semibold ${c.text}`}>{t.speaker}</span>
-              <span className="font-mono text-[11px] text-zinc-600">#{t.turn}</span>
-              <span className="ml-auto font-mono text-[11px] text-zinc-600">
-                {t.llm_s != null && `llm ${t.llm_s}s`}{t.asr_s != null && ` · asr ${t.asr_s}s`}
-              </span>
-            </div>
-            <p className="mt-1.5 text-sm leading-relaxed text-zinc-200">{t.text}</p>
-            {/* The mishearing is the interesting part of a speech-to-speech loop:
-                it is what the *other* agent actually received. */}
-            {t.misheard && t.heard && (
-              <p className="mt-1.5 border-l-2 border-amber-500/40 pl-2 text-xs italic text-amber-300/70">
-                heard as: {t.heard}
-              </p>
-            )}
-          </div>
-        )
+    <div ref={ref} className="h-72 overflow-y-auto rounded-xl border border-zinc-800 bg-black/50 p-3 font-mono text-[11.5px] leading-relaxed">
+      {log.length === 0 && <p className="text-zinc-600">waiting for a run…</p>}
+      {log.map((line, i) => {
+        let cls = 'text-zinc-500'
+        if (line.startsWith('[ui]')) cls = 'text-zinc-600'
+        else if (line.includes('SUCCESS') || line.includes('[+]')) cls = 'text-emerald-400'
+        else if (line.startsWith('[Turn') || line.includes('] [')) cls = 'text-cyan-300'
+        else if (line.startsWith('  >')) cls = 'text-zinc-300'
+        else if (line.includes('[!]')) cls = 'text-amber-400'
+        return <div key={i} className={cls}>{line || '\u00a0'}</div>
       })}
     </div>
   )
 }
 
 /* ------------------------------------------------------------------ */
+/* main                                                                */
+/* ------------------------------------------------------------------ */
 
 export default function App() {
-  const { state, connected, history } = useCacophony()
+  const { connected, running, log, result, runId, outDir } = useRunStream()
+  const [opts, setOpts] = useState(null)
   const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
 
-  const vramPts = useMemo(() => history.map((h) => h.vram), [history])
-  const ramPts = useMemo(() => history.map((h) => h.ram), [history])
-  const utilPts = useMemo(() => history.map((h) => h.util), [history])
-  const m = state.metrics || {}
+  // form state
+  const [script, setScript] = useState('testbench')
+  const [seed, setSeed] = useState('')
+  const [model, setModel] = useState('openai/gpt-oss-120b:cheapest')
+  const [engineType, setEngineType] = useState('omnivoice')
+  const [numSpeakers, setNumSpeakers] = useState(5)
+  const [turns, setTurns] = useState(30)
+  const [durationSec, setDurationSec] = useState(180)
+  const [rt60, setRt60] = useState(0.2)
+  const [ramblers, setRamblers] = useState(false)
+  const [ramblerGain, setRamblerGain] = useState(-18)
+  const [gpuDevice, setGpuDevice] = useState(-1)
+  const [outDirName, setOutDirName] = useState('cacophony_output/ui_run')
+  const [personas, setPersonas] = useState([])
 
-  const lastBy = (name) => [...state.turns].reverse().find((t) => t.speaker === name)?.text
+  useEffect(() => {
+    fetch('/api/options')
+      .then((r) => r.json())
+      .then((o) => {
+        setOpts(o)
+        const d = o.defaults
+        setModel(d.model)
+        setEngineType(d.engine_type)
+        setNumSpeakers(d.num_speakers)
+        setTurns(d.turns)
+        setDurationSec(d.duration_sec)
+        setRt60(d.rt60)
+        setRamblerGain(d.rambler_gain_db)
+        setGpuDevice(d.gpu_device)
+        setOutDirName(d.out_dir)
+        const st = o.scripts[0]
+        setScript(st.id)
+        setSeed(st.seed)
+        setPersonas(o.personas.map((p) => {
+          const refStem = p.voice_ref_wav ? p.voice_ref_wav.split(/[\\/]/).pop().replace(/\.wav$/i, '') : p.voice_name
+          return {
+            index: p.index, name: p.name, engine: '', voice: '',
+            speed: d.engine_type === 'fish_audio' ? 1.0 : p.speed_ratio,
+            defaultVoice: d.engine_type === 'fish_audio' ? refStem : p.voice_name,
+          }
+        }))
+      })
+      .catch(() => setError('could not load options — is the python server running on :8753?'))
+  }, [])
+
+  const onScriptChange = (id) => {
+    setScript(id)
+    const s = (opts?.scripts || []).find((x) => x.id === id)
+    if (s) setSeed(s.seed)
+  }
+
+  const refsByName = useMemo(() => {
+    const m = {}
+    for (const r of opts?.cosyvoice_refs || []) m[r.name] = r
+    return m
+  }, [opts])
+
+  const buildPayload = () => {
+    const payload = {
+      script, model, engine_type: engineType, num_speakers: numSpeakers,
+      turns, duration_sec: durationSec, rt60, enable_ramblers: ramblers,
+      rambler_gain_db: ramblerGain, gpu_device: gpuDevice,
+      out_dir: outDirName, seed_topic: seed,
+    }
+    const overrides = []
+    for (const p of personas.slice(0, numSpeakers)) {
+      const defaultSpeed = opts?.personas[p.index]?.speed_ratio ?? 1.0
+      const hasSpeedChange = p.speed !== undefined && Math.abs(p.speed - defaultSpeed) > 0.001
+      if (!p.engine && !p.voice && !hasSpeedChange) continue // untouched -> preset defaults
+      const entry = { index: p.index }
+      if (p.engine) entry.engine = p.engine
+      const eng = p.engine || engineType
+      if (p.voice) {
+        entry.voice_name = p.voice
+        if ((eng === 'cosyvoice' || eng === 'fish_audio' || eng === 'omnivoice') && refsByName[p.voice]) {
+          entry.voice_ref = { wav: refsByName[p.voice].wav, text: refsByName[p.voice].text }
+        }
+      }
+      if (hasSpeedChange) {
+        entry.speed_ratio = p.speed
+      }
+      overrides.push(entry)
+    }
+    payload.personas = overrides
+    return payload
+  }
 
   const start = async () => {
-    setBusy(true)
+    setBusy(true); setError(null)
     try {
-      await fetch('/api/control', {
+      const resp = await fetch('/api/start', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cmd: 'start' }),
+        body: JSON.stringify(buildPayload()),
       })
+      const data = await resp.json()
+      if (!resp.ok) setError(data.error || 'start failed')
+    } catch (e) {
+      setError(String(e))
     } finally { setBusy(false) }
   }
 
+  const stop = async () => {
+    await fetch('/api/stop', { method: 'POST' })
+  }
+
+  const fileUrl = (p) => (p ? `/api/file?path=${encodeURIComponent(p.replace(/\\/g, '/'))}` : null)
+
   return (
     <div className="min-h-full bg-zinc-950 text-zinc-100">
-      <div className="mx-auto max-w-7xl p-6">
-
+      <div className="mx-auto max-w-[1500px] p-6">
         <header className="mb-6 flex flex-wrap items-center gap-4">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">
-              vault<span className="text-zinc-500">-</span>cacophony
-            </h1>
-            <p className="mt-0.5 text-sm text-zinc-500">
-              two local models talking to each other through speech
-            </p>
+          <div className="flex items-center gap-3">
+            <div className={`h-2.5 w-2.5 rounded-full ${connected ? 'bg-emerald-400' : 'bg-red-500'}`} />
+            <h1 className="text-2xl font-semibold tracking-tight">cacophony studio</h1>
           </div>
-          <div className="ml-auto flex items-center gap-3">
-            <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium ${
-              connected ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
-                        : 'border-zinc-700 bg-zinc-900 text-zinc-500'}`}>
-              <span className={`h-1.5 w-1.5 rounded-full ${connected ? 'animate-pulse bg-emerald-400' : 'bg-zinc-600'}`} />
-              {connected ? 'connected' : 'offline'}
-            </span>
+          <div className="flex items-center gap-2 text-xs">
+            {running ? (
+              <span className="inline-flex items-center gap-1.5 rounded-full bg-orange-500/10 px-3 py-1 font-medium text-orange-300">
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-orange-400" /> running{runId ? ` · ${runId}` : ''}
+              </span>
+            ) : (
+              <span className="rounded-full bg-zinc-800/80 px-3 py-1 text-zinc-400">idle</span>
+            )}
+            {outDir && <span className="font-mono text-zinc-600">{outDir}</span>}
+          </div>
+          <div className="ml-auto flex gap-2">
+            {running && (
+              <button onClick={stop} className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1.5 text-sm font-medium text-red-300 hover:bg-red-500/20">
+                stop
+              </button>
+            )}
             <button
               onClick={start}
-              disabled={busy || state.running}
-              className="rounded-lg bg-zinc-100 px-4 py-2 text-sm font-semibold text-zinc-900 transition hover:bg-white disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500"
+              disabled={busy || running || !opts}
+              className="rounded-lg bg-cyan-600 px-4 py-1.5 text-sm font-semibold text-white hover:bg-cyan-500 disabled:opacity-40"
             >
-              {state.running ? 'running…' : busy ? 'starting…' : 'Start conversation'}
+              {busy ? 'starting…' : running ? 'generating…' : 'generate conversation'}
             </button>
           </div>
         </header>
 
-        {state.seed && (
-          <div className="mb-5 rounded-xl border border-zinc-800 bg-zinc-900/40 px-4 py-3">
-            <span className="text-xs font-medium uppercase tracking-wider text-zinc-500">seed</span>
-            <p className="mt-1 text-sm text-zinc-300">{state.seed}</p>
-          </div>
+        {error && (
+          <div className="mb-4 rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-300">{error}</div>
         )}
 
-        <div className="mb-5 flex flex-col gap-4 sm:flex-row">
-          {(state.agents.length ? state.agents : [null, null]).map((a, i) => (
-            <Avatar
-              key={a?.name || i} agent={a} idx={i}
-              speaking={state.speaking?.speaker === a?.name}
-              lastLine={a ? lastBy(a.name) : null}
-            />
-          ))}
-        </div>
+        <div className="grid grid-cols-1 gap-6 xl:grid-cols-[430px_1fr]">
+          {/* ------------------------------ config ------------------------------ */}
+          <div className="space-y-4">
+            <Section title="story">
+              <Field label="script">
+                <select className={selectCls} value={script} onChange={(e) => onScriptChange(e.target.value)}>
+                  {(opts?.scripts || []).map((s) => <option key={s.id} value={s.id}>{s.label} ({s.id})</option>)}
+                </select>
+              </Field>
+              <Field label="seed topic" hint="first line of the conversation">
+                <textarea className={inputCls + ' h-20 resize-y'} value={seed} onChange={(e) => setSeed(e.target.value)} />
+              </Field>
+            </Section>
 
-        <div className="grid gap-5 lg:grid-cols-[1fr_320px]">
-          <section className="flex h-[46vh] flex-col rounded-2xl border border-zinc-800 bg-zinc-900/30 p-4 lg:h-[52vh]">
-            <h2 className="mb-3 text-xs font-medium uppercase tracking-wider text-zinc-500">transcript</h2>
-            <div className="min-h-0 flex-1">
-              <Transcript turns={state.turns} agents={state.agents} />
-            </div>
-          </section>
+            <Section title="brain & voice">
+              <Field label="HF model">
+                <select className={selectCls} value={model} onChange={(e) => setModel(e.target.value)}>
+                  {(opts?.models || []).map((m) => <option key={m} value={m}>{m}</option>)}
+                </select>
+              </Field>
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="tts engine">
+                  <select className={selectCls} value={engineType} onChange={(e) => setEngineType(e.target.value)}>
+                    {(opts?.engines || []).map((en) => <option key={en} value={en}>{en}</option>)}
+                  </select>
+                </Field>
+                <Field label="speakers">
+                  <select className={selectCls} value={numSpeakers} onChange={(e) => setNumSpeakers(parseInt(e.target.value))}>
+                    {(opts?.num_speakers || []).map((n) => <option key={n} value={n}>{n}</option>)}
+                  </select>
+                </Field>
+              </div>
+            </Section>
 
-          <aside className="space-y-4">
-            <Meter
-              label="VRAM" tone="text-violet-400"
-              value={m.vram_used_mb != null ? `${(m.vram_used_mb / 1024).toFixed(1)} GB` : '—'}
-              sub={m.vram_total_mb ? `of ${(m.vram_total_mb / 1024).toFixed(0)} GB` : ''}
-              points={vramPts} max={m.vram_total_mb || 12288}
-            />
-            <Meter
-              label="GPU" tone="text-emerald-400"
-              value={m.gpu_util != null ? `${m.gpu_util}%` : '—'}
-              sub={m.gpu_temp != null ? `${m.gpu_temp}°C` : ''}
-              points={utilPts} max={100}
-            />
-            <Meter
-              label="Stack RAM" tone="text-sky-400"
-              value={m.ram_total_mb != null ? `${(m.ram_total_mb / 1024).toFixed(1)} GB` : '—'}
-              sub={[m.crispasr && `crispasr ${m.crispasr}M`, m.llama_server && `llm ${m.llama_server}M`]
-                .filter(Boolean).join(' · ')}
-              points={ramPts} max={Math.max(4096, ...ramPts)}
-            />
-            <div className="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
-              <span className="text-xs font-medium uppercase tracking-wider text-zinc-500">turns</span>
-              <div className="mt-1 font-mono text-2xl text-zinc-100">{state.turns.length}</div>
-            </div>
-          </aside>
+            <Section title="timing & room">
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="max turns">
+                  <input type="number" min="1" className={inputCls} value={turns} onChange={(e) => setTurns(parseInt(e.target.value) || 1)} />
+                </Field>
+                <Field label="duration (s)">
+                  <input type="number" min="10" className={inputCls} value={durationSec} onChange={(e) => setDurationSec(parseFloat(e.target.value) || 0)} />
+                </Field>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="rt60 (s)">
+                  <input type="number" step="0.05" min="0" className={inputCls} value={rt60} onChange={(e) => setRt60(parseFloat(e.target.value) || 0)} />
+                </Field>
+                <Field label="gpu device">
+                  <input type="number" className={inputCls} value={gpuDevice} onChange={(e) => setGpuDevice(Number.isNaN(parseInt(e.target.value, 10)) ? -1 : parseInt(e.target.value, 10))} />
+                </Field>
+              </div>
+              <div className="flex items-center gap-3">
+                <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-300">
+                  <input type="checkbox" className="h-4 w-4 accent-cyan-600" checked={ramblers} onChange={(e) => setRamblers(e.target.checked)} />
+                  background ramblers
+                </label>
+                <Field label="gain dB">
+                  <input type="number" className={inputCls + ' !w-24'} disabled={!ramblers} value={ramblerGain} onChange={(e) => setRamblerGain(parseFloat(e.target.value) || 0)} />
+                </Field>
+              </div>
+            </Section>
+
+            <Section title="output">
+              <Field label="output dir" hint="relative to the repo root">
+                <input className={inputCls} value={outDirName} onChange={(e) => setOutDirName(e.target.value)} />
+              </Field>
+            </Section>
+
+            <Section title="voices per persona">
+              <p className="mb-2 -mt-1 text-[11px] text-zinc-600">
+                pick an engine and voice for each speaker; <span className="text-zinc-400">inherit</span> uses the global engine.
+              </p>
+              <div className="space-y-2">
+                {personas.slice(0, numSpeakers).map((p) => (
+                  <PersonaRow
+                    key={p.index} p={p}
+                    globalEngine={engineType}
+                    engines={opts?.engines || []}
+                    kokoroVoices={opts?.kokoro_voices || []}
+                    magpieVoices={opts?.magpie_voices || []}
+                    cosyRefs={opts?.cosyvoice_refs || []}
+                    cosyBaked={opts?.cosyvoice_baked || []}
+                    onChange={(np) => setPersonas((ps) => ps.map((x) => (x.index === np.index ? np : x)))}
+                  />
+                ))}
+              </div>
+            </Section>
+          </div>
+
+          {/* ------------------------------ results ------------------------------ */}
+          <div className="space-y-4">
+            <Section title="console">
+              <LogView log={log} result={result} />
+            </Section>
+
+            {result && (
+              <>
+                <Section title="output">
+                  <div className="flex flex-wrap items-center gap-3 text-sm">
+                    <span className={`rounded-full px-3 py-1 font-medium ${result.run_status?.status === 'partial' ? 'bg-amber-500/10 text-amber-300' : result.code === 0 ? 'bg-emerald-500/10 text-emerald-300' : 'bg-red-500/10 text-red-300'}`}>
+                      {result.run_status?.status === 'partial'
+                        ? `partial · ${result.run_status.completed_turns}/${result.run_status.requested_turns} turns`
+                        : result.code === 0 ? 'success' : `exit ${result.code}`}
+                    </span>
+                    <span className="font-mono text-xs text-zinc-500">{result.out_dir}</span>
+                    <div className="ml-auto flex gap-2">
+                      {result.master_wav && (
+                        <a className="rounded-lg border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:border-cyan-600/60" href={fileUrl(result.master_wav)} download>
+                          download wav
+                        </a>
+                      )}
+                      {result.transcript && (
+                        <a className="rounded-lg border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:border-cyan-600/60" href={fileUrl(result.transcript)} download>
+                          transcript
+                        </a>
+                      )}
+                      {result.manifest && (
+                        <a className="rounded-lg border border-zinc-700 px-3 py-1 text-xs text-zinc-300 hover:border-cyan-600/60" href={fileUrl(result.manifest)} download>
+                          manifest
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                  {result.master_wav && (
+                    <audio controls className="mt-3 w-full" src={fileUrl(result.master_wav)} />
+                  )}
+                </Section>
+
+                {result.transcript_text && (
+                  <Section title="transcript">
+                    <pre className="max-h-96 overflow-y-auto whitespace-pre-wrap rounded-xl border border-zinc-800 bg-black/40 p-3 font-mono text-xs leading-relaxed text-zinc-300">
+                      {result.transcript_text}
+                    </pre>
+                  </Section>
+                )}
+              </>
+            )}
+          </div>
         </div>
       </div>
     </div>
