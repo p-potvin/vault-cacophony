@@ -210,8 +210,13 @@ def resolve_language_pair(source: str, target: str) -> Tuple[str, str, str]:
         src_name, tgt_name = RIVA_LANGUAGE_PAIRS[base_tag]
         return base_tag, src_name, tgt_name
 
-    # Fallback to direct pair for Riva v2
-    return tag, s.upper(), t.upper()
+    if s_base != "en" and t_base != "en":
+        raise ValueError(
+            f"Unsupported language pair: '{source}' -> '{target}'. "
+            "Riva-Translate-4B requires English on either the source or target side."
+        )
+
+    raise ValueError(f"Language pair not found in Riva registry: '{source}' -> '{target}'")
 
 
 def build_riva_messages(lang_pair_code: str, text: str, context: Optional[str] = None) -> List[Dict[str, str]]:

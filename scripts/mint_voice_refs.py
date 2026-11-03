@@ -46,6 +46,40 @@ RATE = 24000
 # the reference stays a reference. Qwen3-TTS clones from about three seconds.
 MIN_REF_S, MAX_REF_S = 3.0, 8.0
 
+ALL_PERSONAPLEX_VOICES = (
+    [f"NATF{i}" for i in range(4)]
+    + [f"NATM{i}" for i in range(4)]
+    + [f"VARF{i}" for i in range(5)]
+    + [f"VARM{i}" for i in range(5)]
+)
+
+
+def default_seed_wav() -> str | None:
+    vs = os.path.join(REPO, "voices-store")
+    preferred = os.path.join(vs, "normal-male-slightly-faster-cadence.wav")
+    if os.path.exists(preferred):
+        return preferred
+    if os.path.isdir(vs):
+        for fn in sorted(os.listdir(vs)):
+            if fn.lower().endswith(".wav"):
+                return os.path.join(vs, fn)
+    return None
+
+
+def ensure_personaplex_downloaded(download_if_missing: bool) -> None:
+    model_dir = os.path.join(AUDIOCPP, PP_MODEL)
+    gguf_path = os.path.join(model_dir, "personaplex-7b-v1-q4_k.gguf")
+    if os.path.exists(gguf_path):
+        return
+    if not download_if_missing:
+        raise SystemExit(
+            f"  missing PersonaPlex GGUF at {gguf_path}\n"
+            "  pass --download-if-missing or run:\n"
+            "    hf download nvidia/personaplex-7b-v1-gguf --local-dir audio.cpp/models/PersonaPlex-GGUF"
+        )
+    print(f"  [*] Downloading nvidia/personaplex-7b-v1-gguf -> {model_dir} ...", flush=True)
+    run(["hf", "download", "nvidia/personaplex-7b-v1-gguf", "--local-dir", model_dir], "hf download personaplex")
+
 
 def run(args, what, cwd=None):
     proc = subprocess.run(args, cwd=cwd, capture_output=True, text=True,
@@ -68,15 +102,27 @@ def duration(path):
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="Mint clone references from PersonaPlex voices")
-    ap.add_argument("--seed", required=True, help="something for PersonaPlex to answer")
-    ap.add_argument("--voice", action="append", required=True,
+    ap.add_argument("--seed", default=None, help="something for PersonaPlex to answer (defaults to voices-store sample)")
+    ap.add_argument("--voice", action="append", default=[],
                     help="packaged voice id, repeatable (NATF0-3, NATM0-3, VARF0-4, VARM0-4)")
+    ap.add_argument("--all-voices", action="store_true",
+                    help="mint all 18 packaged PersonaPlex voices (NATF0-3, NATM0-3, VARF0-4, VARM0-4)")
+    ap.add_argument("--download-if-missing", action="store_true",
+                    help="download nvidia/personaplex-7b-v1-gguf if not present in audio.cpp/models/PersonaPlex-GGUF")
     ap.add_argument("--out", default=os.path.join(REPO, "samples", "voice-refs"))
     ap.add_argument("--reply-window", type=float, default=20.0)
     ap.add_argument("--prompt", default="Say one short, ordinary sentence about the weather, "
                                         "then stop talking.")
     args = ap.parse_args()
 
+    voices = list(ALL_PERSONAPLEX_VOICES) if args.all_voices else list(args.voice)
+    if not voices:
+        raise SystemExit("  pass --all-voices or at least one --voice <ID>")
+    seed = args.seed or default_seed_wav()
+    if not seed or not os.path.exists(seed):
+        raise SystemExit("  pass --seed <path-to-wav>")
+
+    ensure_personaplex_downloaded(args.download_if_missing)
     for path in (PP_CLI, ASR_CLI):
         if not os.path.exists(path):
             raise SystemExit(f"  missing: {path}")
@@ -87,14 +133,14 @@ def main():
     # PersonaPlex answers *into* trailing silence, and its output is as long as
     # its input, so the room to reply has to be added up front.
     padded = os.path.join(work, "seed.padded.wav")
-    run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", args.seed,
+    run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", seed,
          "-af", f"apad=pad_dur={args.reply_window}", "-ac", "1", "-ar", str(RATE), padded],
         "pad seed")
-    heard = duration(args.seed)
+    heard = duration(seed)
 
-    print(f"\n  minting {len(args.voice)} voice reference(s) into {args.out}\n")
+    print(f"\n  minting {len(voices)} voice reference(s) into {args.out}\n")
     minted = []
-    for voice in args.voice:
+    for voice in voices:
         raw = os.path.join(work, f"{voice}.raw.wav")
         wav = os.path.join(args.out, f"{voice}.wav")
         txt = os.path.join(args.out, f"{voice}.txt")

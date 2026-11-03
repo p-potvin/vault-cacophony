@@ -70,7 +70,10 @@ function PersonaRow({ p, globalEngine, engines, kokoroVoices, magpieVoices, cosy
     if (effectiveEngine === 'omnivoice' || effectiveEngine === 'fish_audio')
       return [
         ...base,
-        ...cosyRefs.map((r) => ({ value: r.name, label: `${r.source === 'voices-store' ? 'store' : 'sample'} · ${r.name}` })),
+        ...cosyRefs.map((r) => ({
+          value: r.name,
+          label: `${r.source === 'voices-store' ? 'store' : r.source === 'personaplex' ? 'personaplex' : 'sample'} · ${r.name}`,
+        })),
       ]
     if (effectiveEngine === 'kokoro') return [...base, ...kokoroVoices.map((v) => ({ value: v, label: v }))]
     if (effectiveEngine === 'magpie') return [...base, ...magpieVoices.map((v) => ({ value: v, label: v }))]
@@ -153,6 +156,10 @@ export default function App() {
   const [engineType, setEngineType] = useState('omnivoice')
   const [numSpeakers, setNumSpeakers] = useState(5)
   const [turns, setTurns] = useState(30)
+  const [batchSize, setBatchSize] = useState(8)
+  const [answeringMode, setAnsweringMode] = useState(false)
+  const [streamTokens, setStreamTokens] = useState(true)
+  const [allowProsodyTags, setAllowProsodyTags] = useState(true)
   const [durationSec, setDurationSec] = useState(180)
   const [rt60, setRt60] = useState(0.2)
   const [ramblers, setRamblers] = useState(false)
@@ -160,6 +167,7 @@ export default function App() {
   const [gpuDevice, setGpuDevice] = useState(-1)
   const [outDirName, setOutDirName] = useState('cacophony_output/ui_run')
   const [personas, setPersonas] = useState([])
+  const [playingVoice, setPlayingVoice] = useState(null)
 
   useEffect(() => {
     fetch('/api/options')
@@ -171,6 +179,10 @@ export default function App() {
         setEngineType(d.engine_type)
         setNumSpeakers(d.num_speakers)
         setTurns(d.turns)
+        if (d.batch_size !== undefined) setBatchSize(d.batch_size)
+        if (d.answering_mode !== undefined) setAnsweringMode(d.answering_mode)
+        if (d.stream !== undefined) setStreamTokens(d.stream)
+        if (d.allow_prosody_tags !== undefined) setAllowProsodyTags(d.allow_prosody_tags)
         setDurationSec(d.duration_sec)
         setRt60(d.rt60)
         setRamblerGain(d.rambler_gain_db)
@@ -206,7 +218,9 @@ export default function App() {
   const buildPayload = () => {
     const payload = {
       script, model, engine_type: engineType, num_speakers: numSpeakers,
-      turns, duration_sec: durationSec, rt60, enable_ramblers: ramblers,
+      turns, batch_size: batchSize, answering_mode: answeringMode,
+      stream: streamTokens, allow_prosody_tags: allowProsodyTags,
+      duration_sec: durationSec, rt60, enable_ramblers: ramblers,
       rambler_gain_db: ramblerGain, gpu_device: gpuDevice,
       out_dir: outDirName, seed_topic: seed,
     }
@@ -323,6 +337,31 @@ export default function App() {
                   </select>
                 </Field>
               </div>
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="batch size" hint={answeringMode ? '1 turn (answering mode)' : 'turns per HF + TTS batch'}>
+                  <input
+                    type="number" min="1" max="16"
+                    className={inputCls}
+                    disabled={answeringMode}
+                    value={answeringMode ? 1 : batchSize}
+                    onChange={(e) => setBatchSize(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                  />
+                </Field>
+                <div className="flex flex-col justify-center gap-1.5 pt-3">
+                  <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
+                    <input type="checkbox" className="h-3.5 w-3.5 accent-cyan-600" checked={answeringMode} onChange={(e) => setAnsweringMode(e.target.checked)} />
+                    in-character answering
+                  </label>
+                  <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
+                    <input type="checkbox" className="h-3.5 w-3.5 accent-cyan-600" checked={streamTokens} onChange={(e) => setStreamTokens(e.target.checked)} />
+                    stream HF tokens
+                  </label>
+                  <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-300">
+                    <input type="checkbox" className="h-3.5 w-3.5 accent-cyan-600" checked={allowProsodyTags} onChange={(e) => setAllowProsodyTags(e.target.checked)} />
+                    inline prosody tags
+                  </label>
+                </div>
+              </div>
             </Section>
 
             <Section title="timing & room">
@@ -382,6 +421,58 @@ export default function App() {
 
           {/* ------------------------------ results ------------------------------ */}
           <div className="space-y-4">
+            <Section title={`voice audition shelf (${(opts?.cosyvoice_refs || []).length})`}>
+              <p className="-mt-1 text-[11px] text-zinc-500">
+                click any enrolled reference voice (`voices-store`, `samples/voices`, or minted `personaplex` clips) to audition before assigning to a persona.
+              </p>
+              {playingVoice && (
+                <div className="flex items-center gap-3 rounded-xl border border-cyan-800/50 bg-cyan-950/20 px-3 py-2">
+                  <span className="font-mono text-xs text-cyan-300">{playingVoice}</span>
+                  <audio
+                    controls
+                    autoPlay
+                    className="h-8 flex-1"
+                    src={`/api/voice-preview?name=${encodeURIComponent(playingVoice)}`}
+                  />
+                </div>
+              )}
+              <div className="grid max-h-56 grid-cols-1 gap-2 overflow-y-auto pr-1 sm:grid-cols-2 lg:grid-cols-3">
+                {(opts?.cosyvoice_refs || []).map((r) => {
+                  const active = playingVoice === r.name
+                  const badgeCls =
+                    r.source === 'personaplex'
+                      ? 'bg-purple-500/15 text-purple-300 border-purple-500/30'
+                      : r.source === 'voices-store'
+                      ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30'
+                      : 'bg-zinc-800 text-zinc-400 border-zinc-700'
+                  return (
+                    <button
+                      key={r.name}
+                      type="button"
+                      onClick={() => setPlayingVoice(active ? null : r.name)}
+                      className={`flex flex-col items-start gap-1 rounded-xl border p-2.5 text-left transition ${
+                        active
+                          ? 'border-cyan-500/60 bg-cyan-950/30'
+                          : 'border-zinc-800/80 bg-zinc-900/40 hover:border-zinc-700'
+                      }`}
+                    >
+                      <div className="flex w-full items-center justify-between gap-2">
+                        <span className="truncate font-mono text-xs font-medium text-zinc-200">{r.name}</span>
+                        <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[9px] uppercase ${badgeCls}`}>
+                          {r.source}
+                        </span>
+                      </div>
+                      {r.text && (
+                        <span className="line-clamp-1 text-[11px] text-zinc-500" title={r.text}>
+                          “{r.text}”
+                        </span>
+                      )}
+                    </button>
+                  )
+                })}
+              </div>
+            </Section>
+
             <Section title="console">
               <LogView log={log} result={result} />
             </Section>
