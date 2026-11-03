@@ -348,6 +348,7 @@ class SmartVocalPicker:
             prosody=prosody,
             pause_prob=throat_cfg.clause_break_pause_prob,
         )
+        utt.emotion = emotion
         injected_fillers += [t.word for t in utt.tokens if isinstance(t, sm.Filler)]
 
         # 3. A mid-utterance sigh at a clause pause.

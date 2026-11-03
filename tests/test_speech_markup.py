@@ -398,3 +398,71 @@ def test_personaplex_download_follows_the_model_spec():
     assert package["id"] == next(p["id"] for p in spec["packages"] if p.get("default"))
     assert all(Path(f).parent.name == "PersonaPlex-GGUF" for f in package["local_files"])
     assert any(f.endswith("personaplex-7b-v1-q4_k.gguf") for f in package["local_files"])
+
+
+# -- Devin review, PR #30 -------------------------------------------------------------
+
+def test_ssml_fragments_and_broken_markup_never_reach_plain_engines():
+    assert sm.sanitize_for_engine('Wait <break time="300ms"/> now', "kokoro") == "Wait... now"
+    assert sm.sanitize_for_engine('Wait <break time="300ms"> now', "kokoro") == "Wait now"
+    assert sm.sanitize_for_engine("x < y and y > z", "kokoro") == "x < y and y > z"
+
+
+def test_scoped_prosody_is_not_widened_to_the_whole_line():
+    whole = sm.parse_any('<speak><prosody rate="120%">A B C</prosody></speak>')
+    assert whole.prosody.rate == pytest.approx(1.2)
+    nested = sm.parse_any('<speak><prosody rate="120%">A <prosody rate="50%">B</prosody> C</prosody></speak>')
+    assert nested.prosody.rate == pytest.approx(1.2) and nested.words() == "A B C"
+    partial = sm.parse_any('<speak>A <prosody rate="50%">B</prosody> C</speak>')
+    assert partial.prosody.rate == 1.0 and partial.words() == "A B C"
+
+
+def test_emotion_coordinates_survive_ssml():
+    from cacophony.vocal_habits import SmartVocalPicker
+
+    ann = SmartVocalPicker(bridge=_FixedToneBridge(), seed=0).annotate_turn(
+        "[worried] The pressure is still climbing.", "KAI", engine_type="ssml")
+    back = sm.parse_ssml(ann.ssml)
+    assert back.emotion == sm.TONE_EMOTION["worried"]
+    assert ann.markup["emotion"]["arousal"] == sm.TONE_EMOTION["worried"].arousal
+
+
+def test_hand_set_prosody_survives_rederivation(tmp_path):
+    import prosody
+    import voices
+
+    sr = 16000
+    audio = np.concatenate([_syllables(8), np.zeros(int(0.5 * sr)), _syllables(8)]).astype(np.float32)
+    vec = np.random.default_rng(1).normal(size=512).astype(np.float32)
+    with voices.VoiceStore(str(tmp_path / "v.db")) as store:
+        obs = store.observe(vec, label="X", speech_seconds=len(audio) / sr, metrics=prosody.measure(audio))
+        store.enroll("X", vec, observation_id=obs)
+        derived_long = store.derive_prosody("X")["pauses"]["long_ms"]
+        assert derived_long != 2000
+        store.set_prosody("X", {"pauses": {"long_ms": 2000}})
+        again = store.derive_prosody("X")
+        assert again["pauses"]["long_ms"] == 2000
+        assert again["overrides"] == {"pauses": {"long_ms": 2000}}
+        assert again["pauses"]["medium_ms"] and again["measured"]["observations"] == 1
+
+
+def test_startup_sync_keeps_edited_habits(tmp_path, monkeypatch):
+    import voices
+    from cacophony import habit_profiles
+    from cacophony.raggae_bridge import sync_custom_voices_to_store
+
+    path = str(tmp_path / "v.db")
+    monkeypatch.setenv(habit_profiles.VOICE_STORE_ENV, path)
+    voice = "normal-male-slightly-faster-cadence"
+    sync_custom_voices_to_store(store_path=path)
+    with voices.VoiceStore(path) as store:
+        edited = store.get_habits(voice)
+        edited["filler_rate"] = 0.11
+        store.set_habits(voice, edited)
+
+    sync_custom_voices_to_store(store_path=path)  # what every orchestrator start does
+    assert habit_profiles.resolve_profile("KAI", voice).filler_rate == 0.11
+
+    sync_custom_voices_to_store(store_path=path, overwrite_habits=True)
+    builtin = habit_profiles.builtin_profiles()["KAI"].filler_rate
+    assert habit_profiles.resolve_profile("KAI", voice).filler_rate == builtin

@@ -40,7 +40,8 @@ describe delivery, so it can be handed to any synthesiser rather than only ours:
     measured    the aggregates `derive_prosody` computed from the observations
 
 `baseline`, `pauses` and `disfluency` may be set by hand or derived; `measured`
-is only ever derived, so it is always traceable to evidence.
+is only ever derived, so it is always traceable to evidence. Hand-set values are
+also kept under `overrides` and win over every later derivation.
 
 Thresholds come from measurement, not taste. Over 24 clips from 6 LibriSpeech
 speakers this embedder scores 0.808 mean cosine within a speaker and 0.124
@@ -298,16 +299,25 @@ class VoiceStore:
             return None
         return data or None
 
-    def set_prosody(self, name, prosody, merge=True):
-        """Store a prosody document. With `merge`, top-level sections are updated, not replaced wholesale."""
+    def set_prosody(self, name, prosody, merge=True, manual=True):
+        """Store a prosody document. With `merge`, top-level sections are updated, not replaced wholesale.
+
+        Values set with `manual` (the default: anything a person or caller sets
+        on purpose) are also recorded under `overrides`, and every later
+        derivation lays them back over what it measured -- so re-enrolling a
+        voice refreshes `measured` without undoing a hand-tuned pause length.
+        """
         if self.db.execute("SELECT 1 FROM voice WHERE name = ?", (name,)).fetchone() is None:
             raise KeyError(f"no voice {name!r}")
+        incoming = {k: v for k, v in (prosody or {}).items() if k != "overrides"}
         current = (self.get_prosody(name) or {}) if merge else {}
-        for key, value in (prosody or {}).items():
-            if merge and isinstance(value, dict) and isinstance(current.get(key), dict):
-                current[key] = {**current[key], **value}
-            else:
-                current[key] = value
+        overrides = _deep_merge(current.get("overrides") or {}, incoming) if manual else current.get("overrides") or {}
+        for key in ("measured", "derived", "standard"):
+            overrides.pop(key, None)  # evidence and bookkeeping are never hand-set
+        current = _deep_merge(current, incoming) if merge else dict(incoming)
+        current = _deep_merge(current, overrides)
+        if overrides:
+            current["overrides"] = overrides
         current.setdefault("standard", PROSODY_STANDARD)
         self.db.execute("UPDATE voice SET prosody = ?, updated = ? WHERE name = ?",
                         (json.dumps(current, ensure_ascii=False), _stamp(), name))
@@ -332,7 +342,7 @@ class VoiceStore:
             (json.loads(r["metrics"]), float(r["speech_seconds"] or 0.0)) for r in rows if r["metrics"]],
             ref_text=voice["ref_text"] or "")
         if save and derived:
-            return self.set_prosody(name, derived)
+            return self.set_prosody(name, derived, manual=False)
         return derived
 
     def prosody_summary(self, name):
@@ -483,6 +493,17 @@ PROSODY_STANDARD = {"markup": "SSML 1.1", "emotion": "EmotionML 1.0 (PAD)"}
 # rate="110%" is relative to the engine's default.
 REFERENCE_ARTICULATION_SPS = 5.0
 _FILLED = ("uh", "um", "er", "erm", "uhm")
+
+
+def _deep_merge(base, extra):
+    """`extra` laid over `base`, one level of sections deep (prosody documents are two levels)."""
+    out = dict(base or {})
+    for key, value in (extra or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = {**out[key], **value}
+        else:
+            out[key] = value
+    return out
 
 
 def _weighted(values):

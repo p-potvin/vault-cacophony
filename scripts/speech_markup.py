@@ -223,6 +223,9 @@ class Utterance:
     tone: str = ""
     prosody: Prosody = field(default_factory=Prosody)
     lang: str = "en-US"
+    # The EmotionML coordinates the prosody was derived from, kept so the
+    # canonical record says *why* the baseline moved, not only that it did.
+    emotion: Optional[Emotion] = None
 
     # -- building ----------------------------------------------------------
 
@@ -251,6 +254,7 @@ class Utterance:
             "tone": self.tone,
             "lang": self.lang,
             "prosody": asdict(self.prosody),
+            "emotion": asdict(self.emotion) if self.emotion else None,
             "tokens": [{"type": type(t).__name__.lower(), **asdict(t)} for t in self.tokens],
         }
 
@@ -260,6 +264,9 @@ class Utterance:
         body = []
         if self.tone:
             body.append(f"<mark name={quoteattr('tone:' + self.tone)}/>")
+        if self.emotion is not None:
+            e = self.emotion
+            body.append(f'<mark name="emotion:arousal={e.arousal:g};valence={e.valence:g};dominance={e.dominance:g}"/>')
         for t in self.tokens:
             if isinstance(t, Text):
                 body.append(escape(t.text))
@@ -319,10 +326,22 @@ def parse_ssml(ssml: str) -> Utterance:
                     return
         utt.add(Text(chunk))
 
+    # An Utterance has one prosody for the whole line. A <prosody> is applied
+    # only when it spans the whole line (the only child of <speak>, nothing
+    # outside it); a scoped one around part of the line is descended for its
+    # words but its attributes are dropped, because widening a local change
+    # to every word would be worse than not making it.
+    whole_line = None
+    children = list(root)
+    if (len(children) == 1 and _local(children[0].tag) == "prosody"
+            and not (root.text or "").strip() and not (children[0].tail or "").strip()):
+        whole_line = children[0]
+
     def walk(node: ET.Element) -> None:
         name = _local(node.tag)
         if name == "prosody":
-            utt.prosody = utt.prosody.combine(Prosody.from_ssml_attrs(node.attrib))
+            if node is whole_line:
+                utt.prosody = Prosody.from_ssml_attrs(node.attrib)
             text(node.text)
             for child in node:
                 walk(child)
@@ -342,6 +361,13 @@ def parse_ssml(ssml: str) -> Utterance:
             kind, _, value = mark.partition(":")
             if kind == "tone":
                 utt.tone = value
+            elif kind == "emotion":
+                dims = dict(part.split("=", 1) for part in value.split(";") if "=" in part)
+                try:
+                    utt.emotion = Emotion(**{k: float(v) for k, v in dims.items()
+                                             if k in ("arousal", "valence", "dominance")})
+                except ValueError:
+                    pass
             elif kind == "vocal":
                 utt.add(Vocal(value))
             elif kind == "filler":
@@ -421,11 +447,23 @@ def parse_tagged(text: str, known_tones: Iterable[str] = ()) -> Utterance:
     return out
 
 
+_XML_TAG = re.compile(r"</?[A-Za-z][\w:.-]*(?:\s[^<>]*)?/?>")
+
+
 def parse_any(text: str, known_tones: Iterable[str] = ()) -> Utterance:
-    stripped = text.lstrip()
-    if stripped.startswith("<speak"):
-        return parse_ssml(stripped)
-    return parse_tagged(text, known_tones)
+    """SSML (a full <speak> document or a bare fragment), or bracket-tagged text, to an Utterance.
+
+    Markup that will not parse as SSML is not trusted to be harmless: its tags
+    are stripped and the remaining text read as bracket-tagged text.
+    """
+    stripped = text.strip()
+    if _XML_TAG.search(stripped):
+        doc = stripped if stripped.startswith("<speak") else f'<speak xmlns="{SSML_NS}">{stripped}</speak>'
+        try:
+            return parse_ssml(doc)
+        except ET.ParseError:
+            stripped = _XML_TAG.sub(" ", stripped)
+    return parse_tagged(stripped, known_tones)
 
 
 # --------------------------------------------------------------------------
@@ -529,7 +567,7 @@ def sanitize_for_engine(text: str, engine: Optional[str], known_tones: Iterable[
         return text
     if dialect_for(engine) == "ssml" and text.lstrip().startswith("<speak"):
         return text
-    if "<speak" not in text and "[" not in text and "*" not in text and dialect_for(engine) != "ssml":
+    if not any(c in text for c in "[*<") and dialect_for(engine) != "ssml":
         return re.sub(r"\s+", " ", text).strip()
     return render(parse_any(text, known_tones), engine)
 

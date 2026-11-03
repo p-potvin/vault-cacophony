@@ -67,8 +67,15 @@ from schema 1):
 ```
 
 `measured` is only ever computed from observations; the other sections may be
-derived or set by hand, and hand-set sections are left alone by later
-derivations. Disfluency is derived from the voice's reference transcript when it
+derived or set by hand. Hand-set values are also recorded under `overrides`
+and laid back over every later derivation, so re-enrolling a voice refreshes
+the measurements without undoing a tuned pause length. Each turn's SSML also
+carries its EmotionML coordinates as
+`<mark name="emotion:arousal=…;valence=…;dominance=…"/>`.
+
+Habits stored against a voice are never overwritten by the startup sync
+(`sync_custom_voices_to_store` only fills voices that have none); pass
+`overwrite_habits=True` to reset them to the built-ins. Disfluency is derived from the voice's reference transcript when it
 has one with enough words.
 
 ```bash
@@ -108,6 +115,12 @@ automatically.
   length and filler rate when the store has them.
 
 ## Limits
+
+An `Utterance` has one prosody for the whole line. Incoming SSML whose
+`<prosody>` covers only part of a line keeps its words but drops that local
+rate/pitch change rather than widening it to the whole line. Bare SSML
+fragments (`Wait <break time="300ms"/> now`) are parsed as SSML; markup that
+does not parse is stripped before it can reach an engine.
 
 A cascade only *simulates* disfluency: these are statistically plausible
 hesitations, not ones caused by actually planning speech in real time. The PAD

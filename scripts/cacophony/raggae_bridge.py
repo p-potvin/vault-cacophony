@@ -156,8 +156,18 @@ class RaggaeBridge:
         return results
 
 
-def sync_custom_voices_to_store(store_path: Optional[str] = None, embed_audio: bool = False) -> List[str]:
-    """Ensure the 5 core custom reference voices and their VocalHabitProfiles exist in voices.db."""
+def sync_custom_voices_to_store(
+    store_path: Optional[str] = None,
+    embed_audio: bool = False,
+    overwrite_habits: bool = False,
+) -> List[str]:
+    """Ensure the 5 core custom reference voices and their VocalHabitProfiles exist in voices.db.
+
+    Habits already stored against a voice are left alone unless
+    `overwrite_habits` is set: the store is where a profile is edited, and this
+    runs at every orchestrator start, so writing the built-ins each time would
+    undo every edit before it could be used.
+    """
     vs_dir = REPO_DIR / "voices-store"
     samples_dir = REPO_DIR / "samples" / "voices"
     custom_roster = [
@@ -185,6 +195,8 @@ def sync_custom_voices_to_store(store_path: Optional[str] = None, embed_audio: b
             ref_text = txt_path.read_text(encoding="utf-8", errors="replace").strip() if txt_path.exists() else ""
             prof = profiles.get(persona_name) or profiles.get(voice_name)
             habits_dict = prof.to_dict() if prof else {}
+            if not overwrite_habits and store.get_habits(voice_name):
+                habits_dict = None  # keep what the store has
 
             if embedder is not None and wav_path.exists():
                 emb_obj, _, prosody_mod = embedder
@@ -230,12 +242,22 @@ def sync_custom_voices_to_store(store_path: Optional[str] = None, embed_audio: b
                     synced.append(voice_name)
                     continue
 
-            store.set_habits(
-                voice_name,
-                habits=habits_dict,
-                ref_wav=str(wav_path.resolve()) if wav_path.exists() else "",
-                ref_text=ref_text,
-            )
+            if habits_dict is None:
+                # Habits kept as stored; only fill reference audio/text the row lacks.
+                row = store.db.execute("SELECT ref_wav, ref_text FROM voice WHERE name = ?", (voice_name,)).fetchone()
+                if row is not None and (not row["ref_wav"] or not row["ref_text"]):
+                    store.db.execute(
+                        "UPDATE voice SET ref_wav = ?, ref_text = ? WHERE name = ?",
+                        (row["ref_wav"] or (str(wav_path.resolve()) if wav_path.exists() else ""),
+                         row["ref_text"] or ref_text, voice_name))
+                    store.db.commit()
+            else:
+                store.set_habits(
+                    voice_name,
+                    habits=habits_dict,
+                    ref_wav=str(wav_path.resolve()) if wav_path.exists() else "",
+                    ref_text=ref_text,
+                )
             synced.append(voice_name)
 
     return synced
