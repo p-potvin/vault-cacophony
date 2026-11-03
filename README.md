@@ -162,7 +162,22 @@ rebuilds that voice's centroid from its evidence:
 .venv/Scripts/python.exe scripts/voices.py attribute --id 42 --name "Clopeux"
 ```
 
-Describe a stretch of audio without identifying it — pitch, spread, loudness:
+Derive how an enrolled voice *speaks* — speaking rate, pitch spread and pause
+lengths, measured from its observations — into its prosody document, and render
+a line in that delivery (SSML, or any engine's dialect; see
+[docs/voice-prosody.md](docs/voice-prosody.md)). A filler rate ("uh"/"um" per
+word) is derived only when the voice's `ref_text` is a verbatim transcript of at
+least 20 words that keeps its filled pauses (ASR usually drops them); otherwise
+the persona's default disfluency model applies, or set one by hand with
+`VoiceStore.set_prosody(name, {"disfluency": {"filled_pause_rate": 0.03}})`:
+
+```bash
+.venv/Scripts/python.exe scripts/voices.py derive-prosody --name "Clopeux"
+.venv/Scripts/python.exe scripts/voices.py ssml --name "Clopeux" --text "Well, I think we should go." --engine ssml
+```
+
+Describe a stretch of audio without identifying it — pitch, spread, loudness,
+pauses and speaking rate:
 
 ```bash
 .venv/Scripts/python.exe scripts/prosody.py episode.16k.wav --span 30:90
@@ -406,8 +421,9 @@ scripts/
   translate_srt.py              sentence-aware batched translation
   tagstore.py                   the per-media tag store (also a CLI: inspect one)
   voiceprint.py                 CAM++ embeddings (also a CLI: compare two spans)
-  prosody.py                    pitch, spread, loudness -- description, not identity
-  voices.py                     the voice store: voices, observations, repair
+  prosody.py                    pitch, spread, loudness, pauses, speaking rate -- description, not identity
+  voices.py                     the voice store: voices, observations, prosody, repair
+  speech_markup.py              delivery as SSML 1.1: pauses, breaths, fillers, emotion, per-engine rendering
   speakers.py                   the speaker pass: window, cluster, name, record
 audio.cpp/                      submodule: ggml runtime, prebuilt CLI, models
 CrispASR/                       submodule: the older ASR path

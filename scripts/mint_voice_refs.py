@@ -66,19 +66,54 @@ def default_seed_wav() -> str | None:
     return None
 
 
+PP_SPEC = os.path.join(AUDIOCPP, "model_specs", "personaplex.json")
+MODEL_MANAGER = os.path.join(AUDIOCPP, "tools", "model_manager_v2.py")
+
+
+def personaplex_package(spec_path: str = PP_SPEC) -> dict:
+    """The default PersonaPlex package as audio.cpp's own model spec declares it.
+
+    The download source, the file name and the directory it lands in all come
+    from `model_specs/personaplex.json`, so this script can never drift from what
+    `audiocpp_cli --family personaplex` actually loads.
+    """
+    import json
+    with open(spec_path, encoding="utf-8") as f:
+        spec = json.load(f)
+    packages = spec.get("packages") or []
+    package = next((p for p in packages if p.get("default")), packages[0] if packages else None)
+    if package is None:
+        raise SystemExit(f"  no packages declared in {spec_path}")
+    download = dict(spec.get("package_defaults", {}).get("download", {}))
+    download.update(package.get("download", {}))
+    prefix = package.get("strip_prefix", "")
+    files = []
+    for remote in package.get("files", []):
+        local = remote[len(prefix):].lstrip("/") if prefix and remote.startswith(prefix) else remote
+        files.append(os.path.join(AUDIOCPP, "models", package.get("target_directory", ""), local))
+    return {"id": package["id"], "repo": download.get("repo"), "revision": download.get("revision", "main"),
+            "remote_files": list(package.get("files", [])), "local_files": files,
+            "target_directory": package.get("target_directory", "")}
+
+
 def ensure_personaplex_downloaded(download_if_missing: bool) -> None:
-    model_dir = os.path.join(AUDIOCPP, PP_MODEL)
-    gguf_path = os.path.join(model_dir, "personaplex-7b-v1-q4_k.gguf")
-    if os.path.exists(gguf_path):
+    package = personaplex_package()
+    missing = [f for f in package["local_files"] if not os.path.exists(f)]
+    if not missing:
         return
+    install = [sys.executable, MODEL_MANAGER, "install", package["id"], "--models-root", "models"]
     if not download_if_missing:
         raise SystemExit(
-            f"  missing PersonaPlex GGUF at {gguf_path}\n"
-            "  pass --download-if-missing or run:\n"
-            "    hf download nvidia/personaplex-7b-v1-gguf --local-dir audio.cpp/models/PersonaPlex-GGUF"
+            f"  missing PersonaPlex GGUF: {', '.join(missing)}\n"
+            "  pass --download-if-missing or run (from audio.cpp/):\n"
+            f"    python tools/model_manager_v2.py install {package['id']} --models-root models"
         )
-    print(f"  [*] Downloading nvidia/personaplex-7b-v1-gguf -> {model_dir} ...", flush=True)
-    run(["hf", "download", "nvidia/personaplex-7b-v1-gguf", "--local-dir", model_dir], "hf download personaplex")
+    print(f"  [*] Installing {package['id']} from {package['repo']}@{package['revision']} "
+          f"-> audio.cpp/models/{package['target_directory']} ...", flush=True)
+    run(install, "install personaplex", cwd=AUDIOCPP)
+    still_missing = [f for f in package["local_files"] if not os.path.exists(f)]
+    if still_missing:
+        raise SystemExit(f"  install finished but files are still missing: {', '.join(still_missing)}")
 
 
 def run(args, what, cwd=None):
@@ -108,7 +143,7 @@ def main():
     ap.add_argument("--all-voices", action="store_true",
                     help="mint all 18 packaged PersonaPlex voices (NATF0-3, NATM0-3, VARF0-4, VARM0-4)")
     ap.add_argument("--download-if-missing", action="store_true",
-                    help="download nvidia/personaplex-7b-v1-gguf if not present in audio.cpp/models/PersonaPlex-GGUF")
+                    help="install the default PersonaPlex package from audio.cpp/model_specs/personaplex.json if missing")
     ap.add_argument("--out", default=os.path.join(REPO, "samples", "voice-refs"))
     ap.add_argument("--reply-window", type=float, default=20.0)
     ap.add_argument("--prompt", default="Say one short, ordinary sentence about the weather, "

@@ -13,8 +13,17 @@ Each persona / custom voice has a distinct vocal personality that governs:
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+import os
+import sys
+from pathlib import Path
 from typing import Dict, List, Optional
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent.parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from speech_markup import TONE_EMOTION, DisfluencyModel, Emotion, PauseModel, Prosody  # noqa: E402
 
 
 @dataclass
@@ -24,6 +33,19 @@ class ToneAnchor:
     anchor: str                    # Semantic description compared against turn text via EG2 cosine
     lexical_keywords: List[str] = field(default_factory=list)
     omnivoice_onset: str = ""      # Optional OmniVoice onset token when this tone wins (e.g. "[sigh]", "[surprise-ah]")
+    # EmotionML 1.0 dimensional coordinates in [-1, 1]; None falls back to
+    # speech_markup.TONE_EMOTION for the tag, then to neutral.
+    arousal: Optional[float] = None
+    valence: Optional[float] = None
+    dominance: Optional[float] = None
+
+    def emotion(self) -> Emotion:
+        default = TONE_EMOTION.get(self.tag.lower(), Emotion())
+        return Emotion(
+            arousal=default.arousal if self.arousal is None else float(self.arousal),
+            valence=default.valence if self.valence is None else float(self.valence),
+            dominance=default.dominance if self.dominance is None else float(self.dominance),
+        )
 
 
 @dataclass
@@ -63,6 +85,13 @@ class VocalHabitProfile:
     filler_lexicon: List[FillerItem] = field(default_factory=list)
     throat_habits: ThroatAndPauseHabits = field(default_factory=ThroatAndPauseHabits)
     cadence_speed: float = 1.0
+    # Natural-delivery models (see speech_markup): where and how long this
+    # speaker pauses, how often they hesitate with "uh"/"um", how often they
+    # breathe, and how strongly a turn's tone moves the SSML prosody baseline.
+    pauses: PauseModel = field(default_factory=PauseModel)
+    disfluency: DisfluencyModel = field(default_factory=DisfluencyModel)
+    baseline: Prosody = field(default_factory=Prosody)
+    emotion_intensity: float = 0.6
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -83,7 +112,23 @@ class VocalHabitProfile:
             filler_lexicon=fillers,
             throat_habits=throat,
             cadence_speed=float(data.get("cadence_speed", 1.0)),
+            pauses=PauseModel.from_dict(data.get("pauses")),
+            disfluency=DisfluencyModel.from_dict(data.get("disfluency")),
+            baseline=Prosody.from_dict(data.get("baseline")),
+            emotion_intensity=float(data.get("emotion_intensity", 0.6)),
         )
+
+    def with_prosody_document(self, doc: Optional[dict]) -> "VocalHabitProfile":
+        """Overlay a voice-store prosody document (measured or hand-set) onto this profile."""
+        if not doc:
+            return self
+        pauses = PauseModel.from_dict({**asdict(self.pauses), **(doc.get("pauses") or {})})
+        dis = DisfluencyModel.from_dict({**asdict(self.disfluency), **(doc.get("disfluency") or {})})
+        # The rate in a stored baseline describes the reference recording, which
+        # the cloning engines already reproduce; only pitch/range/volume overlay.
+        base = Prosody.from_dict({**asdict(self.baseline),
+                                  **{k: v for k, v in (doc.get("baseline") or {}).items() if k != "rate"}})
+        return replace(self, pauses=pauses, disfluency=dis, baseline=base)
 
 
 def builtin_profiles() -> Dict[str, VocalHabitProfile]:
@@ -312,6 +357,19 @@ def builtin_profiles() -> Dict[str, VocalHabitProfile]:
         cadence_speed=1.08,
     )
 
+    # Delivery: Margot is crisp and rarely hesitates; Desmond lets sarcasm land
+    # in longer pauses; Kai is fast and stumbles; Chloe hesitates with "um" and
+    # trails into longer pauses; Clopeux sits at the conversational defaults.
+    margot.pauses = PauseModel(brief_ms=140, medium_ms=420, long_ms=1000, sigma=0.30)
+    margot.disfluency = DisfluencyModel(filled_pause_rate=0.015, um_ratio=0.30, repetition_prob=0.02)
+    desmond.pauses = PauseModel(brief_ms=170, medium_ms=560, long_ms=1400, sigma=0.40)
+    desmond.disfluency = DisfluencyModel(filled_pause_rate=0.025, um_ratio=0.50, repetition_prob=0.03)
+    kai.pauses = PauseModel(brief_ms=120, medium_ms=360, long_ms=900, sigma=0.35)
+    kai.disfluency = DisfluencyModel(filled_pause_rate=0.050, um_ratio=0.35, repetition_prob=0.08,
+                                     breath_group_words=15)
+    chloe.pauses = PauseModel(brief_ms=170, medium_ms=560, long_ms=1300, sigma=0.42)
+    chloe.disfluency = DisfluencyModel(filled_pause_rate=0.035, um_ratio=0.60, repetition_prob=0.06)
+
     profiles = {
         "MARGOT": margot,
         "high-woman-voice-excited": margot,
@@ -330,13 +388,90 @@ def builtin_profiles() -> Dict[str, VocalHabitProfile]:
     return profiles
 
 
+VOICE_STORE_ENV = "CACOPHONY_VOICE_STORE"
+_store_cache: Dict[str, object] = {"key": None, "habits": {}, "prosody": {}}
+
+
+def _store_path() -> Optional[str]:
+    explicit = os.environ.get(VOICE_STORE_ENV)
+    if explicit:
+        return explicit
+    try:
+        import voices as voices_mod
+        return voices_mod.default_path()
+    except Exception:
+        return None
+
+
+def _store_snapshot() -> tuple:
+    """(habits by name, prosody by name) from the voice store, re-read only when the file changes."""
+    path = _store_path()
+    if not path or not os.path.exists(path):
+        return {}, {}
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}, {}
+    key = (path, st.st_mtime_ns, st.st_size)
+    if _store_cache["key"] != key:
+        habits: Dict[str, dict] = {}
+        prosody: Dict[str, dict] = {}
+        try:
+            import json
+            import sqlite3
+            db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                cols = {r[1] for r in db.execute("PRAGMA table_info(voice)").fetchall()}
+                sel = ["name", "habits" if "habits" in cols else "'{}'", "prosody" if "prosody" in cols else "'{}'"]
+                for name, h, p in db.execute(f"SELECT {', '.join(sel)} FROM voice").fetchall():
+                    try:
+                        if h and h != "{}":
+                            habits[name] = json.loads(h)
+                        if p and p != "{}":
+                            prosody[name] = json.loads(p)
+                    except ValueError:
+                        continue
+            finally:
+                db.close()
+        except Exception:
+            habits, prosody = {}, {}
+        _store_cache.update(key=key, habits=habits, prosody=prosody)
+    return _store_cache["habits"], _store_cache["prosody"]  # type: ignore[return-value]
+
+
 def resolve_profile(speaker_name: str, voice_name: Optional[str] = None) -> VocalHabitProfile:
-    """Return the VocalHabitProfile for a persona or reference voice name."""
+    """Return the VocalHabitProfile for a persona or reference voice name.
+
+    The voice store wins over the built-ins: a habit profile saved against a
+    voice in voices.db (by `sync_custom_voices_to_store`, or edited by hand) is
+    the one used, and the voice's stored prosody document -- measured pauses,
+    disfluency rates, SSML baseline -- is laid over whichever profile is chosen.
+    """
     catalog = builtin_profiles()
-    if speaker_name in catalog:
-        return catalog[speaker_name]
-    if speaker_name.upper() in catalog:
-        return catalog[speaker_name.upper()]
-    if voice_name and voice_name in catalog:
-        return catalog[voice_name]
-    return catalog["MARGOT"]
+    store_habits, store_prosody = _store_snapshot()
+
+    profile: Optional[VocalHabitProfile] = None
+    for key in (voice_name, speaker_name):
+        if key and key in store_habits:
+            stored = store_habits[key]
+            # Habits saved before a field existed fall back to the built-in for
+            # that persona, not to bare defaults.
+            builtin = catalog.get(key) or catalog.get(str(stored.get("persona_name", "")))
+            merged = {**builtin.to_dict(), **stored} if builtin else stored
+            try:
+                profile = VocalHabitProfile.from_dict(merged)
+                break
+            except (TypeError, ValueError):
+                continue
+    if profile is None:
+        for key in (speaker_name, speaker_name.upper() if speaker_name else None, voice_name):
+            if key and key in catalog:
+                profile = catalog[key]
+                break
+    if profile is None:
+        profile = catalog["MARGOT"]
+
+    for key in (voice_name, profile.voice_name):
+        if key and key in store_prosody:
+            return profile.with_prosody_document(store_prosody[key])
+    return profile

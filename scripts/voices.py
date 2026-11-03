@@ -29,6 +29,20 @@ person, under a store that only kept centroids, permanently poisoned that
 centroid. Here the link is a column: point the observation at the right voice
 and rebuild, and the store is as though it never happened.
 
+A third thing rides on `voice`: how the person *speaks*, as distinct from who
+they are. `prosody` is a JSON document in the vocabulary of the standards that
+describe delivery, so it can be handed to any synthesiser rather than only ours:
+
+    baseline    SSML 1.1 <prosody> terms -- rate (x), pitch/range (st), volume (dB)
+    pauses      a log-normal pause model -- brief/medium/long medians, log sigma
+    disfluency  filled-pause rate, uh/um balance, breath-group length
+    emotion     EmotionML 1.0 pleasure/arousal/dominance resting point
+    measured    the aggregates `derive_prosody` computed from the observations
+
+`baseline`, `pauses` and `disfluency` may be set by hand or derived; `measured`
+is only ever derived, so it is always traceable to evidence. Hand-set values are
+also kept under `overrides` and win over every later derivation.
+
 Thresholds come from measurement, not taste. Over 24 clips from 6 LibriSpeech
 speakers this embedder scores 0.808 mean cosine within a speaker and 0.124
 between speakers, and 0.52 separates them with one error in 276 pairs. The
@@ -46,7 +60,7 @@ from datetime import datetime
 
 import numpy as np
 
-SCHEMA = 1
+SCHEMA = 2  # 2: per-voice `prosody` (SSML baseline, pause and disfluency models)
 MATCH_THRESHOLD = 0.60
 MARGIN = 0.05  # how far the best match must lead the runner-up
 EMB_DIM = 512
@@ -96,7 +110,8 @@ CREATE TABLE IF NOT EXISTS voice (
     notes    TEXT DEFAULT '',
     ref_wav  TEXT DEFAULT '',
     ref_text TEXT DEFAULT '',
-    habits   TEXT DEFAULT '{}'
+    habits   TEXT DEFAULT '{}',
+    prosody  TEXT DEFAULT '{}'
 );
 
 CREATE TABLE IF NOT EXISTS observation (
@@ -136,13 +151,17 @@ class VoiceStore:
         self.db.row_factory = sqlite3.Row
         self.db.executescript(DDL)
         self._ensure_columns()
-        self.db.execute("INSERT OR IGNORE INTO meta VALUES ('schema', ?)", (str(SCHEMA),))
+        # Every migration so far is additive (new columns with defaults), so the
+        # recorded schema can simply be raised to what this code writes.
+        self.db.execute("INSERT INTO meta VALUES ('schema', ?) ON CONFLICT(key) DO UPDATE SET "
+                        "value = excluded.value WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
+                        (str(SCHEMA),))
         self.db.commit()
         self._migrate_json()
 
     def _ensure_columns(self):
         cols = {r["name"] for r in self.db.execute("PRAGMA table_info(voice)").fetchall()}
-        for col, default in (("ref_wav", "''"), ("ref_text", "''"), ("habits", "'{}'")):
+        for col, default in (("ref_wav", "''"), ("ref_text", "''"), ("habits", "'{}'"), ("prosody", "'{}'")):
             if col not in cols:
                 self.db.execute(f"ALTER TABLE voice ADD COLUMN {col} TEXT DEFAULT {default}")
 
@@ -267,6 +286,84 @@ class VoiceStore:
         except (TypeError, ValueError):
             return None
 
+    # -- prosody -------------------------------------------------------------
+
+    def get_prosody(self, name):
+        """The stored prosody document for `name`, or None."""
+        row = self.db.execute("SELECT prosody FROM voice WHERE name = ?", (name,)).fetchone()
+        if not row or not row["prosody"]:
+            return None
+        try:
+            data = json.loads(row["prosody"])
+        except (TypeError, ValueError):
+            return None
+        return data or None
+
+    def set_prosody(self, name, prosody, merge=True, manual=True):
+        """Store a prosody document. With `merge`, top-level sections are updated, not replaced wholesale.
+
+        Values set with `manual` (the default: anything a person or caller sets
+        on purpose) are also recorded under `overrides`, and every later
+        derivation lays them back over what it measured -- so re-enrolling a
+        voice refreshes `measured` without undoing a hand-tuned pause length.
+        """
+        if self.db.execute("SELECT 1 FROM voice WHERE name = ?", (name,)).fetchone() is None:
+            raise KeyError(f"no voice {name!r}")
+        incoming = {k: v for k, v in (prosody or {}).items() if k != "overrides"}
+        current = (self.get_prosody(name) or {}) if merge else {}
+        overrides = _deep_merge(current.get("overrides") or {}, incoming) if manual else current.get("overrides") or {}
+        for key in ("measured", "derived", "standard"):
+            overrides.pop(key, None)  # evidence and bookkeeping are never hand-set
+        current = _deep_merge(current, incoming) if merge else dict(incoming)
+        current = _deep_merge(current, overrides)
+        if overrides:
+            current["overrides"] = overrides
+        current.setdefault("standard", PROSODY_STANDARD)
+        self.db.execute("UPDATE voice SET prosody = ?, updated = ? WHERE name = ?",
+                        (json.dumps(current, ensure_ascii=False), _stamp(), name))
+        self.db.commit()
+        return current
+
+    def derive_prosody(self, name, save=True):
+        """Aggregate the observations' timing and pitch into the voice's prosody document.
+
+        Weighted by speech length, like `rebuild`. Pitch is averaged in log
+        space (semitones), because that is the scale the ear and SSML both use.
+        Only the sections the evidence supports are written; hand-set values in
+        other sections are left alone.
+        """
+        rows = self.db.execute(
+            "SELECT o.metrics, o.speech_seconds FROM observation o JOIN voice v ON v.id = o.voice_id "
+            "WHERE v.name = ? AND o.metrics IS NOT NULL", (name,)).fetchall()
+        voice = self.db.execute("SELECT ref_text FROM voice WHERE name = ?", (name,)).fetchone()
+        if voice is None:
+            raise KeyError(f"no voice {name!r}")
+        derived = derive_prosody_document([
+            (json.loads(r["metrics"]), float(r["speech_seconds"] or 0.0)) for r in rows if r["metrics"]],
+            ref_text=voice["ref_text"] or "")
+        if save and derived:
+            return self.set_prosody(name, derived, manual=False)
+        return derived
+
+    def prosody_summary(self, name):
+        """A handful of human-readable numbers for listings and the UI, or None."""
+        doc = self.get_prosody(name)
+        if not doc:
+            return None
+        measured = doc.get("measured", {})
+        baseline = doc.get("baseline", {})
+        pauses = doc.get("pauses", {})
+        dis = doc.get("disfluency", {})
+        out = {
+            "rate": baseline.get("rate"),
+            "f0_hz": measured.get("f0_median_hz"),
+            "syll_per_s": measured.get("articulation_rate_sps"),
+            "pause_ms": pauses.get("medium_ms") or measured.get("pause_median_ms"),
+            "fillers_per_100w": round(100 * dis["filled_pause_rate"], 1) if "filled_pause_rate" in dis else None,
+        }
+        out = {k: v for k, v in out.items() if v is not None}
+        return out or None
+
     def observe(self, embedding, windows=None, **fields):
         """Record one stretch of attributed speech. Returns its row id.
 
@@ -387,6 +484,89 @@ class VoiceStore:
             pass  # A store that will not parse is not worth failing an ASR run over.
 
 
+# -- prosody derivation ----------------------------------------------------
+
+PROSODY_STANDARD = {"markup": "SSML 1.1", "emotion": "EmotionML 1.0 (PAD)"}
+
+# Conversational English articulation rate sits around 4-6 syllables a second;
+# the baseline rate is expressed against the middle of that, the way SSML's
+# rate="110%" is relative to the engine's default.
+REFERENCE_ARTICULATION_SPS = 5.0
+_FILLED = ("uh", "um", "er", "erm", "uhm")
+
+
+def _deep_merge(base, extra):
+    """`extra` laid over `base`, one level of sections deep (prosody documents are two levels)."""
+    out = dict(base or {})
+    for key, value in (extra or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = {**out[key], **value}
+        else:
+            out[key] = value
+    return out
+
+
+def _weighted(values):
+    """Weighted mean over (value, weight) pairs, skipping missing values."""
+    pairs = [(float(v), max(float(w), 1e-3)) for v, w in values if v is not None]
+    if not pairs:
+        return None
+    total = sum(w for _, w in pairs)
+    return sum(v * w for v, w in pairs) / total
+
+
+def derive_prosody_document(metric_rows, ref_text=""):
+    """[(metrics dict, speech_seconds)] -> prosody document sections the data supports."""
+    import math
+    import re
+
+    doc = {}
+    measured = {}
+    if metric_rows:
+        def agg(key):
+            return _weighted((m.get(key), w) for m, w in metric_rows)
+
+        f0_st = _weighted((12 * math.log2(m["f0_median_hz"] / 55.0), w)
+                          for m, w in metric_rows if m.get("f0_median_hz"))
+        if f0_st is not None:
+            measured["f0_median_hz"] = round(55.0 * 2 ** (f0_st / 12), 1)
+        for key, digits in (("f0_iqr_semitones", 2), ("articulation_rate_sps", 2), ("speech_rate_sps", 2),
+                            ("pause_median_ms", 1), ("pause_p90_ms", 1), ("pause_log_sigma", 3),
+                            ("pause_rate_per_min", 2), ("phonation_ratio", 3), ("rms_db", 2)):
+            value = agg(key)
+            if value is not None:
+                measured[key] = round(value, digits)
+        measured["observations"] = len(metric_rows)
+        measured["seconds"] = round(sum(w for _, w in metric_rows), 2)
+
+    if "articulation_rate_sps" in measured:
+        rate = measured["articulation_rate_sps"] / REFERENCE_ARTICULATION_SPS
+        doc["baseline"] = {"rate": round(min(1.25, max(0.8, rate)), 3)}
+    if "f0_iqr_semitones" in measured:
+        # ~3 st IQR is an ordinary conversational spread; a flatter or livelier
+        # speaker moves SSML's range from there.
+        doc.setdefault("baseline", {})["range_st"] = round(max(-3.0, min(3.0, measured["f0_iqr_semitones"] - 3.0)), 2)
+    if "pause_median_ms" in measured:
+        medium = max(250.0, min(900.0, measured["pause_median_ms"]))
+        doc["pauses"] = {"medium_ms": round(medium, 1),
+                         "brief_ms": round(medium / 3.0, 1),
+                         "long_ms": round(max(medium * 2.5, measured.get("pause_p90_ms") or 0.0), 1)}
+        if measured.get("pause_log_sigma"):
+            doc["pauses"]["sigma"] = round(min(0.6, max(0.2, measured["pause_log_sigma"])), 3)
+
+    words = re.findall(r"[a-zA-Z']+", ref_text or "")
+    if len(words) >= 20:
+        filled = sum(1 for w in words if w.lower() in _FILLED)
+        ums = sum(1 for w in words if w.lower() in ("um", "erm", "uhm"))
+        if filled:
+            doc["disfluency"] = {"filled_pause_rate": round(filled / len(words), 4),
+                                 "um_ratio": round(ums / filled, 3)}
+    if measured:
+        doc["measured"] = measured
+        doc["derived"] = _stamp()
+    return doc
+
+
 # Module-level shims, so a caller that just wants an answer does not have to
 # think about connection lifetime.
 
@@ -415,7 +595,8 @@ def main():
 
     ap = argparse.ArgumentParser(description="The permanent voice store")
     ap.add_argument("action", choices=["list", "show", "enroll", "identify", "forget",
-                                       "observations", "attribute", "rebuild", "export"])
+                                       "observations", "attribute", "rebuild", "export",
+                                       "prosody", "derive-prosody", "ssml"])
     ap.add_argument("--name")
     ap.add_argument("--audio", help="16 kHz mono wav")
     ap.add_argument("--span", metavar="START:END", help="seconds within --audio")
@@ -425,6 +606,9 @@ def main():
     ap.add_argument("--limit", type=int, default=20)
     ap.add_argument("--threshold", type=float, default=MATCH_THRESHOLD)
     ap.add_argument("--notes", default="")
+    ap.add_argument("--text", help="for ssml: the line to render in this voice's delivery")
+    ap.add_argument("--engine", default="ssml", help="for ssml: ssml | fish_audio | omnivoice | kokoro | ...")
+    ap.add_argument("--seed", type=int, default=None, help="for ssml: make the rendering repeatable")
     args = ap.parse_args()
 
     store = VoiceStore(args.store)
@@ -486,11 +670,40 @@ def main():
         print(f"  forgot {args.name} (its observations are kept, unlinked)")
         return 0
 
+    if args.action == "prosody":
+        doc = store.get_prosody(args.name)
+        print(json.dumps(doc, ensure_ascii=False, indent=1) if doc else f"  no prosody stored for {args.name}")
+        return 0
+
+    if args.action == "derive-prosody":
+        names = [args.name] if args.name else [n for n, _, _ in store.voices()]
+        for name in names:
+            doc = store.derive_prosody(name)
+            print(f"  {name}: {json.dumps(store.prosody_summary(name) or {}, ensure_ascii=False)}"
+                  if doc else f"  {name}: no measured observations to derive from")
+        return 0
+
+    if args.action == "ssml":
+        import random
+        import speech_markup as sm
+        if not args.text:
+            print("  --text is required")
+            return 2
+        doc = store.get_prosody(args.name) or {} if args.name else {}
+        utt = sm.humanize(args.text, random.Random(args.seed), pauses=sm.PauseModel.from_dict(doc.get("pauses")),
+                          disfluency=sm.DisfluencyModel.from_dict(doc.get("disfluency")),
+                          prosody=sm.Prosody.from_dict(doc.get("baseline")))
+        print(sm.render(utt, args.engine))
+        return 0
+
     if args.action == "export":
         out = {"voices": [], "observations": []}
         for name, centroid, row in store.voices():
             out["voices"].append({"name": name, "samples": row["samples"],
                                   "updated": row["updated"], "notes": row["notes"],
+                                  "ref_wav": row["ref_wav"], "ref_text": row["ref_text"],
+                                  "habits": json.loads(row["habits"] or "{}"),
+                                  "prosody": json.loads(row["prosody"] or "{}"),
                                   "centroid": [round(float(x), 6) for x in centroid]})
         for r in store.observations(limit=args.limit):
             out["observations"].append({
@@ -525,7 +738,11 @@ def main():
             metrics=prosody.measure(audio),
             source={"pass": "enroll", "model": "campplus-voxceleb-lm"})
         samples = store.enroll(args.name, vector, args.notes, observation_id=obs)
+        store.derive_prosody(args.name)
         print(f"  {args.name}: {samples} sample(s), observation #{obs} -> {store.path}")
+        summary = store.prosody_summary(args.name)
+        if summary:
+            print(f"  prosody: {json.dumps(summary)}")
     else:
         name, score = store.identify(vector, args.threshold)
         print(f"  {name or 'unknown'}  (best score {score:.3f})")

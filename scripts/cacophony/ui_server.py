@@ -291,31 +291,81 @@ def build_command(config: dict) -> tuple[list[str], Path]:
     return cmd, out_path
 
 
-def discover_refs() -> list[dict]:
-    """Discover all reference WAVs in voices-store/, samples/voices/, and samples/voice-refs/, auto-transcribing missing .txt sidecars."""
-    refs = []
+REF_SEARCH_DIRS = (
+    ("voices-store", "voices-store"),
+    ("samples/voices", "samples/voices"),
+    ("samples/voice-refs", "personaplex"),
+    ("samples/voice-refs/personaplex", "personaplex"),
+)
+
+
+def _iter_ref_wavs():
+    """(wav_path, source_label) for every reference wav, first name wins."""
     seen = set()
-    search_dirs = [
-        (REPO_DIR / "voices-store", "voices-store"),
-        (REPO_DIR / "samples" / "voices", "samples/voices"),
-        (REPO_DIR / "samples" / "voice-refs", "personaplex"),
-        (REPO_DIR / "samples" / "voice-refs" / "personaplex", "personaplex"),
-    ]
-    for folder, source_label in search_dirs:
+    for rel, source_label in REF_SEARCH_DIRS:
+        folder = REPO_DIR / rel
         if not folder.exists():
             continue
         for wav in sorted(folder.glob("*.wav")):
             if wav.stem in seen:
                 continue
             seen.add(wav.stem)
+            yield wav, source_label
+
+
+def discover_refs(transcribe: bool = True) -> list[dict]:
+    """Discover all reference WAVs in voices-store/, samples/voices/, and samples/voice-refs/.
+
+    With `transcribe`, missing .txt sidecars are filled by running ASR -- right
+    for building the options form once, wrong for anything per-request.
+    """
+    refs = []
+    for wav, source_label in _iter_ref_wavs():
+        if transcribe:
             text = ensure_voice_ref_text(wav)
-            refs.append({
-                "name": wav.stem,
-                "wav": str(wav.relative_to(REPO_DIR)).replace("\\", "/"),
-                "text": text,
-                "source": source_label,
-            })
+        else:
+            txt = wav.with_suffix(".txt")
+            text = txt.read_text(encoding="utf-8", errors="replace").strip() if txt.exists() else ""
+        refs.append({
+            "name": wav.stem,
+            "wav": str(wav.relative_to(REPO_DIR)).replace("\\", "/"),
+            "text": text,
+            "source": source_label,
+        })
+    _attach_store_prosody(refs)
     return refs
+
+
+def _attach_store_prosody(refs: list[dict]) -> None:
+    """Add each voice's stored prosody summary (rate, pitch, pauses) when the voice store has one."""
+    try:
+        import voices as voices_mod
+        path = voices_mod.default_path()
+        if not os.path.exists(path):
+            return
+        with voices_mod.VoiceStore(path) as store:
+            for ref in refs:
+                summary = store.prosody_summary(ref["name"])
+                if summary:
+                    ref["prosody"] = summary
+    except Exception:
+        return  # The shelf works without it; a broken store must not break the form.
+
+
+def find_ref_wav(name: str) -> Path | None:
+    """Resolve a voice name to its wav without transcribing anything."""
+    for wav, _ in _iter_ref_wavs():
+        if wav.stem == name:
+            return wav
+    return None
+
+
+# Audition previews: bounded concurrency and size, streamed from disk, so a
+# burst of clicks (or a hostile client) cannot pull N whole WAVs into memory.
+PREVIEW_MAX_CONCURRENT = 4
+PREVIEW_MAX_BYTES = 64 * 1024 * 1024
+_preview_slots = threading.BoundedSemaphore(PREVIEW_MAX_CONCURRENT)
+STREAM_CHUNK = 64 * 1024
 
 
 def discover_options() -> dict:
@@ -386,16 +436,35 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, msg, status=400):
         self._json({"error": msg}, status)
 
-    def _send_file(self, path: Path, content_type: str):
+    def _send_file(self, path: Path, content_type: str, cache: bool = False):
+        """Stream a file in fixed-size chunks; memory per request is one chunk, not the file."""
         try:
-            data = path.read_bytes()
-        except Exception:
+            st = path.stat()
+            fh = open(path, "rb")
+        except OSError:
             return self._error("file not found", 404)
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        with fh:
+            etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+            if cache and self.headers.get("If-None-Match") == etag:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(st.st_size))
+            if cache:
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "private, max-age=3600")
+            self.end_headers()
+            try:
+                while True:
+                    chunk = fh.read(STREAM_CHUNK)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # client navigated away mid-preview
 
     # -- routes -------------------------------------------------------------
     def do_GET(self):
@@ -411,14 +480,24 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/voice-preview":
             qs = parse_qs(parsed.query)
             vname = (qs.get("name") or [""])[0].strip()
-            refs_by_name = {r["name"]: r for r in discover_refs()}
-            ref = refs_by_name.get(vname)
-            if not ref:
+            found = find_ref_wav(vname) if vname else None
+            if found is None:
                 return self._error("voice not found", 404)
-            wav_path = (REPO_DIR / ref["wav"]).resolve()
+            wav_path = found.resolve()
             if not wav_path.is_relative_to(REPO_DIR.resolve()) or not wav_path.exists():
                 return self._error("voice file not found", 404)
-            return self._send_file(wav_path, "audio/wav")
+            if wav_path.stat().st_size > PREVIEW_MAX_BYTES:
+                return self._error("voice reference too large to preview", 413)
+            if not _preview_slots.acquire(blocking=False):
+                self.send_response(503)
+                self.send_header("Retry-After", "1")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            try:
+                return self._send_file(wav_path, "audio/wav", cache=True)
+            finally:
+                _preview_slots.release()
 
         if path == "/api/file":
             qs = parse_qs(parsed.query)

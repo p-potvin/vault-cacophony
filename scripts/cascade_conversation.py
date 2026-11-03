@@ -36,6 +36,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tagstore
+import speech_markup
 import trim_speech
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -232,6 +233,10 @@ def main():
                             "content": heard})
         reply = think(args.llm, agent["system"], history, args.temperature)
         reply = re.sub(r"\s+", " ", reply).strip().strip('"')
+        # The history shows the agents SenseVoice's tags as "[happy] ...", and
+        # they sometimes answer in kind. Qwen3-TTS takes plain text and would
+        # read a bracket aloud, so any cue becomes punctuation or nothing.
+        reply = speech_markup.sanitize_for_engine(reply, "qwen3_tts")
         if not reply:
             print("      the agent had nothing to say; stopping")
             break

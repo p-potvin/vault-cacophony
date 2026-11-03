@@ -159,10 +159,16 @@ scripts/
   Start-Conversation.ps1    PersonaPlex turn loop, per-process. Transcript-in-prompt context.
   duplex_conversation.py    PersonaPlex via resident server. Works; conversation degenerates.
   trim_speech.py            silence trim + --skip for the overlapped region
-  prosody.py                F0/RMS/crest via numpy autocorrelation
+  prosody.py                F0/RMS/crest, pauses (count/median/p90/log-sigma), speech + articulation
+                            rate from syllable nuclei -- all numpy
   conversation_tags.py      turns -> tag store (speaker track = diarization ground truth)
   Measure-Passes.ps1        per-stage timing + targeted nsys traces (sep/asr/speakers/s2s)
-  voices.py                 permanent SQLite voice store: centroids + observations
+  voices.py                 permanent SQLite voice store: centroids + observations + per-voice
+                            prosody (SSML baseline, pause/disfluency models, measured, overrides);
+                            derive-prosody / prosody / ssml CLI actions
+  speech_markup.py          engine-neutral turn delivery (SSML 1.1 + EmotionML PAD): places breaths,
+                            log-normal pauses and uh/um at planning points; renders Fish S2,
+                            OmniVoice and plain-text dialects; sanitizes all TTS input
   speakers.py               diarization pass, writes speaker track + observations
   voiceprint.py             CAM++ embeddings
   words_to_srt.py           cue builder (punctuation-aware splitting, orphan merge)
@@ -208,6 +214,13 @@ PersonaPlex's pauses, fillers and breathing. Their plan, which is sound:
 
 Caveat worth repeating to them: a cascade can only *simulate* disfluency.
 PersonaPlex's pauses come from reacting in real time to the other speaker.
+
+Step 1 now exists in a stronger form than token injection: `speech_markup.py`
+holds each turn's delivery engine-neutrally (SSML 1.1 + EmotionML PAD), places
+breaths, log-normal pauses and "uh"/"um" at planning points per the disfluency
+literature, renders it for Fish / OmniVoice / plain-text engines, and the voice
+store keeps per-voice pause/rate/disfluency models (`voices.py derive-prosody`).
+See `docs/voice-prosody.md`. Steps 2 and 3 are still open.
 
 **Turn length drifts long** — 19 s by turn 6 despite "at most two short
 sentences". Llama stops honouring it as history grows. Needs a hard token cap,

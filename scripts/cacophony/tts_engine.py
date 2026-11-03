@@ -26,6 +26,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import trim_speech
+import speech_markup
 
 
 def time_stretch_wsola(audio: np.ndarray, rate: float, sr: int = 24000) -> np.ndarray:
@@ -377,6 +378,12 @@ class TtsEngine:
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         engine = (engine_type or self.engine_type).lower()
+        # Whatever markup the caller sent (SSML, another engine's bracket
+        # dialect, an LLM's stage cues), this engine gets only its own dialect;
+        # nothing reaches a plain-text engine that it would read aloud.
+        text = speech_markup.sanitize_for_engine(text, engine)
+        if not text.strip():
+            raise ValueError(f"nothing left to speak after rendering markup for {engine}")
         target_gpu = gpu_device_override if gpu_device_override is not None else self.gpu_device
         if target_gpu is None and self.gpu_devices:
             with self._server_lock:
