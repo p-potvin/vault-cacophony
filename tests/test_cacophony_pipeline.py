@@ -424,3 +424,31 @@ def test_batched_orchestrator_with_parallel_tts_mock(tmp_path):
     status = json.loads((tmp_path / "run_status.json").read_text(encoding="utf-8"))
     assert status["status"] == "complete"
     assert status["completed_turns"] == 6
+
+
+def test_ui_server_answering_mode_and_audition_refs():
+    """Verify UI server build_command flags for answering mode, streaming, prosody tags, and PersonaPlex voice list."""
+    from cacophony import ui_server
+    import mint_voice_refs
+
+    assert len(mint_voice_refs.ALL_PERSONAPLEX_VOICES) == 18
+    assert "NATF0" in mint_voice_refs.ALL_PERSONAPLEX_VOICES
+    assert "VARM4" in mint_voice_refs.ALL_PERSONAPLEX_VOICES
+
+    cmd, out_path = ui_server.build_command({
+        "script": "testbench",
+        "answering_mode": True,
+        "stream": False,
+        "allow_prosody_tags": False,
+        "out_dir": "cacophony_output/test_ui",
+    })
+    assert "--answering-mode" in cmd
+    assert "--no-stream" in cmd
+    assert "--no-prosody-tags" in cmd
+
+    opts = ui_server.discover_options()
+    assert opts["defaults"]["answering_mode"] is False
+    assert opts["defaults"]["stream"] is True
+    assert opts["defaults"]["allow_prosody_tags"] is True
+    assert len(opts["cosyvoice_refs"]) >= 5
+

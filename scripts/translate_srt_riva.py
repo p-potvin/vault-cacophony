@@ -114,9 +114,12 @@ def get_silero_te():
 
 
 def restore_punctuation(text: str, lang: str = "en") -> str:
-    """Apply Silero punctuation and capitalization if supported."""
+    """Apply Silero punctuation and capitalization if the text lacks sentence punctuation."""
+    stripped = text.strip()
+    if not stripped or stripped[-1] in ".!?…":
+        return text
     te = get_silero_te()
-    if not te or not text.strip():
+    if not te:
         return text
     _, languages, apply_te = te
     lang_code = lang.lower().split("-")[0]
@@ -158,10 +161,12 @@ def build_sentences(
         curr_start = cue_times[i][0]
         gap = curr_start - prev_end
         text_len = len(cues[i][2])
+        prev_ended_sentence = cues[i - 1][2].rstrip().endswith((".", "!", "?", "…"))
 
-        # Break chunk if pause gap >= threshold, or max cues reached, or character limit reached
+        # Break chunk if previous cue closed a sentence, pause gap >= threshold, max cues reached, or character limit reached
         if (
-            gap >= gap_threshold
+            prev_ended_sentence
+            or gap >= gap_threshold
             or len(curr_chunk) >= max_cues_per_chunk
             or (curr_chars + text_len) > max_chars_per_chunk
         ):

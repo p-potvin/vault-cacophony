@@ -236,6 +236,16 @@ def build_command(config: dict) -> tuple[list[str], Path]:
     ]
     if config.get("enable_ramblers"):
         cmd += ["--enable-ramblers", "--rambler-gain-db", str(float(config.get("rambler_gain_db", -18.0)))]
+    if config.get("answering_mode"):
+        cmd += ["--answering-mode"]
+    if config.get("stream", True):
+        cmd += ["--stream"]
+    else:
+        cmd += ["--no-stream"]
+    if config.get("allow_prosody_tags", True):
+        cmd += ["--allow-prosody-tags"]
+    else:
+        cmd += ["--no-prosody-tags"]
     seed = (config.get("seed_topic") or "").strip()
     if seed:
         cmd += ["--seed-topic", seed]
@@ -282,27 +292,28 @@ def build_command(config: dict) -> tuple[list[str], Path]:
 
 
 def discover_refs() -> list[dict]:
-    """Discover all reference WAVs in voices-store/ and samples/voices/, auto-transcribing missing .txt sidecars."""
+    """Discover all reference WAVs in voices-store/, samples/voices/, and samples/voice-refs/, auto-transcribing missing .txt sidecars."""
     refs = []
-    vs_dir = REPO_DIR / "voices-store"
-    if vs_dir.exists():
-        for wav in sorted(vs_dir.glob("*.wav")):
+    seen = set()
+    search_dirs = [
+        (REPO_DIR / "voices-store", "voices-store"),
+        (REPO_DIR / "samples" / "voices", "samples/voices"),
+        (REPO_DIR / "samples" / "voice-refs", "personaplex"),
+        (REPO_DIR / "samples" / "voice-refs" / "personaplex", "personaplex"),
+    ]
+    for folder, source_label in search_dirs:
+        if not folder.exists():
+            continue
+        for wav in sorted(folder.glob("*.wav")):
+            if wav.stem in seen:
+                continue
+            seen.add(wav.stem)
             text = ensure_voice_ref_text(wav)
             refs.append({
                 "name": wav.stem,
                 "wav": str(wav.relative_to(REPO_DIR)).replace("\\", "/"),
                 "text": text,
-                "source": "voices-store",
-            })
-    voices_dir = REPO_DIR / "samples" / "voices"
-    if voices_dir.exists():
-        for wav in sorted(voices_dir.glob("*.wav")):
-            text = ensure_voice_ref_text(wav)
-            refs.append({
-                "name": wav.stem,
-                "wav": str(wav.relative_to(REPO_DIR)).replace("\\", "/"),
-                "text": text,
-                "source": "samples/voices",
+                "source": source_label,
             })
     return refs
 
@@ -349,6 +360,9 @@ def discover_options() -> dict:
             "rambler_gain_db": -18.0,
             "gpu_device": -1,
             "enable_ramblers": False,
+            "answering_mode": False,
+            "stream": True,
+            "allow_prosody_tags": True,
             "out_dir": "cacophony_output/ui_run",
             "model": "openai/gpt-oss-120b:cheapest",
             "engine_type": "omnivoice",
@@ -393,6 +407,18 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/events":
             return self._sse()
+
+        if path == "/api/voice-preview":
+            qs = parse_qs(parsed.query)
+            vname = (qs.get("name") or [""])[0].strip()
+            refs_by_name = {r["name"]: r for r in discover_refs()}
+            ref = refs_by_name.get(vname)
+            if not ref:
+                return self._error("voice not found", 404)
+            wav_path = (REPO_DIR / ref["wav"]).resolve()
+            if not wav_path.is_relative_to(REPO_DIR.resolve()) or not wav_path.exists():
+                return self._error("voice file not found", 404)
+            return self._send_file(wav_path, "audio/wav")
 
         if path == "/api/file":
             qs = parse_qs(parsed.query)
