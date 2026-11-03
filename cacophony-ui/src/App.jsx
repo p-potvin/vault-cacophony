@@ -143,6 +143,26 @@ function LogView({ log, result }) {
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
+// Measured delivery from the voice store (voices.py derive-prosody): how fast,
+// how high, how long the pauses, how often "uh"/"um".
+function ProsodyChips({ p }) {
+  const chips = []
+  if (p.f0_hz) chips.push(['pitch', `${Math.round(p.f0_hz)} Hz`])
+  if (p.syll_per_s) chips.push(['rate', `${p.syll_per_s} syl/s`])
+  if (p.pause_ms) chips.push(['pause', `${Math.round(p.pause_ms)} ms`])
+  if (p.fillers_per_100w != null) chips.push(['uh/um', `${p.fillers_per_100w}/100w`])
+  if (!chips.length) return null
+  return (
+    <div className="flex flex-wrap gap-1">
+      {chips.map(([k, v]) => (
+        <span key={k} className="rounded bg-zinc-800/80 px-1.5 py-0.5 font-mono text-[9px] text-zinc-400" title={k}>
+          {k} {v}
+        </span>
+      ))}
+    </div>
+  )
+}
+
 export default function App() {
   const { connected, running, log, result, runId, outDir } = useRunStream()
   const [opts, setOpts] = useState(null)
@@ -467,6 +487,7 @@ export default function App() {
                           “{r.text}”
                         </span>
                       )}
+                      {r.prosody && <ProsodyChips p={r.prosody} />}
                     </button>
                   )
                 })}

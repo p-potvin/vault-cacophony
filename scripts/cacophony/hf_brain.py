@@ -60,6 +60,31 @@ class HfDialogueBrain:
                 raise
         raise last_err  # type: ignore[misc]
 
+    @staticmethod
+    def _consume_stream(stream_resp, on_text=None):
+        """Drain a streamed chat completion into (content, reasoning).
+
+        `on_text` is called with each content delta as it arrives, so a caller
+        can surface tokens live (the whole point of streaming) while still
+        getting the full text back for parsing.
+        """
+        content: List[str] = []
+        reasoning: List[str] = []
+        for chunk in stream_resp:
+            if not getattr(chunk, "choices", None):
+                continue
+            delta = chunk.choices[0].delta
+            c = getattr(delta, "content", None)
+            if c:
+                content.append(c)
+                if on_text is not None:
+                    on_text(c)
+            else:
+                r = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                if r:
+                    reasoning.append(r)
+        return "".join(content), "".join(reasoning)
+
     def generate_turn(
         self,
         speaker_name: str,
@@ -78,13 +103,18 @@ class HfDialogueBrain:
         """Generate a single conversational turn in character with optional bounce off previous speaker."""
         topic_block = f"\nConversation premise / starting topic: {narrative_hint}\n" if narrative_hint else ""
         if allow_prosody_tags:
+            # The vocabulary speech_markup.parse_tagged understands: one leading
+            # delivery tone, then non-verbal sounds and pauses where they occur.
+            # Each engine gets these rendered in its own dialect downstream, so
+            # the model never needs to know which engine is speaking.
             tag_rule = (
-                "4. Modulate the TTS voice by weaving 1 to 3 inline Fish Audio S2 Pro vocal acting, emotion, and "
-                "staging tags in square brackets directly into the line where the delivery shifts (e.g. "
-                "[sighing], [laughing], [chuckling], [gasping], [clear throat], [break], [in a hurry tone], "
-                "[soft tone], [emphasis], [excited], [nervous], [sarcastic], [skeptical], [frustrated], "
-                "[confident], [calm], [surprised], [worried]).\n"
-                "5. Output ONLY the spoken line with its square-bracket tags. NO asterisks, NO parentheses, "
+                "4. You may add delivery cues in square brackets. Start with at most ONE tone cue describing how "
+                "the whole line is said (e.g. [excited], [sarcastic], [skeptical], [worried], [calm], [confident], "
+                "[soft tone], [in a hurry tone]). Inside the line, use at most two of: [sighs], [laughs], "
+                "[chuckling], [gasping], [breath], [clear throat], [short pause], [pause], [long pause], placed "
+                "exactly where the sound or silence happens (a sigh before a reluctant admission, a pause before "
+                "the punchline). Do not write 'uh' or 'um'; hesitations are added downstream.\n"
+                "5. Output ONLY the spoken line with its square-bracket cues. NO asterisks, NO parentheses, "
                 "NO quotes, NO emojis, NO speaker name prefixes."
             )
         else:
@@ -157,21 +187,10 @@ class HfDialogueBrain:
                 temperature=self.temperature,
                 stream=True,
             )
-            collected_content: List[str] = []
-            collected_reasoning: List[str] = []
-            for chunk in stream_resp:
-                delta = chunk.choices[0].delta
-                c = getattr(delta, "content", None)
-                if c:
-                    collected_content.append(c)
-                else:
-                    r = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
-                    if r:
-                        collected_reasoning.append(r)
-            if collected_content:
-                raw = "".join(collected_content)
+            content, reasoning = self._consume_stream(stream_resp)
+            if content:
+                raw = content
             else:
-                reasoning = "".join(collected_reasoning)
                 forbidden = {
                     (target_utterance or "").strip().lower(),
                     (prev_utterance or "").strip().lower(),
@@ -234,6 +253,8 @@ class HfDialogueBrain:
         history: List[Dict[str, str]],
         narrative_hint: Optional[str] = None,
         max_tokens: int = 1200,
+        stream: bool = False,
+        on_line=None,
     ) -> List[str]:
         """Generate 5–10 dialogue turns in a single LLM request according to `turn_plan`.
 
@@ -243,6 +264,12 @@ class HfDialogueBrain:
             history: Recent conversation history (`[{"role": ..., "content": "NAME: text"}, ...]`).
             narrative_hint: Premise / starting topic.
             max_tokens: Token budget for the full batch.
+            stream: Request a streamed completion. Lines are parsed as the
+                tokens arrive and handed to `on_line(index, text)` the moment
+                each one is complete, so the console (and anything else
+                listening) sees the batch being written rather than waiting for
+                the whole request.
+            on_line: Optional callback for each finished line when streaming.
 
         Returns:
             List of clean spoken strings matching `len(turn_plan)`. Automatically falls back to
@@ -261,6 +288,7 @@ class HfDialogueBrain:
                     target_speaker=step.get("target"),
                     bounce_mode=step.get("bounce_mode"),
                     narrative_hint=narrative_hint,
+                    stream=stream,
                     allow_prosody_tags=False,
                 )
             ]
@@ -309,12 +337,30 @@ class HfDialogueBrain:
             ],
             max_tokens=max(max_tokens, 220 * len(turn_plan)),
             temperature=self.temperature,
-            stream=False,
+            stream=stream,
         )
-        choice = resp.choices[0]
-        raw = (choice.message.content or "").strip()
-        if not raw:
-            raw = (getattr(choice.message, "reasoning_content", None) or getattr(choice.message, "reasoning", None) or "").strip()
+        if stream:
+            pending = [""]
+            emitted = [0]
+
+            def _feed(delta: str) -> None:
+                # Hand each line over the moment its newline arrives.
+                pending[0] += delta
+                while "\n" in pending[0]:
+                    line, pending[0] = pending[0].split("\n", 1)
+                    if line.strip() and on_line is not None:
+                        on_line(emitted[0], line.strip())
+                        emitted[0] += 1
+
+            content, reasoning = self._consume_stream(resp, on_text=_feed)
+            if pending[0].strip() and on_line is not None:
+                on_line(emitted[0], pending[0].strip())
+            raw = (content or reasoning).strip()
+        else:
+            choice = resp.choices[0]
+            raw = (choice.message.content or "").strip()
+            if not raw:
+                raw = (getattr(choice.message, "reasoning_content", None) or getattr(choice.message, "reasoning", None) or "").strip()
 
         # Parse numbered or speaker-prefixed lines
         parsed_by_idx: Dict[int, str] = {}
@@ -356,6 +402,7 @@ class HfDialogueBrain:
                     target_speaker=step.get("target"),
                     bounce_mode=step.get("bounce_mode"),
                     narrative_hint=narrative_hint,
+                    stream=stream,
                     allow_prosody_tags=False,
                 )
             results.append(line_text)

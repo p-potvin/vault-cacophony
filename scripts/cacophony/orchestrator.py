@@ -23,6 +23,19 @@ from cacophony.acoustic_mixer import AcousticRoomMixer
 from cacophony.turn_taker import TurnTakingScheduler, TransitionType
 from cacophony.vocal_habits import SmartVocalPicker
 from cacophony.raggae_bridge import sync_custom_voices_to_store
+import speech_markup as sm
+
+
+def _turn_speed(base: float, ann, engine: str) -> float:
+    """Persona cadence times the turn's tone rate -- unless the engine acts the tone out itself.
+
+    Fish Audio reads the `[tone]` cue and performs it, rate included; scaling
+    its output again would apply the emotion twice. Every other engine only
+    gets words, so the SSML rate is the one way the tone reaches it.
+    """
+    if sm.dialect_for(engine) == "fish":
+        return base
+    return round(float(base) * float(getattr(ann, "speed_scale", 1.0) or 1.0), 4)
 
 
 def _recent_history(history: List[Dict[str, str]], limit: int) -> List[Dict[str, str]]:
@@ -67,12 +80,24 @@ def _generate_turn_once(brain, max_429_attempts: int = 3, **kwargs) -> Tuple[Opt
     return None, last_diag
 
 
+def _accepted_kwargs(fn, kwargs: dict) -> dict:
+    """Drop keyword arguments `fn` cannot take (older/mock brains predate `stream`)."""
+    import inspect
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
+
+
 def _generate_batch_once(brain, max_429_attempts: int = 3, **kwargs) -> Tuple[Optional[List[str]], Optional[str]]:
     last_diag: Optional[str] = None
     for attempt in range(1, max_429_attempts + 1):
         try:
             if hasattr(brain, "generate_turns_batch"):
-                return brain.generate_turns_batch(**kwargs), None
+                return brain.generate_turns_batch(**_accepted_kwargs(brain.generate_turns_batch, kwargs)), None
             # Fallback if a mock/test brain only implements generate_turn
             turn_plan = kwargs.get("turn_plan") or []
             personas = kwargs.get("personas") or {}
@@ -87,6 +112,7 @@ def _generate_batch_once(brain, max_429_attempts: int = 3, **kwargs) -> Tuple[Op
                     target_speaker=step.get("target"),
                     bounce_mode=step.get("bounce_mode"),
                     narrative_hint=kwargs.get("narrative_hint"),
+                    stream=bool(kwargs.get("stream", False)),
                     allow_prosody_tags=False,
                 )
                 lines.append(line)
@@ -256,6 +282,7 @@ class CacophonyOrchestrator:
         except Exception as sync_err:
             print(f"  [!] VoiceStore sync warning: {sync_err}")
         self.smart_picker = SmartVocalPicker()
+        self.markup_records: List[dict] = []
 
         print("[*] Initializing FastMSS Turn-Taking Scheduler...")
         self.scheduler = TurnTakingScheduler()
@@ -438,6 +465,8 @@ class CacophonyOrchestrator:
         batch_size = max(1, int(getattr(self.args, "batch_size", 1) or 1))
         if not hasattr(self, "smart_picker") or self.smart_picker is None:
             self.smart_picker = SmartVocalPicker()
+        if not hasattr(self, "markup_records"):
+            self.markup_records = []
 
         print("\n=======================================================")
         print(f"  Starting Staggered Multi-Speaker Orchestration")
@@ -499,13 +528,16 @@ class CacophonyOrchestrator:
                     sim_prev_tgt = tgt
 
                 persona_map = {p.name: p.description for p in self.personas}
-                print(f"\n[Batch Turns {turn_idx + 1}..{turn_idx + cur_batch_n} | t={current_timeline_end:.1f}s] Generating {cur_batch_n} dialogue lines via HF Brain...")
+                stream_enabled = bool(getattr(self.args, "stream", True))
+                print(f"\n[Batch Turns {turn_idx + 1}..{turn_idx + cur_batch_n} | t={current_timeline_end:.1f}s] Generating {cur_batch_n} dialogue lines via HF Brain{' (streaming)' if stream_enabled else ''}...")
                 raw_lines, diagnostic = _generate_batch_once(
                     self.brain,
                     personas=persona_map,
                     turn_plan=[{"speaker": s["speaker"], "target": s["target"], "bounce_mode": s["bounce_mode"]} for s in planned_steps],
                     history=_recent_history(history, self.args.history_turns) if history else [],
                     narrative_hint=self.seed_topic,
+                    stream=stream_enabled,
+                    on_line=(lambda i, line: print(f"    ~ {line}", flush=True)) if stream_enabled else None,
                 )
                 if diagnostic or raw_lines is None:
                     self.run_error = diagnostic
@@ -543,11 +575,13 @@ class CacophonyOrchestrator:
                     ref_text = spk.voice_ref_text
                     if not ref_text and spk.voice_ref_wav and spk.voice_ref_wav.with_suffix(".txt").exists():
                         ref_text = spk.voice_ref_wav.with_suffix(".txt").read_text(encoding="utf-8").strip()
+                    eff_eng = (spk.engine or self.args.engine_type).lower()
+                    self._record_markup(t_num, spk, eff_eng, ann)
                     tts_jobs.append({
                         "text": ann.rendered_text,
                         "speaker_idx": spk.index,
                         "voice_name": spk.voice_name,
-                        "speed_ratio": spk.speed_ratio,
+                        "speed_ratio": _turn_speed(spk.speed_ratio, ann, eff_eng),
                         "voice_ref_wav": spk.voice_ref_wav,
                         "voice_ref_text": ref_text,
                         "engine_type": spk.engine,
@@ -592,7 +626,6 @@ class CacophonyOrchestrator:
             )
 
             effective_engine = (speaker.engine or self.args.engine_type).lower()
-            allow_prosody = effective_engine in ("fish_audio", "fish", "fish-s2", "cosyvoice")
 
             target_utt = None
             if target:
@@ -610,6 +643,9 @@ class CacophonyOrchestrator:
             mode_tag = "Answering" if getattr(self.args, "answering_mode", False) else "Improvised"
             print(f"\n[Turn {turn_num} | {mode_tag}: {speaker.name} -> {target.name if target else 'ALL'} | t={current_timeline_end:.1f}s] ({speaker.voice_name}, speed={speaker.speed_ratio:.2f}x)...")
             stream_enabled = getattr(self.args, "stream", True)
+            # The LLM may write delivery cues whatever the engine: the Smart
+            # Picker parses them and renders them in the engine's own dialect
+            # (plain punctuation for engines with no tag support).
             allow_prosody = getattr(self.args, "allow_prosody_tags", True)
             utterance_text, diagnostic = _generate_turn_once(
                 self.brain,
@@ -635,16 +671,17 @@ class CacophonyOrchestrator:
                 TransitionType.TURN_HOLD.value if turn_num == 1
                 else (TransitionType.INTERRUPTION.value if action_type == "interject" else TransitionType.INTERLEAVED_REPLY.value)
             )
-            if effective_engine in ("omnivoice", "omni", "fish_audio", "fish", "fish-s2"):
-                ann = self.smart_picker.annotate_turn(
-                    clean_text=utterance_text,
-                    speaker_name=speaker.name,
-                    voice_name=speaker.voice_name,
-                    engine_type=effective_engine,
-                    transition_type=trans_hint,
-                    turn_num=turn_num,
-                )
-                utterance_text = ann.rendered_text
+            ann = self.smart_picker.annotate_turn(
+                clean_text=utterance_text,
+                speaker_name=speaker.name,
+                voice_name=speaker.voice_name,
+                engine_type=effective_engine,
+                transition_type=trans_hint,
+                turn_num=turn_num,
+            )
+            utterance_text = ann.rendered_text
+            turn_speed = _turn_speed(speaker.speed_ratio, ann, effective_engine)
+            self._record_markup(turn_num, speaker, effective_engine, ann)
 
             print(f"  > [{speaker.name} -> {target.name if target else 'ALL'}]: \"{utterance_text}\"")
 
@@ -665,7 +702,7 @@ class CacophonyOrchestrator:
                     text=utterance_text,
                     speaker_idx=speaker.index,
                     voice_name=speaker.voice_name,
-                    speed_ratio=speaker.speed_ratio,
+                    speed_ratio=turn_speed,
                     voice_ref_wav=speaker.voice_ref_wav,
                     voice_ref_text=ref_text,
                     engine_type=speaker.engine,
@@ -680,7 +717,7 @@ class CacophonyOrchestrator:
                     text=utterance_text,
                     speaker_idx=speaker.index,
                     voice_name=speaker.voice_name,
-                    speed_ratio=speaker.speed_ratio,
+                    speed_ratio=turn_speed,
                     voice_ref_wav=speaker.voice_ref_wav,
                     voice_ref_text=ref_text,
                     engine_type=speaker.engine,
@@ -717,6 +754,11 @@ class CacophonyOrchestrator:
 
         _write_run_status(self.out_dir, self.args.turns, len(turn_records), self.run_error)
 
+        markup_path = self.out_dir / "prosody_markup.json"
+        with open(markup_path, "w", encoding="utf-8") as f:
+            json.dump({"standard": "SSML 1.1", "turns": getattr(self, "markup_records", [])},
+                      f, indent=2, ensure_ascii=False)
+
         with open(transcript_path, "w", encoding="utf-8") as f:
             f.write("=== MULTI-SPEAKER CONVERSATION TRANSCRIPT ===\n")
             if self.run_error:
@@ -734,8 +776,24 @@ class CacophonyOrchestrator:
         print(f"    Master Stereo WAV: {master_wav_path} ({total_sec:.2f}s)")
         print(f"    Manifest Timeline: {manifest_path}")
         print(f"    Transcript Log:    {transcript_path}")
+        print(f"    Prosody Markup:    {markup_path}")
         print(f"    Run Status:        {status_path}")
         return master_wav_path
+
+    def _record_markup(self, turn_num: int, speaker, engine: str, ann) -> None:
+        """Keep each turn's delivery in its canonical (SSML) and rendered forms for the run's output."""
+        self.markup_records.append({
+            "turn": turn_num,
+            "speaker": speaker.name,
+            "voice": speaker.voice_name,
+            "engine": engine,
+            "tone": ann.selected_tone,
+            "tone_method": ann.tone_method,
+            "words": sm.parse_ssml(ann.ssml).words() if ann.ssml else ann.clean_text,
+            "rendered": ann.rendered_text,
+            "ssml": ann.ssml,
+            "speed_scale": ann.speed_scale,
+        })
 
     def _inject_background_rambler(self, base_offset: float, base_duration: float):
         """Pulls a random speech cut from the RamblerPool and positions it in the room background."""

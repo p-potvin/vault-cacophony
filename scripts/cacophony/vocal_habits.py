@@ -25,16 +25,25 @@ Why this exists:
        `[question-en]`, `[question-ah]`, `[question-oh]`, `[surprise-ah]`, `[surprise-oh]`,
        `[dissatisfaction-hnn]`) + natural punctuation pauses (`...`, `—`), stripping any unsupported
        bracket tags so OmniVoice never speaks bracket text literally.
+
+Delivery is built engine-neutrally (`speech_markup.Utterance`) and only then
+rendered into the engine's dialect, so every engine gets the same pauses,
+breaths and hesitations in the only form it understands -- Fish bracket cues,
+OmniVoice tokens, plain punctuation for Kokoro/Magpie/CosyVoice/Chatterbox --
+and every turn also has a canonical SSML 1.1 rendering for the manifest.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import random
 import re
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 
-from cacophony.habit_profiles import (
+import speech_markup as sm
+
+from cacophony.habit_profiles import (  # noqa: E402
     FillerItem,
     ToneAnchor,
     VocalHabitProfile,
@@ -43,49 +52,8 @@ from cacophony.habit_profiles import (
 from cacophony.raggae_bridge import RaggaeBridge
 
 
-# Abstract throat/reaction keys -> engine-native tag strings
-FISH_AUDIO_TAG_MAP: Dict[str, str] = {
-    "clear_throat": "[clear throat]",
-    "sigh": "[sighs]",
-    "gasp": "[gasping]",
-    "laugh": "[laughs]",
-    "chuckle": "[chuckling]",
-    "confirmation": "[soft tone]",
-    "dissatisfaction": "[sighs]",
-    "surprise": "[gasping]",
-    "pause": "[break]",
-}
-
-OMNIVOICE_TAG_MAP: Dict[str, str] = {
-    "clear_throat": "[confirmation-en]",
-    "sigh": "[sigh]",
-    "gasp": "[surprise-ah]",
-    "laugh": "[laughter]",
-    "chuckle": "[laughter]",
-    "confirmation": "[confirmation-en]",
-    "dissatisfaction": "[dissatisfaction-hnn]",
-    "surprise": "[surprise-oh]",
-    "question_ah": "[question-ah]",
-    "question_oh": "[question-oh]",
-    "question_en": "[question-en]",
-    "pause": "...",
-}
-
-OMNIVOICE_ALLOWED_TAGS = {
-    "[laughter]",
-    "[sigh]",
-    "[confirmation-en]",
-    "[question-en]",
-    "[question-ah]",
-    "[question-oh]",
-    "[question-ei]",
-    "[question-yi]",
-    "[surprise-ah]",
-    "[surprise-oh]",
-    "[surprise-wa]",
-    "[surprise-yo]",
-    "[dissatisfaction-hnn]",
-}
+# The OmniVoice non-verbal vocabulary, kept here for callers that check against it.
+OMNIVOICE_ALLOWED_TAGS = set(sm.OMNIVOICE_ALLOWED)
 
 # Post-verb targets where fillers like "like" or "uh" naturally attach in English speech
 _POST_VERB_PATTERN = re.compile(
@@ -122,6 +90,9 @@ class AnnotatedTurn:
     injected_fillers: List[str] = field(default_factory=list)
     injected_throat_tags: List[str] = field(default_factory=list)
     emphasized_word: Optional[str] = None
+    ssml: str = ""                   # canonical SSML 1.1 rendering of the same delivery
+    speed_scale: float = 1.0         # the turn's SSML rate (tone/emotion), to multiply into engine speed
+    markup: Dict[str, object] = field(default_factory=dict)  # engine-neutral token list
 
 
 class SmartVocalPicker:
@@ -134,6 +105,7 @@ class SmartVocalPicker:
     ):
         self.bridge = bridge or RaggaeBridge()
         self.rng = np.random.default_rng(seed)
+        self.py_rng = random.Random(seed)
         # Tracks the last turn index on which each speaker emitted a throat noise
         self._last_throat_turn: Dict[str, int] = {}
 
@@ -218,64 +190,55 @@ class SmartVocalPicker:
             updated = text[: m.start()] + f" {insertion}{sep}" + text[m.end() :]
         return re.sub(r"\s+", " ", updated).strip(), True
 
-    def _apply_word_emphasis(self, text: str, engine: str) -> Tuple[str, Optional[str]]:
-        """Wrap one high-salience content word in *emphasis* for fish_audio."""
-        if engine not in ("fish_audio", "fish", "fish-s2"):
-            return text, None
-        # Find words outside square brackets
-        tokens = text.split(" ")
-        candidate_indices: List[int] = []
-        in_bracket = False
-        for idx, tok in enumerate(tokens):
-            if "[" in tok:
-                in_bracket = True
-            if not in_bracket:
-                bare = re.sub(r"[^a-zA-Z]", "", tok)
-                if len(bare) >= 5 and bare.lower() not in _STOPWORDS:
-                    candidate_indices.append(idx)
-            if "]" in tok:
-                in_bracket = False
-        if not candidate_indices:
-            return text, None
-        chosen_idx = int(self.rng.choice(candidate_indices))
-        raw_tok = tokens[chosen_idx]
-        m = re.match(r"^([^a-zA-Z]*)([a-zA-Z]+)([^a-zA-Z]*)$", raw_tok)
-        if not m:
-            return text, None
-        prefix, word, suffix = m.groups()
-        tokens[chosen_idx] = f"{prefix}*{word}*{suffix}"
-        return " ".join(tokens), word
-
     @staticmethod
     def sanitize_for_engine(text: str, engine: str) -> str:
-        """Ensure only tags supported by `engine` remain in the final TTS string."""
-        eng = engine.lower()
-        if eng == "omnivoice":
-            # Strip *emphasis* asterisks while keeping the word
-            cleaned = re.sub(r"\*([^*]+)\*", r"\1", text)
-            # Keep only official OmniVoice non-verbal bracket tags; convert [break] to '...' and strip others
-            def _omni_bracket(m: "re.Match[str]") -> str:
-                full = m.group(0).strip().lower()
-                if full in OMNIVOICE_ALLOWED_TAGS:
-                    return full
-                if full in ("[break]", "[pause]"):
-                    return "..."
-                if full in ("[sighs]", "[sighing]", "[sarcastic]", "[skeptical]", "[soft tone]", "[dissatisfaction]"):
-                    return "[sigh]"
-                if full in ("[laughs]", "[laughing]", "[chuckling]", "[chuckle]"):
-                    return "[laughter]"
-                if full in ("[gasping]", "[gasp]", "[surprised]"):
-                    return "[surprise-ah]"
-                if full in ("[clear throat]", "[confirmation]", "[confident]", "[excited]"):
-                    return "[confirmation-en]"
-                if full in ("[in a hurry tone]", "[hurry]", "[fast]"):
-                    return "[question-en]"
-                return ""
+        """Ensure only markup supported by `engine` remains in the final TTS string."""
+        return sm.sanitize_for_engine(text, engine)
 
-            cleaned = re.sub(r"\[[^\]]+\]", _omni_bracket, cleaned)
-            cleaned = re.sub(r"\s+", " ", cleaned).strip()
-            return cleaned
-        return re.sub(r"\s+", " ", text).strip()
+    # Abstract habit keys (habit_profiles) -> engine-neutral vocalisations.
+    _HABIT_VOCAL = {
+        "clear_throat": "clear_throat", "sigh": "sigh", "gasp": "gasp", "laugh": "laugh",
+        "chuckle": "chuckle", "confirmation": "confirmation", "dissatisfaction": "hmm",
+        "surprise": "gasp", "question_ah": "question", "question_oh": "question", "question_en": "question",
+    }
+
+    def _emphasize(self, utt: sm.Utterance) -> Optional[str]:
+        """Turn one salient content word into an <emphasis>, in place."""
+        candidates = []
+        for ti, tok in enumerate(utt.tokens):
+            if isinstance(tok, sm.Text):
+                for wi, w in enumerate(tok.text.split(" ")):
+                    bare = re.sub(r"[^a-zA-Z]", "", w)
+                    if len(bare) >= 5 and bare.lower() not in _STOPWORDS and re.fullmatch(r"[^a-zA-Z]*[a-zA-Z]+[^a-zA-Z]*", w):
+                        candidates.append((ti, wi))
+        if not candidates:
+            return None
+        ti, wi = candidates[int(self.rng.integers(len(candidates)))]
+        words = utt.tokens[ti].text.split(" ")  # type: ignore[union-attr]
+        m = re.match(r"^([^a-zA-Z]*)([a-zA-Z]+)([^a-zA-Z]*)$", words[wi])
+        if not m:
+            return None
+        prefix, word, suffix = m.groups()
+        before = " ".join(words[:wi] + ([prefix] if prefix else []))
+        after = " ".join(([suffix] if suffix else []) + words[wi + 1:])
+        replacement: List[sm.Token] = []
+        if before.strip():
+            replacement.append(sm.Text(before.strip()))
+        replacement.append(sm.Emphasis(word))
+        if after.strip():
+            replacement.append(sm.Text(after.strip()))
+        utt.tokens[ti:ti + 1] = replacement
+        return word
+
+    @staticmethod
+    def _first_mid_break(utt: sm.Utterance) -> Optional[int]:
+        seen_text = False
+        for i, tok in enumerate(utt.tokens):
+            if isinstance(tok, (sm.Text, sm.Emphasis)):
+                seen_text = True
+            elif seen_text and isinstance(tok, sm.Break):
+                return i
+        return None
 
     def annotate_turn(
         self,
@@ -288,136 +251,164 @@ class SmartVocalPicker:
         pre_scored_tone: Optional[Tuple[ToneAnchor, float, str]] = None,
         profile: Optional[VocalHabitProfile] = None,
     ) -> AnnotatedTurn:
-        """Annotate a single clean utterance with persona-specific tone, fillers, pauses, and throat noises."""
+        """Annotate one utterance with persona tone, discourse markers, pauses, breaths, hesitations and vocal noises.
+
+        `clean_text` may already carry inline cues (an LLM allowed to write
+        `[sighs]` or `*really*`); they are kept where they were written and
+        translated for the engine like everything else.
+        """
         prof = profile or resolve_profile(speaker_name, voice_name)
         eng = engine_type.lower()
+        palette = [t.tag for t in prof.tone_palette]
+
+        # Inline cues the LLM wrote, separated from the words.
+        inline = sm.parse_tagged(clean_text.strip(), palette)
+        words_only = inline.words()
 
         if pre_scored_tone is not None:
             tone_anchor, tone_score, tone_method = pre_scored_tone
         else:
-            scored = self.bridge.score_tones_batch([clean_text], [prof])
+            scored = self.bridge.score_tones_batch([words_only or clean_text], [prof])
             tone_anchor, tone_score, tone_method = scored[0]
+        tone_tag = tone_anchor.tag
+        if inline.tone:
+            # The writer picked a delivery on purpose; it outranks the scorer.
+            tone_tag = inline.tone
+            tone_anchor = next((t for t in prof.tone_palette if t.tag.lower() == inline.tone),
+                               ToneAnchor(tag=inline.tone, anchor=""))
+            tone_method = "inline"
 
-        working = clean_text.strip()
         injected_fillers: List[str] = []
         injected_throat: List[str] = []
         used_fillers: set[str] = set()
 
-        is_barge_in = transition_type.lower() == "interruption"
+        trans = transition_type.lower()
+        is_barge_in = trans == "interruption"
+        taking_floor = trans in ("turn_switch", "turn_hold", "interleaved_reply")
         throat_cfg = prof.throat_habits
         can_throat = self._can_emit_throat(prof.persona_name, turn_num, throat_cfg.cooldown_turns)
 
-        # 1. Grammar-aware filler words (up to max_fillers_per_turn)
-        if prof.filler_lexicon and self.rng.random() < prof.filler_rate:
-            # Prefer post_verb slot first (e.g. "is like", "seems uh")
-            pv_filler = self._sample_filler_for_slot(prof.filler_lexicon, "post_verb", used_fillers, working.lower())
-            if pv_filler:
-                working, ok = self._inject_post_verb_filler(working, pv_filler)
-                if ok:
-                    injected_fillers.append(pv_filler)
-                    used_fillers.add(pv_filler.lower())
+        # 1. The persona's discourse markers ("frankly", "like", "you know"),
+        #    placed by grammar. Filled pauses ("uh", "um") are not placed here:
+        #    they belong to the hesitation model below, which puts them where a
+        #    speaker would actually be planning.
+        lexicon = [f for f in prof.filler_lexicon if f.word.lower() not in sm.FILLED_PAUSES]
+        segments = [t for t in inline.tokens]
+        text_idx = [i for i, t in enumerate(segments) if isinstance(t, sm.Text)]
 
-            # Optional second filler or fallback in pre_onset / clause_break
+        def _edit_first_text(fn) -> bool:
+            for i in text_idx:
+                new_text, ok = fn(segments[i].text)  # type: ignore[union-attr]
+                if ok:
+                    segments[i] = sm.Text(new_text)
+                    return True
+            return False
+
+        if lexicon and self.rng.random() < prof.filler_rate:
+            pv_filler = self._sample_filler_for_slot(lexicon, "post_verb", used_fillers, words_only.lower())
+            if pv_filler and _edit_first_text(lambda t: self._inject_post_verb_filler(t, pv_filler)):
+                injected_fillers.append(pv_filler)
+                used_fillers.add(pv_filler.lower())
+
             if len(injected_fillers) < prof.max_fillers_per_turn and (
                 not injected_fillers or self.rng.random() < (prof.filler_rate * 0.55)
             ):
-                if self.rng.random() < 0.50:
-                    onset_filler = self._sample_filler_for_slot(prof.filler_lexicon, "pre_onset", used_fillers, working.lower())
-                    if onset_filler and len(working.split()) >= 5:
-                        # Lowercase first letter if it's not "I" or a proper name
-                        first_char = working[0]
-                        rest = working[1:]
-                        if first_char.isupper() and not working.startswith("I ") and not working.startswith("I'"):
-                            for p_name in ("Margot", "Desmond", "Kai", "Chloe", "Clopeux", "Yellow", "Hat", "Hats"):
-                                if working.startswith(p_name):
-                                    break
-                            else:
-                                first_char = first_char.lower()
-                        working = f"{onset_filler.capitalize() if onset_filler != 'I mean' else 'I mean'}, {first_char}{rest}"
+                if self.rng.random() < 0.50 and text_idx and text_idx[0] == 0:
+                    onset_filler = self._sample_filler_for_slot(lexicon, "pre_onset", used_fillers, words_only.lower())
+                    first = segments[0].text  # type: ignore[union-attr]
+                    if onset_filler and len(words_only.split()) >= 5:
+                        lead, rest = first[0], first[1:]
+                        if lead.isupper() and not first.startswith(("I ", "I'")) and not any(
+                            first.startswith(n) for n in ("Margot", "Desmond", "Kai", "Chloe", "Clopeux", "Yellow", "Hat")
+                        ):
+                            lead = lead.lower()
+                        word = onset_filler if onset_filler == "I mean" else onset_filler.capitalize()
+                        segments[0] = sm.Text(f"{word}, {lead}{rest}")
                         injected_fillers.append(onset_filler)
                         used_fillers.add(onset_filler.lower())
 
-        # 2. Clause-break pause / mid-phrase sigh / clause filler
-        clause_pause_tok: Optional[str] = None
-        clause_filler_tok: Optional[str] = None
-        if self.rng.random() < throat_cfg.clause_break_pause_prob:
-            if can_throat and self.rng.random() < throat_cfg.clause_break_sigh_prob:
-                clause_pause_tok = OMNIVOICE_TAG_MAP["sigh"] if eng == "omnivoice" else FISH_AUDIO_TAG_MAP["sigh"]
+        if len(injected_fillers) < prof.max_fillers_per_turn and self.rng.random() < (prof.filler_rate * 0.45):
+            cb_filler = self._sample_filler_for_slot(lexicon, "clause_break", used_fillers, words_only.lower())
+            if cb_filler and _edit_first_text(lambda t: self._inject_clause_break(t, None, cb_filler)):
+                injected_fillers.append(cb_filler)
+                used_fillers.add(cb_filler.lower())
+
+        # 2. Pauses, breaths and hesitations at planning points, from the
+        #    speaker's pause and disfluency models, under the turn's prosody.
+        emotion = tone_anchor.emotion() if hasattr(tone_anchor, "emotion") else sm.TONE_EMOTION.get(tone_tag, sm.Emotion())
+        prosody = prof.baseline.combine(emotion.to_prosody(prof.emotion_intensity))
+        utt = sm.humanize(
+            sm.Utterance(tokens=segments, tone=tone_tag),
+            self.py_rng,
+            pauses=prof.pauses,
+            disfluency=prof.disfluency,
+            taking_floor=taking_floor,
+            interrupting=is_barge_in,
+            tone=tone_tag,
+            prosody=prosody,
+            pause_prob=throat_cfg.clause_break_pause_prob,
+        )
+        injected_fillers += [t.word for t in utt.tokens if isinstance(t, sm.Filler)]
+
+        # 3. A mid-utterance sigh at a clause pause.
+        if can_throat and self.rng.random() < throat_cfg.clause_break_pause_prob * throat_cfg.clause_break_sigh_prob:
+            at = self._first_mid_break(utt)
+            if at is not None:
+                utt.tokens.insert(at + 1, sm.Vocal("sigh"))
                 injected_throat.append("clause_sigh")
                 self._record_throat(prof.persona_name, turn_num)
                 can_throat = False
-            else:
-                clause_pause_tok = "..." if eng == "omnivoice" else "[break]"
 
-        if len(injected_fillers) < prof.max_fillers_per_turn and self.rng.random() < (prof.filler_rate * 0.45):
-            clause_filler_tok = self._sample_filler_for_slot(prof.filler_lexicon, "clause_break", used_fillers, working.lower())
-
-        if clause_pause_tok or clause_filler_tok:
-            working, cb_ok = self._inject_clause_break(working, clause_pause_tok, clause_filler_tok)
-            if cb_ok and clause_filler_tok:
-                injected_fillers.append(clause_filler_tok)
-                used_fillers.add(clause_filler_tok.lower())
-
-        # 3. Pre-onset throat noise (suppressed on fast barge-in interruptions so barge-ins stay snappy)
-        onset_tag_str = ""
+        # 4. Throat noise before speaking -- never on a barge-in, which has no
+        #    time for one. It replaces an onset breath rather than stacking.
+        onset_vocal: Optional[str] = None
         if not is_barge_in and can_throat and self.rng.random() < throat_cfg.pre_onset_prob:
-            abstract_onset = self._sample_weighted_dict(throat_cfg.pre_onset_tags)
-            if abstract_onset:
-                onset_tag_str = (
-                    OMNIVOICE_TAG_MAP.get(abstract_onset, "[confirmation-en]")
-                    if eng == "omnivoice"
-                    else FISH_AUDIO_TAG_MAP.get(abstract_onset, "[clear throat]")
-                )
-                injected_throat.append(f"pre_onset:{abstract_onset}")
-                self._record_throat(prof.persona_name, turn_num)
-                can_throat = False
-        elif eng == "omnivoice" and tone_anchor.omnivoice_onset and can_throat and self.rng.random() < 0.35:
-            # In OmniVoice, surface the tone's expressive onset token (e.g. [sigh], [surprise-ah])
-            onset_tag_str = tone_anchor.omnivoice_onset
-            injected_throat.append(f"tone_onset:{onset_tag_str}")
+            abstract = self._sample_weighted_dict(throat_cfg.pre_onset_tags)
+            if abstract:
+                onset_vocal = self._HABIT_VOCAL.get(abstract, "clear_throat")
+                injected_throat.append(f"pre_onset:{abstract}")
+        elif eng in ("omnivoice", "omni") and tone_anchor.omnivoice_onset and can_throat and self.rng.random() < 0.35:
+            cue = sm.parse_tagged(tone_anchor.omnivoice_onset).tokens
+            onset_vocal = cue[0].kind if cue and isinstance(cue[0], sm.Vocal) else None
+            if onset_vocal:
+                injected_throat.append(f"tone_onset:{tone_anchor.omnivoice_onset}")
+        if onset_vocal:
+            if utt.tokens and isinstance(utt.tokens[0], sm.Vocal) and utt.tokens[0].kind == "breath":
+                utt.tokens[0] = sm.Vocal(onset_vocal)
+            else:
+                utt.tokens.insert(0, sm.Vocal(onset_vocal))
             self._record_throat(prof.persona_name, turn_num)
             can_throat = False
 
-        # 4. Post-turn tail noise (chuckle, laugh, trailing sigh)
-        post_tag_str = ""
+        # 5. A trailing chuckle, laugh or sigh after making the point.
         if can_throat and self.rng.random() < throat_cfg.post_turn_prob:
-            abstract_post = self._sample_weighted_dict(throat_cfg.post_turn_tags)
-            if abstract_post:
-                post_tag_str = (
-                    OMNIVOICE_TAG_MAP.get(abstract_post, "[sigh]")
-                    if eng == "omnivoice"
-                    else FISH_AUDIO_TAG_MAP.get(abstract_post, "[sighs]")
-                )
-                injected_throat.append(f"post_turn:{abstract_post}")
+            abstract = self._sample_weighted_dict(throat_cfg.post_turn_tags)
+            if abstract:
+                utt.add(sm.Vocal(self._HABIT_VOCAL.get(abstract, "sigh")))
+                injected_throat.append(f"post_turn:{abstract}")
                 self._record_throat(prof.persona_name, turn_num)
 
-        # 5. Salient word *emphasis* (Fish Audio S2 Pro supports *emphasis*)
+        # 6. One stressed word. Carried for every engine: Fish and SSML voice
+        #    it, the plain-text engines simply drop the mark.
         emphasized_word = None
-        if eng in ("fish_audio", "fish", "fish-s2") and self.rng.random() < throat_cfg.emphasis_prob:
-            working, emphasized_word = self._apply_word_emphasis(working, eng)
+        if not any(isinstance(t, sm.Emphasis) for t in utt.tokens) and self.rng.random() < throat_cfg.emphasis_prob:
+            emphasized_word = self._emphasize(utt)
+        elif any(isinstance(t, sm.Emphasis) for t in utt.tokens):
+            emphasized_word = next(t.text for t in utt.tokens if isinstance(t, sm.Emphasis))
 
-        # 6. Assemble final engine-specific utterance
-        prefix_parts = []
-        if eng in ("fish_audio", "fish", "fish-s2"):
-            prefix_parts.append(f"[{tone_anchor.tag}]")
-        if onset_tag_str:
-            prefix_parts.append(onset_tag_str)
-
-        assembled = " ".join(prefix_parts + [working])
-        if post_tag_str:
-            assembled = f"{assembled} {post_tag_str}"
-
-        rendered = self.sanitize_for_engine(assembled, eng)
         return AnnotatedTurn(
             clean_text=clean_text,
-            rendered_text=rendered,
+            rendered_text=sm.render(utt, eng),
             engine_type=eng,
-            selected_tone=tone_anchor.tag,
+            selected_tone=tone_tag,
             tone_score=tone_score,
             tone_method=tone_method,
             injected_fillers=injected_fillers,
             injected_throat_tags=injected_throat,
             emphasized_word=emphasized_word,
+            ssml=utt.to_ssml(),
+            speed_scale=round(float(utt.prosody.rate), 4),
+            markup=utt.to_dict(),
         )
 
     def annotate_batch(

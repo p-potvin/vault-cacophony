@@ -209,6 +209,13 @@ PersonaPlex's pauses, fillers and breathing. Their plan, which is sound:
 Caveat worth repeating to them: a cascade can only *simulate* disfluency.
 PersonaPlex's pauses come from reacting in real time to the other speaker.
 
+Step 1 now exists in a stronger form than token injection: `speech_markup.py`
+holds each turn's delivery engine-neutrally (SSML 1.1 + EmotionML PAD), places
+breaths, log-normal pauses and "uh"/"um" at planning points per the disfluency
+literature, renders it for Fish / OmniVoice / plain-text engines, and the voice
+store keeps per-voice pause/rate/disfluency models (`voices.py derive-prosody`).
+See `docs/voice-prosody.md`. Steps 2 and 3 are still open.
+
 **Turn length drifts long** — 19 s by turn 6 despite "at most two short
 sentences". Llama stops honouring it as history grows. Needs a hard token cap,
 not a politer prompt.

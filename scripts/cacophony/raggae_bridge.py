@@ -226,6 +226,7 @@ def sync_custom_voices_to_store(store_path: Optional[str] = None, embed_audio: b
                         ref_text=ref_text,
                         habits=habits_dict,
                     )
+                    store.derive_prosody(voice_name)
                     synced.append(voice_name)
                     continue
 
