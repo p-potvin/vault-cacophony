@@ -10,9 +10,7 @@
     beside the file:
 
         <base>.captions.jsonl   one line per chunk (rt-vlm's dense caption shape)
-        <base>.summary.json     the LVS CompletionResponse envelope
-        <base>.summary.md       the same, readable
-        <base>.tags.json        `caption` and `event` tracks in the tag store
+        <base>.summary.json     the summary and its events, readable JSON
 
     The request vocabulary is VSS's: a scenario, a list of event types to
     surface, optional objects of interest, chunk duration and frames per chunk.

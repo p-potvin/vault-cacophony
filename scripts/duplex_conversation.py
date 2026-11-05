@@ -161,14 +161,14 @@ def main():
                     "-f", "concat", "-safe", "0", "-i", listing,
                     "-ac", "1", "-ar", str(RATE), conversation], check=True)
 
-    store = tagstore.load(os.path.join(out_dir, "conversation.tags.json"))
+    store = tagstore.load(conversation)
     tagstore.set_media(store, conversation, clock)
-    tagstore.put_cues(store, [(t["start"], t["end"], t["text"]) for t in record])
+    tagstore.write_srt(tagstore.srt_path(conversation), [(t["start"], t["end"], t["text"]) for t in record])
     tagstore.put_track(store, "speaker",
                        [{"start": t["start"], "end": t["end"], "value": t["agent"]}
                         for t in record],
                        "conversation", model="personaplex-7b-v1")
-    tagstore.save(store, os.path.join(out_dir, "conversation.tags.json"))
+    tagstore.save(store)
 
     print(f"\n  {clock:.1f}s over {len(record) - 1} turns")
     print(f"    {conversation}\n")

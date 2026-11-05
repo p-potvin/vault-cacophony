@@ -298,8 +298,9 @@ def main():
     ap.add_argument("--cue-gap", type=float, default=0.08,
                     help="gap kept between one cue and the next when a cue is extended")
     ap.add_argument("--tagged-text", help="transcript with <lang> tags, from --language auto")
-    ap.add_argument("--tags-out", help="tag store to write the language track and cues into")
-    ap.add_argument("--media", help="media path recorded in the tag store")
+    ap.add_argument("--tags", action="store_true",
+                    help="write the language track into the --media file's sidecar `tags`")
+    ap.add_argument("--media", help="the media file the cues belong to (needed by --tags)")
     ap.add_argument("--model-name", help="model credited for the language track")
     args = ap.parse_args()
 
@@ -338,18 +339,17 @@ def main():
             print(f"    [!] language tags drifted {drift:.0%} from the word stream; "
                   f"tagging the file, not the cues", file=sys.stderr)
 
-    if args.tags_out:
+    if args.tags:
+        if not args.media:
+            raise SystemExit("--tags needs --media (the file whose sidecar gets the language track)")
         # Merge into whatever is already there: this pass owns the language
-        # track and the cues, and must not disturb a speaker track written
-        # before it or after it.
-        store = tagstore.load(args.tags_out)
+        # track and must not disturb a speaker track written before or after
+        # it. The cue text itself is the .srt this run writes.
+        store = tagstore.load(args.media)
         tagstore.set_media(store, args.media, cues[-1][1] if cues else None)
-        # The store keeps cue text on one line; the wrapping is a display
-        # decision that belongs to the .srt, not to the annotations.
-        tagstore.put_cues(store, [(s, e, " ".join(t.split())) for s, e, t, _ in cues])
         tagstore.put_track(store, "language", tagstore.collapse(spans), "asr",
                            model=args.model_name)
-        tagstore.save(store, args.tags_out)
+        tagstore.save(store)
 
     spoken = sorted({s["value"] for s in spans})
     extra = f", {'/'.join(spoken)}" if spoken else ""

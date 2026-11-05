@@ -13,7 +13,7 @@ per-frame, per-speaker activity and so handles overlap -- but its labels are
 local to a 20-second window, and this is what will link them across windows and
 across files. Building it first is what makes that possible.
 
-    python speakers.py --audio episode.16k.wav --tags episode.tags.json
+    python speakers.py --audio episode.16k.wav --media episode.mkv [--srt episode.srt]
 """
 
 from __future__ import annotations
@@ -195,7 +195,7 @@ def gather(audio, spans, cap=PROSODY_CAP_S):
     return np.concatenate([audio[int(s * 16000):int(e * 16000)] for s, e in merged[::step]])
 
 
-def record(known, store, audio, audio_path, tags_path, spans, vectors, labels, ordered,
+def record(known, store, audio, audio_path, media_path, spans, vectors, labels, ordered,
            members, centroids, names, scores, voted, threshold, match_threshold):
     """Write one observation per cluster: the embedding, and why to believe it.
 
@@ -209,14 +209,9 @@ def record(known, store, audio, audio_path, tags_path, spans, vectors, labels, o
     the same 0.85 against a 0.55 neighbour is a coin toss that happened to land,
     and only the file it came from ever knew that.
     """
-    media = store.get("media", {})
     # The wav handed to this pass is a temp file the pipeline deletes on its way
-    # out, so recording it would leave the store pointing at nothing. The tag
-    # store sits beside the media it describes, and knows its name.
-    if media.get("path"):
-        media_path = os.path.abspath(os.path.join(os.path.dirname(tags_path), media["path"]))
-    else:
-        media_path = os.path.abspath(audio_path)
+    # out, so the observation names the media file the tags belong to instead.
+    media_path = os.path.abspath(media_path)
     recorded = {}
     for label in ordered:
         languages = {}
@@ -247,9 +242,9 @@ def record(known, store, audio, audio_path, tags_path, spans, vectors, labels, o
             centroid, windows=np.stack(members[label]),
             voice=names[label] if not names[label].startswith("SPEAKER_") else None,
             label=names[label],
-            media=media.get("path") or os.path.basename(audio_path),
+            media=os.path.basename(media_path),
             media_path=media_path,
-            media_duration=media.get("duration"),
+            media_duration=store.get("duration"),
             start_s=min(c["start"] for c in cues) if cues else None,
             end_s=max(c["end"] for c in cues) if cues else None,
             speech_seconds=round(spoken, 3),
@@ -259,19 +254,22 @@ def record(known, store, audio, audio_path, tags_path, spans, vectors, labels, o
             matched=names[label] if not names[label].startswith("SPEAKER_") else None,
             metrics={k: v for k, v in metrics.items() if v is not None},
             source={"pass": "speaker", "model": "campplus-voxceleb-lm",
-                    "tags": os.path.basename(tags_path),
+                    "media": os.path.basename(media_path),
                     "window_s": WINDOW_S, "hop_s": HOP_S,
                     "cluster_threshold": threshold, "match_threshold": match_threshold,
                     "speakers_in_file": len(ordered)})
     return recorded
 
 
-def run(audio_path, tags_path, store_path=None, threshold=CLUSTER_THRESHOLD,
-        match_threshold=voicestore.MATCH_THRESHOLD, min_span=MIN_SPAN_S, quiet=False):
-    store = tagstore.load(tags_path)
-    cues = store.get("cues", [])
+def run(audio_path, media_path, store_path=None, threshold=CLUSTER_THRESHOLD,
+        match_threshold=voicestore.MATCH_THRESHOLD, min_span=MIN_SPAN_S, quiet=False, srt_path=None):
+    """Attribute the cues of `media_path`'s .srt (or `srt_path`) to speakers; the `speaker` track goes into the
+    media's sidecar `tags`."""
+    store = tagstore.load(media_path)
+    srt_path = srt_path or tagstore.srt_path(media_path)
+    cues = tagstore.read_srt(srt_path)
     if not cues:
-        raise SystemExit(f"no cues in {tags_path}; run the subtitle pass first")
+        raise SystemExit(f"no cues in {srt_path}; run the subtitle pass first")
 
     embedder = Embedder()
     audio = read_wav(audio_path)
@@ -309,14 +307,14 @@ def run(audio_path, tags_path, store_path=None, threshold=CLUSTER_THRESHOLD,
     tagstore.put_track(store, "speaker", tagstore.collapse(spans), "speaker",
                        model="campplus-voxceleb-lm",
                        clustered_at=round(threshold, 3))
-    tagstore.save(store, tags_path)
+    tagstore.save(store)
 
     # Deposit the evidence. This runs after the tag store is written, and its
     # failure is caught below, because the subtitle pass calling this must not
     # lose a finished speaker track to a locked database.
     recorded = {}
     try:
-        recorded = record(known, store, audio, audio_path, tags_path, usable, vectors,
+        recorded = record(known, store, audio, audio_path, media_path, usable, vectors,
                           labels, ordered, members, centroids, names, scores, voted,
                           threshold, match_threshold)
     except Exception as exc:  # sqlite errors, a read-only store, a full disk
@@ -325,7 +323,7 @@ def run(audio_path, tags_path, store_path=None, threshold=CLUSTER_THRESHOLD,
 
     if not quiet:
         print(f"    {len(ordered)} speaker(s) over {len(voted)} of {len(cues)} cues "
-              f"({len(usable)} windows) -> {tags_path}")
+              f"({len(usable)} windows) -> {tagstore.sidecar_path(media_path)}")
         for label in ordered:
             spoken = sum(c["end"] - c["start"] for c, l in voted if l == label)
             named = not names[label].startswith("SPEAKER_")
@@ -342,7 +340,8 @@ def main():
     import argparse
     ap = argparse.ArgumentParser(description="Attribute cues to speakers and write the speaker track")
     ap.add_argument("--audio", required=True, help="16 kHz mono wav of the same media")
-    ap.add_argument("--tags", required=True, help="tag store written by the subtitle pass")
+    ap.add_argument("--media", required=True, help="the media file: its sidecar gets the speaker track")
+    ap.add_argument("--srt", help="the cues to attribute (default: the .srt beside --media)")
     ap.add_argument("--voices", help="voice store (default: %%LOCALAPPDATA%%\\VaultWares\\voices.json)")
     ap.add_argument("--threshold", type=float, default=CLUSTER_THRESHOLD,
                     help="cosine similarity below which two cues are different speakers")
@@ -351,7 +350,8 @@ def main():
     ap.add_argument("--min-span", type=float, default=MIN_SPAN_S,
                     help="windows shorter than this are left unattributed")
     args = ap.parse_args()
-    run(args.audio, args.tags, args.voices, args.threshold, args.match_threshold, args.min_span)
+    run(args.audio, args.media, args.voices, args.threshold, args.match_threshold, args.min_span,
+        srt_path=args.srt)
     return 0
 
 

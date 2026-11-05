@@ -381,8 +381,8 @@ Invoke-Native ffmpeg @('-hide_banner','-loglevel','error','-nostdin','-y',
 
 $turnsJson = Join-Path $OutDir "turns.json"
 ConvertTo-Json @($record) -Depth 4 | Set-Content -LiteralPath $turnsJson -Encoding UTF8
-$tagsPath = Join-Path $OutDir "conversation.tags.json"
-& $Python $ToTags --turns $turnsJson --out $tagsPath --media $conversation
+# the turns become conversation.srt, the speaker / voice tracks go into conversation.wav.json
+& $Python $ToTags --turns $turnsJson --media $conversation
 
 $spoken = $record | Where-Object { $_.latency -ne $null }
 if ($spoken) {
@@ -391,4 +391,4 @@ if ($spoken) {
         $clock, $spoken.Count, $meanLatency) -ForegroundColor Green
 }
 Write-Host ("    {0}" -f $conversation) -ForegroundColor Green
-Write-Host ("    {0}`n" -f $tagsPath) -ForegroundColor DarkGray
+Write-Host ("    {0}`n" -f "$conversation.json") -ForegroundColor DarkGray

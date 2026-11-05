@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Write a conversation's turns into a tag store.
+"""Write a conversation's turns as its .srt and its sidecar `tags`.
 
 A generated conversation is media like any other, so it gets the same shape as
-a film does rather than a bespoke log format: cues for what was said, a
+a film does rather than a bespoke log format: an .srt for what was said, a
 `speaker` track for who said it. That means every consumer already written --
 the tag store CLI, anything that intersects tracks -- works on it unchanged, and
 the diarization pass can later be run over the same audio and compared against
@@ -26,10 +26,9 @@ import tagstore
 
 def main():
     import argparse
-    ap = argparse.ArgumentParser(description="Write conversation turns into a tag store")
+    ap = argparse.ArgumentParser(description="Write conversation turns as its .srt and sidecar tags")
     ap.add_argument("--turns", required=True, help="turns JSON")
-    ap.add_argument("--out", required=True, help="tag store to write")
-    ap.add_argument("--media", help="the stitched conversation wav")
+    ap.add_argument("--media", required=True, help="the stitched conversation wav")
     ap.add_argument("--model", default="personaplex-7b-v1")
     args = ap.parse_args()
 
@@ -39,13 +38,13 @@ def main():
         print("  no turns")
         return 1
 
-    store = tagstore.load(args.out)
+    store = tagstore.load(args.media)
     tagstore.set_media(store, args.media, turns[-1]["end"])
     # One cue per turn. A turn is not a subtitle cue -- it is far too long to
     # read on screen -- but it is the unit that was actually generated, and
     # splitting it here would invent boundaries the model never expressed.
-    tagstore.put_cues(store, [(t["start"], t["end"], " ".join(t.get("text", "").split()))
-                              for t in turns])
+    srt = tagstore.write_srt(tagstore.srt_path(args.media),
+                             [(t["start"], t["end"], t.get("text", "")) for t in turns])
     tagstore.put_track(store, "speaker",
                        tagstore.collapse([{"start": t["start"], "end": t["end"],
                                            "value": t["agent"]} for t in turns]),
@@ -57,8 +56,8 @@ def main():
                        tagstore.collapse([{"start": t["start"], "end": t["end"],
                                            "value": t.get("voice", "?")} for t in turns]),
                        "conversation", model=args.model)
-    tagstore.save(store, args.out)
-    print(f"    {len(turns)} turns -> {args.out}")
+    side = tagstore.save(store)
+    print(f"    {len(turns)} turns -> {srt}, {side}")
     return 0
 
 

@@ -288,7 +288,7 @@ It is cheap to recover and it is load-bearing for a lot of the above:
 
 Not roadmap items — the things the roadmap can assume.
 
-- **Tag store** — one `.tags.json` per media file, independent tracks per pass.
+- **Tag store** — the `tags` key of each media file's sidecar, independent tracks per pass.
   New passes add tracks without disturbing existing ones.
 - **Voice store** — permanent SQLite, centroids plus every observation and its
   evidence. Built specifically so Sortformer's window-local labels can become

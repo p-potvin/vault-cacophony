@@ -32,10 +32,10 @@ approaches that failed and why, and the gotchas that cost real time.
         |               + the language it decoded each segment in
         |
    words_to_srt.py     cues from gaps between words --> <base>.srt
-        |                                           --> <base>.tags.json
+        |                                           --> language track in the sidecar
         |
    speakers.py         CAM++ embeddings of 2 s windows, clustered
-   (-Speakers)         --> speaker track in the tag store
+   (-Speakers)         --> speaker track in the sidecar
         |               --> one observation per speaker in the voice store,
         |                   named from it when a cluster matches
         |
@@ -43,8 +43,8 @@ approaches that failed and why, and the gotchas that cost real time.
    (-Langs)
 ```
 
-Two files land beside the media: a plain `.srt` any player will pick up, and a
-`.tags.json` holding everything that is not text.
+Beside the media: a plain `.srt` any player will pick up (the text), and the
+tracks in the media's own sidecar, `<media>.<ext>.json`, under `tags`.
 
 ## The stack
 
@@ -118,16 +118,16 @@ under music — it is the expensive stage (BS-RoFormer, ~8x realtime):
 .\scripts\Start-SubtitlesAudioCpp.ps1 -TargetDir "D:\Concerts" -Separate
 ```
 
-Read a tag store, and ask what every track says at one moment:
+Read a file's tags, and ask what every track says at one moment:
 
 ```bash
-.venv/Scripts/python.exe scripts/tagstore.py "D:\Media\episode.tags.json" --at 412.5
+.venv/Scripts/python.exe scripts/tagstore.py "D:\Media\episode.mkv" --at 412.5
 ```
 
-Run the speaker pass on its own, against a tag store that already has cues:
+Run the speaker pass on its own, over the cues of the `.srt` beside the file:
 
 ```bash
-.venv/Scripts/python.exe scripts/speakers.py --audio episode.16k.wav --tags episode.tags.json
+.venv/Scripts/python.exe scripts/speakers.py --audio episode.16k.wav --media episode.mkv
 ```
 
 Teach it a name, then check that it sticks. The audio must be 16 kHz mono:
@@ -228,22 +228,29 @@ and let the VLM look at the matching chunks' frames again:
 
 ## What it writes
 
-`<base>.srt` is ordinary SubRip. `<base>.tags.json` is the tag store: one file
-per media file, holding the cues and one independent *track* per analysis pass.
+`<base>.srt` is ordinary SubRip and holds the text. The tag store is the `tags`
+key of the media's main sidecar, `<media>.<ext>.json` (the shared v2 record
+vault-raggae, vault-explorer and vault-commander also keep), with one
+independent *track* per analysis pass:
 
 ```json
-{
-  "schema": 1,
-  "media": {"path": "episode.mkv", "duration": 1356.85},
+"tags": {
+  "duration": 1356.85,
   "tracks": {
     "language": {"source": {"pass": "asr", "model": "nemotron-3.5-asr-streaming-0.6b"},
                  "spans": [{"start": 0.88, "end": 4.40, "value": "en-US"}]},
     "speaker":  {"source": {"pass": "speaker", "model": "campplus-voxceleb-lm"},
                  "spans": [{"start": 0.88, "end": 12.10, "value": "Clopeux"}]}
-  },
-  "cues": [{"start": 0.88, "end": 4.40, "text": "Mister Quilter is..."}]
+  }
 }
 ```
+
+Track values are short labels, so a sidecar stays a few KB however long the
+media is; text that grows with the length (the transcript, VSS captions and
+events) stays in its own file. Each pass rewrites only its own tracks and keeps
+every other key of the sidecar. (Until Thu 05 Nov 2026 this was a separate
+`<base>.tags.json` holding the cues too; those files were migrated once and
+nothing reads that name any more.)
 
 Tracks are independent spans rather than fields on a cue, because the passes do
 not agree on boundaries and never will: a speaker turn runs across cue breaks, a
@@ -252,13 +259,10 @@ screen. Whoever writes first would otherwise fix the segmentation for everyone
 after. Consumers intersect instead, and a pass can run late, run again, or never
 run at all without invalidating the file.
 
-The video pass adds two tracks to the same store, `caption` (one span per
-chunk, the dense caption as its value) and `event` (the summarizer's events,
-type as value, description alongside), and two files of its own:
-`<base>.captions.jsonl`, one line per chunk in the shape VSS's rt-vlm writes,
-and `<base>.summary.json`, the LVS response envelope whose
-`choices[0].message.content` is a JSON string of `{video_summary, events}`,
-with `<base>.summary.md` beside it for reading.
+The video pass writes two files of its own: `<base>.captions.jsonl`, one line
+per chunk in the shape VSS's rt-vlm writes, and `<base>.summary.json`, readable
+JSON with the summary text and the events at the top (then model, request,
+usage). Its `face` pass adds a `face` track to the sidecar's `tags`.
 
 ## The voice store
 

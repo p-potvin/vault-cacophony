@@ -13,7 +13,7 @@
                         in -SepChunkMinutes slices, crossfaded back together
         audiocpp        --task asr --family nemotron_asr --mode streaming
                         --language auto, sub-word timings + language tags
-        words_to_srt.py cues from word gaps, <lang> tags -> .tags.json
+        words_to_srt.py cues from word gaps, <lang> tags -> the sidecar's `tags`
         translate_srt.py deep_translator
 
     Separation is OFF by default (operator, Fri 23 Oct 2026: not every file
@@ -28,9 +28,8 @@
     once the pass count is one rather than the packaged four.
 
     The ASR is nemotron-3.5-asr-streaming-0.6b (-Engine parakeet for the old
-    one). It writes <base>.tags.json beside the .srt: the language it decoded
-    each cue in, which is the first entry in what will hold speaker, emotion and
-    the rest.
+    one). It writes the language it decoded each cue in as a track in the media's
+    sidecar (`tags`), which also holds the speaker track and what comes next.
 
 .PARAMETER Gap
     Seconds of silence that starts a new cue. Cue boundaries come from gaps
@@ -113,7 +112,7 @@ param(
     [switch]$Speakers,
     [string]$Voices,
     # nemotron only. auto makes it announce the language per segment, which is
-    # what fills the .tags.json beside the .srt.
+    # what fills the language track in the media's sidecar.
     [string]$Language = "auto",
     [double]$LongFormThreshold = 300,
     # Past the threshold, parakeet re-encodes bounded windows and keeps only the
@@ -457,8 +456,8 @@ foreach ($f in $files) {
             # nemotron times sub-word pieces and announces the language it decoded
             # each segment in; the tags land in the transcript rather than the
             # token stream, so the cue builder gets both and lines them up.
-            $tagsPath = Join-Path $(if ($OutputDir) { $OutputDir } else { $f.DirectoryName }) "$base.tags.json"
-            $srtArgs += @('--merge-tokens','--tagged-text',$tagged,'--tags-out',$tagsPath,
+            # the language track goes into the media file's sidecar (`tags`)
+            $srtArgs += @('--merge-tokens','--tagged-text',$tagged,'--tags',
                           '--media',$f.FullName,'--model-name','nemotron-3.5-asr-streaming-0.6b')
         }
         & $Python $ToSrt @srtArgs
@@ -469,12 +468,11 @@ foreach ($f in $files) {
         # here rather than as a separate command: the 16 kHz wav it needs is
         # still on disk, and re-extracting it later would cost more than the
         # pass itself.
-        if ($Speakers -and $Engine -eq "nemotron") {
-            $spkArgs = @($ToSpeakers, '--audio', $asrWav, '--tags', $tagsPath)
+        if ($Speakers) {
+            # cues from the .srt just written; the speaker track goes into the media file's sidecar
+            $spkArgs = @($ToSpeakers, '--audio', $asrWav, '--media', $f.FullName, '--srt', $srtPath)
             if ($Voices) { $spkArgs += @('--voices', $Voices) }
             & $Python @spkArgs
-        } elseif ($Speakers) {
-            Write-Host "    [!] -Speakers needs the tag store, which only -Engine nemotron writes" -ForegroundColor Yellow
         }
 
         if ($Langs) { & $Python $ToLang --srt $srtPath --langs $Langs }
