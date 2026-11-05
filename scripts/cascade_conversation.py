@@ -270,14 +270,13 @@ def main():
          "-f", "concat", "-safe", "0", "-i", listing,
          "-ac", "1", "-ar", str(RATE), conversation], "stitch")
 
-    tags = os.path.join(args.out, "conversation.tags.json")
-    store = tagstore.load(tags)
+    store = tagstore.load(conversation)
     tagstore.set_media(store, conversation, clock)
-    tagstore.put_cues(store, [(t["start"], t["end"], t["text"]) for t in record])
+    tagstore.write_srt(tagstore.srt_path(conversation), [(t["start"], t["end"], t["text"]) for t in record])
     tagstore.put_track(store, "speaker",
                        [{"start": t["start"], "end": t["end"], "value": t["agent"]}
                         for t in record], "conversation", model=args.llm)
-    tagstore.save(store, tags)
+    tagstore.save(store)
 
     with open(os.path.join(args.out, "conversation.txt"), "w", encoding="utf-8") as f:
         for t in record:

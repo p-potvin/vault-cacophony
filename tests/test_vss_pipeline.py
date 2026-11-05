@@ -215,25 +215,19 @@ class TestOutputs(unittest.TestCase):
         self.assertEqual(lines, ["**0.0-10.0** one", "**12.0-14.0** two"])
         self.assertEqual(len(vp.batched(list(range(120)), 50)), 3)
 
-    def test_write_tags_and_summary(self):
+    def test_summary_is_readable_json_and_alone(self):
         with tempfile.TemporaryDirectory() as d:
             video = os.path.join(d, "clip.mp4")
-            recs = [{"caption": "cap", "events": [], "chunk": {"chunkIdx": 0, "start": 0.0, "end": 10.0}}]
             summary = {"video_summary": "It happened.",
                        "events": [{"start_time": 1.0, "end_time": 2.0, "type": "t", "description": "d"}]}
-            tags = vp.write_tags(video, recs, summary, "vlm", "llm", 10.0)
-            store = tagstore.load(tags)
-            self.assertEqual(store["tracks"]["caption"]["spans"][0]["value"], "cap")
-            self.assertEqual(store["tracks"]["event"]["spans"][0]["description"], "d")
-            self.assertEqual(store["media"]["duration"], 10.0)
-            out, md = vp.write_summary(video, summary, {"scenario": "s", "events": ["t"]},
-                                       {"total_chunks_processed": 1}, "llm")
+            out = vp.write_summary(video, summary, {"scenario": "s", "events": ["t"]},
+                                   {"total_chunks_processed": 1}, "llm")
             with open(out, encoding="utf-8") as f:
-                env = json.load(f)
-            content = json.loads(env["choices"][0]["message"]["content"])
-            self.assertEqual(content["video_summary"], "It happened.")
-            self.assertEqual(env["usage"]["total_chunks_processed"], 1)
-            self.assertTrue(os.path.exists(md))
+                doc = json.load(f)
+            self.assertEqual(doc["summary"], "It happened.")
+            self.assertEqual(doc["events"], [{"start": 1.0, "end": 2.0, "type": "t", "description": "d"}])
+            self.assertEqual(doc["usage"]["total_chunks_processed"], 1)
+            self.assertEqual(sorted(os.listdir(d)), ["clip.summary.json"])   # no .summary.md, no .tags.json
 
 
 class TestFaceTrackBridge(unittest.TestCase):
@@ -346,8 +340,10 @@ class TestFaceTrackBridge(unittest.TestCase):
             self.assertEqual(best_ex["timestamp"], 3.5)
             self.assertLessEqual(abs(best_ex["yaw_deg"]), 5.0)
 
-            # Write face track into clip.tags.json beside existing caption track, then search for "Alice"
+            # Write the face track into the video's sidecar `tags`, then search for "Alice"
             video = os.path.join(d, "clip.mp4")
+            with open(video, "wb") as vf:
+                vf.write(b"not really a video")
             recs = [
                 {"caption": "A person walks into the hallway.", "events": [],
                  "chunk": {"chunkIdx": 0, "file": "clip.mp4", "start": 0.0, "end": 10.0}},
@@ -357,12 +353,16 @@ class TestFaceTrackBridge(unittest.TestCase):
             with open(os.path.join(d, "clip.captions.jsonl"), "w", encoding="utf-8") as cf:
                 for r in recs:
                     cf.write(json.dumps(r) + "\n")
-            vp.write_tags(video, recs, {"video_summary": "test", "events": []}, "vlm", "llm", 20.0)
+            with open(video + ".json", "w", encoding="utf-8") as sf:
+                json.dump({"schema": 2, "vw": {"id": "01ARZ3NDEKTSV4RRFFQ69G5FAV", "kind": "video"}}, sf)
             faces.write_face_track(video, annotated, identities, duration=20.0, gallery_path=db_path)
 
-            store = tagstore.load(os.path.join(d, "clip.tags.json"))
-            self.assertIn("caption", store["tracks"])
-            self.assertIn("face", store["tracks"])
+            with open(video + ".json", encoding="utf-8") as sf:
+                side = json.load(sf)
+            self.assertEqual(side["vw"]["id"], "01ARZ3NDEKTSV4RRFFQ69G5FAV")   # the other keys are kept
+            self.assertFalse(os.path.exists(os.path.join(d, "clip.tags.json")))
+            store = tagstore.load(video)
+            self.assertEqual(sorted(store["tracks"]), ["face"])
             self.assertEqual(tagstore.value_at(store, "face", 3.5), "Alice")
             self.assertEqual(tagstore.value_at(store, "face", 13.0), "FACE_0")
 

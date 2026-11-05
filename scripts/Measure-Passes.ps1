@@ -326,19 +326,21 @@ if ($Stages -contains "speakers") {
     # The speaker pass needs cues, and cues come from the ASR. Build them from
     # whatever the asr stage just wrote rather than running the model twice.
     $words = Join-Path $OutDir "bench.words.json"
-    $tags  = Join-Path $OutDir "bench.tags.json"
+    # tags go into the sidecar of a stand-in file in the bench folder, never into the measured media's own
+    $benchMedia = Join-Path $OutDir "bench.wav"
     if (-not (Test-Path -LiteralPath $words)) {
         Write-Host "  [!] speakers needs the asr stage to have run; skipping" -ForegroundColor Yellow
     } else {
         $srtArgs = @((Join-Path $PSScriptRoot "words_to_srt.py"),
                      '--words',$words,'--out',(Join-Path $OutDir "bench.srt"),
-                     '--tags-out',$tags,'--media',$Audio,'--model-name',$Engine)
+                     '--tags','--media',$benchMedia,'--model-name',$Engine)
         if ($Engine -eq "nemotron") {
             $srtArgs += @('--merge-tokens','--tagged-text',(Join-Path $OutDir "bench.txt"))
         }
         & $Python @srtArgs | Out-Null
         Measure-Stage -Name "speakers" -Cpu -Exe $Python -Media $span -Arguments @(
-            (Join-Path $PSScriptRoot "speakers.py"), '--audio', $wav16, '--tags', $tags)
+            (Join-Path $PSScriptRoot "speakers.py"), '--audio', $wav16, '--media', $benchMedia,
+            '--srt', (Join-Path $OutDir "bench.srt"))
     }
 }
 

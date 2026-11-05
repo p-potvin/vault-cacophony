@@ -22,9 +22,10 @@ ggml runtime, and the results written beside the media file.
     Ollama  (LLM)         caption_summarization -> summary_aggregation ->
         |                 {video_summary, events}, the LVS response shape
         |
-    <base>.summary.json   CompletionResponse envelope, content is a JSON string
-    <base>.summary.md     the same, readable
-    <base>.tags.json      `caption` and `event` tracks in the tag store
+    <base>.summary.json   the summary and its events, readable JSON (+ model, request, usage)
+
+The `face` pass writes its track into the video's sidecar `tags` (tagstore.py), next to the `speaker` / `language`
+tracks of the subtitle passes; captions and events stay in the two files above, which own that text.
 
 `search` ranks chunks across many files with BM25 over their captions, which
 is what VSS's Elasticsearch leg does before the agent reads the hits. `ask`
@@ -717,57 +718,30 @@ def aggregate(records, cfg, scenario, events, llm_model, log=print):
 
 
 def write_summary(video, summary, request, usage, model):
-    """The LVS CompletionResponse: content is a JSON string, as VSS's CLI expects."""
+    """<base>.summary.json, readable as it is: the summary text and the events at the top, then what produced them.
+    (It used to be the LVS CompletionResponse envelope, whose content was a JSON string, with a .summary.md beside it
+    for reading; nothing read the envelope, and one readable file replaces both.)"""
     out = sidecar(video, ".summary.json")
-    envelope = {
-        "id": os.path.basename(video),
+    doc = {
+        "video": os.path.basename(video),
+        "written": time.strftime("%a, %d %b %Y %H:%M"),
+        "summary": summary["video_summary"].strip(),
+        "events": [{"start": e["start_time"], "end": e["end_time"], "type": e["type"],
+                    "description": e["description"]} for e in summary.get("events", [])],
         "model": model,
-        "created": time.strftime("%a, %d %b %Y %H:%M"),
-        "choices": [{"index": 0, "finish_reason": "stop",
-                     "message": {"role": "assistant",
-                                 "content": json.dumps(summary, ensure_ascii=False)}}],
-        "usage": usage,
         "request": request,
+        "usage": usage,
     }
     with open(out, "w", encoding="utf-8") as f:
-        json.dump(envelope, f, ensure_ascii=False, indent=1)
-    md = sidecar(video, ".summary.md")
-    with open(md, "w", encoding="utf-8") as f:
-        f.write(f"# {os.path.basename(video)}\n\n")
-        f.write(f"Scenario: {request.get('scenario')}  \nEvents: {', '.join(request.get('events') or [])}  \n")
-        f.write(f"Model: {model}  \nWritten: {envelope['created']}\n\n")
-        f.write(summary["video_summary"].strip() + "\n\n")
-        if summary["events"]:
-            f.write("## Events\n\n")
-            for e in summary["events"]:
-                f.write(f"- **{e['start_time']:.1f}-{e['end_time']:.1f} s** [{e['type']}] {e['description']}\n")
-    return out, md
-
-
-def write_tags(video, records, summary, vlm_model, llm_model, duration):
-    """`caption` and `event` tracks beside whatever the ASR passes wrote."""
-    path = sidecar(video, ".tags.json")
-    store = tagstore.load(path)
-    tagstore.set_media(store, video, duration)
-    caps = []
-    for r in records:
-        c = r["chunk"]
-        text = (r.get("caption") or "").strip()
-        if text:
-            caps.append({"start": c["start"], "end": c["end"], "value": text})
-    tagstore.put_track(store, "caption", caps, "vlm", model=vlm_model)
-    evs = [{"start": e["start_time"], "end": e["end_time"], "value": e["type"],
-            "description": e["description"]} for e in (summary or {}).get("events", [])]
-    tagstore.put_track(store, "event", evs, "summarize", model=llm_model)
-    tagstore.save(store, path)
-    return path
+        json.dump(doc, f, ensure_ascii=False, indent=2)
+    return out
 
 
 def faces_file(video, cfg, chunk_duration, overlap, frames, gallery_path=None,
                min_similarity=faces.DEFAULT_MATCH_THRESHOLD,
                cluster_threshold=faces.DEFAULT_CLUSTER_THRESHOLD,
                device="cuda", detector=None, log=print):
-    """Detect, cluster, and gallery-match faces over the VSS chunk frames -> <base>.tags.json `face` track."""
+    """Detect, cluster, and gallery-match faces over the VSS chunk frames -> the `face` track in the video's sidecar."""
     info = probe(video)
     if not info["has_video"]:
         raise RuntimeError("no video stream")
@@ -846,12 +820,21 @@ class BM25:
         return out
 
 
+def media_for(base):
+    """The video a `<base>.captions.jsonl` belongs to (same stem, any video extension), or None."""
+    for ext in sorted(VIDEO_EXT):
+        for e in (ext, ext.upper()):
+            if os.path.isfile(base + e):
+                return base + e
+    return None
+
+
 def _enrich_records_from_tags(base_video, records):
-    """Attach overlapping `face` and `speaker` values from `<base>.tags.json` to each chunk record."""
-    tags_path = base_video + ".tags.json"
-    if not os.path.exists(tags_path):
+    """Attach overlapping `face` and `speaker` values from the video's sidecar `tags` to each chunk record."""
+    media = media_for(base_video)
+    if not media:
         return records
-    store = tagstore.load(tags_path)
+    store = tagstore.load(media)
     face_spans = store.get("tracks", {}).get("face", {}).get("spans", [])
     spk_spans = store.get("tracks", {}).get("speaker", {}).get("spans", [])
     if not face_spans and not spk_spans:
@@ -877,24 +860,23 @@ def _enrich_records_from_tags(base_video, records):
 
 
 def collect_captions(targets):
-    """Every .captions.jsonl (and face-tagged .tags.json) under the targets, as (video, record) pairs."""
+    """Every .captions.jsonl (and video with a `face` track in its sidecar) under the targets, as (video, record)
+    pairs."""
     cap_files = []
-    tag_files = []
+    tagged = []          # videos whose sidecar `tags` has a face track
     for t in targets:
         if os.path.isdir(t):
             cap_files += glob.glob(os.path.join(glob.escape(t), "**", "*.captions.jsonl"), recursive=True)
-            tag_files += glob.glob(os.path.join(glob.escape(t), "**", "*.tags.json"), recursive=True)
+            for ext in sorted(VIDEO_EXT):
+                tagged += glob.glob(os.path.join(glob.escape(t), "**", "*" + ext), recursive=True)
         elif t.endswith(".captions.jsonl"):
             cap_files.append(t)
-        elif t.endswith(".tags.json"):
-            tag_files.append(t)
         else:
             c = sidecar(t, ".captions.jsonl")
             if os.path.exists(c):
                 cap_files.append(c)
-            tg = sidecar(t, ".tags.json")
-            if os.path.exists(tg):
-                tag_files.append(tg)
+            if os.path.isfile(t):
+                tagged.append(t)
     pairs = []
     seen_bases = set()
     for f in sorted(set(cap_files)):
@@ -903,12 +885,12 @@ def collect_captions(targets):
         recs = _enrich_records_from_tags(base, read_captions(f))
         for r in recs:
             pairs.append((base, r))
-    # Also index videos that only have a .tags.json (e.g. `faces` pass run before `caption`)
-    for tf in sorted(set(tag_files)):
-        base = tf[:-len(".tags.json")]
+    # Also index videos that only have face tags (e.g. `faces` pass run before `caption`)
+    for video in sorted(set(tagged)):
+        base = os.path.splitext(video)[0]
         if os.path.normcase(os.path.abspath(base)) in seen_bases:
             continue
-        store = tagstore.load(tf)
+        store = tagstore.load(video)
         face_spans = store.get("tracks", {}).get("face", {}).get("spans", [])
         for idx, sp in enumerate(face_spans):
             val = sp.get("value") or ""
@@ -919,7 +901,7 @@ def collect_captions(targets):
                 "events": [],
                 "audio": "",
                 "faces": [val],
-                "chunk": {"chunkIdx": idx, "file": store.get("media", {}).get("path") or os.path.basename(base),
+                "chunk": {"chunkIdx": idx, "file": os.path.basename(video),
                           "start": sp["start"], "end": sp["end"]},
             }
             pairs.append((base, rec))
@@ -1039,7 +1021,7 @@ def _caption_args(ap):
     ap.add_argument("--enable-audio", action="store_true",
                     help="fold the .srt beside the file into each chunk prompt")
     ap.add_argument("--enable-faces", action="store_true",
-                    help="detect, cluster, and gallery-match faces -> .tags.json `face` track")
+                    help="detect, cluster, and gallery-match faces -> the `face` track in the video's sidecar")
     ap.add_argument("--face-gallery", default=None,
                     help="path to ColONEL-KFC gallery directory or gallery.db")
 
@@ -1079,7 +1061,7 @@ def main(argv=None):
     s.add_argument("--recaption", action="store_true", help="ignore an existing .captions.jsonl")
     _common(s)
 
-    s = sub.add_parser("faces", help="detect, cluster, and gallery-match faces -> .tags.json `face` track")
+    s = sub.add_parser("faces", help="detect, cluster, and gallery-match faces -> the `face` track in the video's sidecar")
     s.add_argument("target", help="video file or directory")
     s.add_argument("--recurse", action="store_true")
     s.add_argument("--gallery", default=None, help="ColONEL-KFC gallery directory or gallery.db")
@@ -1197,15 +1179,15 @@ def main(argv=None):
                            "chunk_overlap_duration": ch["chunk_overlap_duration"],
                            "num_frames_per_chunk": ch["num_frames_per_chunk"],
                            "enable_audio": a.enable_audio, "vlm_model": vlm, "llm_model": llm}
-                out, md = write_summary(video, summary, request, usage, llm)
-                print(f"    summary: {len(summary['events'])} events -> {os.path.basename(md)}")
-            tags = write_tags(video, records, summary, vlm, llm, info["duration"])
+                out = write_summary(video, summary, request, usage, llm)
+                print(f"    summary: {len(summary['events'])} events -> {os.path.basename(out)}")
             if getattr(a, "enable_faces", False):
                 faces_file(video, cfg, ch["chunk_duration"], ch["chunk_overlap_duration"],
                            ch["num_frames_per_chunk"], gallery_path=getattr(a, "face_gallery", None))
-            store = tagstore.load(tags)
-            print("    tags: " + ", ".join(f"{k}={len(v['spans'])} spans"
-                                          for k, v in sorted(store.get("tracks", {}).items())))
+            store = tagstore.load(video)
+            if store.get("tracks"):
+                print("    tags: " + ", ".join(f"{k}={len(v['spans'])} spans"
+                                              for k, v in sorted(store["tracks"].items())))
             print(f"    done in {time.time() - t0:.1f}s")
         except Exception as e:  # one bad file must not stop a directory run
             failed += 1

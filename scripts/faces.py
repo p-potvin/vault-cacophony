@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The face pass: SCRFD detection, GlintR100 clustering, gallery matching, and exemplar picking.
 
-Every video pass in this repo writes its own track into `<media>.tags.json`
+Every video pass in this repo writes its own track into the media's sidecar `tags`
 (`tagstore.py`) and leaves the others alone. This module is the visual
 counterpart to `voices.py`:
 
@@ -24,7 +24,7 @@ counterpart to `voices.py`:
    - detection probability, with temporal separation so exemplars span the clip.
 4. **Tag Store Track (`face`)**
    Writes collapsed time spans `[{start, end, value, similarity, bbox, yaw_deg}]`
-   and per-identity exemplar summaries into `<media>.tags.json`.
+   and per-identity exemplar summaries into the media's sidecar `tags`.
 """
 
 from __future__ import annotations
@@ -573,10 +573,8 @@ def write_face_track(
     model: str = ANTELOPEV2_CONTRACT,
     gallery_path: str = "",
 ) -> str:
-    """Write the `face` track into `<base>.tags.json` without disturbing other tracks."""
-    base, _ = os.path.splitext(video)
-    path = base + ".tags.json"
-    store = tagstore.load(path)
+    """Write the `face` track into the video's sidecar `tags` without disturbing other tracks or keys."""
+    store = tagstore.load(video)
     tagstore.set_media(store, video, duration)
     spans = observations_to_spans(observations, duration=duration)
     extra: Dict[str, Any] = {}
@@ -585,8 +583,7 @@ def write_face_track(
     if gallery_path:
         extra["gallery"] = os.path.basename(gallery_path)
     tagstore.put_track(store, "face", spans, "face", model=model, **extra)
-    tagstore.save(store, path)
-    return path
+    return tagstore.save(store)
 
 
 # ----------------------------------------------------------------------------

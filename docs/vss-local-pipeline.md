@@ -49,7 +49,7 @@ prompts and defaults in [`config/vss/lvs-local.yaml`](../config/vss/lvs-local.ya
 | CA-RAG `caption_summarization` and `summary_aggregation` prompts, `max_events_per_batch: 50` | the same prompts verbatim, same batch size, then one JSON-schema pass for `{video_summary, events}` |
 | LLM NIM | Ollama `llama3.2:3b` |
 | `DenseCaptionSerializer` JSON lines | `<base>.captions.jsonl` |
-| `POST /v1/summarize` response, content as a JSON string | `<base>.summary.json`, plus `.summary.md` |
+| `POST /v1/summarize` response | `<base>.summary.json`: the summary and events as readable JSON |
 | Elasticsearch over captions, the search leg | BM25 in the script over every `.captions.jsonl` under a folder |
 | VLM Q&A (`chat_completion`) | `ask`: BM25 picks the chunks, their frames go back to the VLM with the question |
 | Kafka, Logstash, Redis, HAProxy, Phoenix, the agent and its UI | nothing; the outputs are files beside the media |
@@ -60,9 +60,9 @@ Request vocabulary is VSS's so a caller written against LVS reads the same:
 `--enable-audio`. Defaults are the HITL defaults from the operations skill
 (`activity monitoring`, `notable activity`).
 
-The tag store gets two tracks, `caption` and `event`, next to `language` and
-`speaker`, which is the point of putting this here: one file answers "what
-was on screen while speaker 2 was talking French".
+Captions and events stay in those two files; the `face` pass puts its track in
+the video's sidecar `tags`, next to `language` and `speaker`, and `search` joins
+the two: "what was on screen while speaker 2 was talking French".
 
 ## Measured
 
