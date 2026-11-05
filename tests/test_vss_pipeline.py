@@ -11,6 +11,10 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
+import sqlite3
+import numpy as np
+
+import faces  # noqa: E402
 import tagstore  # noqa: E402
 import vss_pipeline as vp  # noqa: E402
 
@@ -230,6 +234,143 @@ class TestOutputs(unittest.TestCase):
             self.assertEqual(content["video_summary"], "It happened.")
             self.assertEqual(env["usage"]["total_chunks_processed"], 1)
             self.assertTrue(os.path.exists(md))
+
+
+class TestFaceTrackBridge(unittest.TestCase):
+    def _unit_vec(self, seed: int, noise: float = 0.0) -> np.ndarray:
+        rng = np.random.default_rng(seed)
+        v = rng.normal(size=512).astype(np.float32)
+        v /= np.linalg.norm(v)
+        if noise > 0:
+            n = rng.normal(scale=noise, size=512).astype(np.float32)
+            v = v + n
+            v /= np.linalg.norm(v)
+        return v
+
+    def test_pose_estimation_2d106_and_5pts(self):
+        # Frontal 5-point face: eyes at x=38, 74, nose centered at x=56
+        frontal_5 = np.array([
+            [38.0, 52.0], [74.0, 52.0], [56.0, 72.0], [42.0, 92.0], [70.0, 92.0]
+        ], dtype=np.float32)
+        pose_f = faces.estimate_pose_degrees(landmarks_5pts=frontal_5)
+        self.assertAlmostEqual(pose_f["yaw_deg"], 0.0, places=1)
+        self.assertAlmostEqual(pose_f["roll_deg"], 0.0, places=1)
+
+        # Profile 2D-106 face turned sharply to the right
+        pts106 = np.zeros((106, 2), dtype=np.float32)
+        pts106[1] = [20.0, 60.0]       # left cheek
+        pts106[31] = [120.0, 60.0]     # right cheek
+        pts106[33:43] = [45.0, 50.0]   # left eye
+        pts106[87:97] = [95.0, 50.0]   # right eye
+        pts106[86] = [110.0, 70.0]     # nose tip shifted near right cheek
+        pose_p = faces.estimate_pose_degrees(landmarks_106=pts106)
+        self.assertGreater(abs(pose_p["yaw_deg"]), 45.0)
+
+    def test_gallery_sqlite_matching_and_clustering_exemplars(self):
+        alice_base = self._unit_vec(101)
+        bob_unknown_base = self._unit_vec(202)
+
+        with tempfile.TemporaryDirectory() as d:
+            db_path = os.path.join(d, "gallery.db")
+            conn = sqlite3.connect(db_path)
+            conn.executescript("""
+                CREATE TABLE identities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'locked',
+                    threshold REAL DEFAULT 0.50
+                );
+                CREATE TABLE face_crops (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    identity_id INTEGER,
+                    model_name TEXT NOT NULL,
+                    embedding BLOB NOT NULL
+                );
+            """)
+            conn.execute("INSERT INTO identities (id, name, status, threshold) VALUES (1, 'Alice', 'locked', 0.55)")
+            conn.execute("INSERT INTO identities (id, name, status, threshold) VALUES (2, 'QuarantinedPerson', 'quarantined', 0.45)")
+            conn.execute("INSERT INTO face_crops (identity_id, model_name, embedding) VALUES (1, 'Alice', ?)",
+                         (alice_base.tobytes(),))
+            conn.execute("INSERT INTO face_crops (identity_id, model_name, embedding) VALUES (2, 'QuarantinedPerson', ?)",
+                         (bob_unknown_base.tobytes(),))
+            conn.commit()
+            conn.close()
+
+            gallery = faces.FaceGallery.load(db_path)
+            self.assertEqual(gallery.unique_names, ["Alice"])
+
+            # Create observations for Alice (3 frames: 1 profile, 1 small box, 1 large frontal)
+            # and an unknown person (2 frames, since QuarantinedPerson was excluded)
+            frontal_5 = np.array([[38, 52], [74, 52], [56, 72], [42, 92], [70, 92]], dtype=np.float32)
+            profile_5 = np.array([[38, 52], [74, 52], [78, 72], [42, 92], [70, 92]], dtype=np.float32)
+
+            obs = [
+                # Alice frame 1: turned profile (high yaw)
+                faces.FaceObservation(
+                    timestamp=1.5, frame_path="f001.jpg",
+                    embedding=self._unit_vec(101, noise=0.01),
+                    bbox=[10, 10, 150, 150], prob=0.95, landmarks_5pts=profile_5,
+                ),
+                # Alice frame 2: frontal and large box -> should win #1 exemplar
+                faces.FaceObservation(
+                    timestamp=3.5, frame_path="f002.jpg",
+                    embedding=self._unit_vec(101, noise=0.005),
+                    bbox=[10, 10, 210, 210], prob=0.98, landmarks_5pts=frontal_5,
+                ),
+                # Alice frame 3: frontal but tiny box
+                faces.FaceObservation(
+                    timestamp=6.0, frame_path="f003.jpg",
+                    embedding=self._unit_vec(101, noise=0.01),
+                    bbox=[10, 10, 60, 60], prob=0.92, landmarks_5pts=frontal_5,
+                ),
+                # Unknown person frames
+                faces.FaceObservation(
+                    timestamp=12.0, frame_path="f004.jpg",
+                    embedding=self._unit_vec(202, noise=0.01),
+                    bbox=[20, 20, 140, 140], prob=0.96, landmarks_5pts=frontal_5,
+                ),
+                faces.FaceObservation(
+                    timestamp=14.0, frame_path="f005.jpg",
+                    embedding=self._unit_vec(202, noise=0.01),
+                    bbox=[20, 20, 145, 145], prob=0.95, landmarks_5pts=frontal_5,
+                ),
+            ]
+
+            annotated, identities = faces.cluster_observations(obs, gallery=gallery)
+            self.assertIn("Alice", identities)
+            self.assertIn("FACE_0", identities)
+            self.assertEqual(identities["Alice"]["source"], "gallery")
+            # Best exemplar for Alice must be the large frontal frame f002.jpg at t=3.5s
+            best_ex = identities["Alice"]["exemplars"][0]
+            self.assertEqual(best_ex["frame_path"], "f002.jpg")
+            self.assertEqual(best_ex["timestamp"], 3.5)
+            self.assertLessEqual(abs(best_ex["yaw_deg"]), 5.0)
+
+            # Write face track into clip.tags.json beside existing caption track, then search for "Alice"
+            video = os.path.join(d, "clip.mp4")
+            recs = [
+                {"caption": "A person walks into the hallway.", "events": [],
+                 "chunk": {"chunkIdx": 0, "file": "clip.mp4", "start": 0.0, "end": 10.0}},
+                {"caption": "Another person sits at a desk.", "events": [],
+                 "chunk": {"chunkIdx": 1, "file": "clip.mp4", "start": 10.0, "end": 20.0}},
+            ]
+            with open(os.path.join(d, "clip.captions.jsonl"), "w", encoding="utf-8") as cf:
+                for r in recs:
+                    cf.write(json.dumps(r) + "\n")
+            vp.write_tags(video, recs, {"video_summary": "test", "events": []}, "vlm", "llm", 20.0)
+            faces.write_face_track(video, annotated, identities, duration=20.0, gallery_path=db_path)
+
+            store = tagstore.load(os.path.join(d, "clip.tags.json"))
+            self.assertIn("caption", store["tracks"])
+            self.assertIn("face", store["tracks"])
+            self.assertEqual(tagstore.value_at(store, "face", 3.5), "Alice")
+            self.assertEqual(tagstore.value_at(store, "face", 13.0), "FACE_0")
+
+            # Searching for "Alice" across the directory finds chunk 0 (where Alice appears)
+            hits = vp.search([d], "Alice", top_k=5)
+            self.assertEqual(len(hits), 1)
+            self.assertEqual(hits[0]["chunkIdx"], 0)
+            self.assertIn("Alice", hits[0]["faces"])
 
 
 if __name__ == "__main__":
