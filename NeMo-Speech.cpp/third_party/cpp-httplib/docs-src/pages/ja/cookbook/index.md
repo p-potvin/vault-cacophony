@@ -73,6 +73,9 @@ status: "draft"
 - [S21. マルチスレッド数を設定する](s21-thread-pool)
 - [S22. Unix domain socketで通信する](s22-unix-socket)
 
+### プロトコル拡張
+- [S23. カスタムHTTPメソッドを扱う](s23-custom-methods)
+
 ## TLS / セキュリティ
 
 - [T01. OpenSSL・mbedTLS・wolfSSLの選択指針](t01-tls-backends)
@@ -94,3 +97,5 @@ status: "draft"
 - [W02. ハートビートを設定する](w02-websocket-ping)
 - [W03. 接続クローズをハンドリングする](w03-websocket-close)
 - [W04. バイナリフレームを送受信する](w04-websocket-binary)
+- [W05. wss接続でTLSを設定する](w05-websocket-tls)
+- [W06. タイムアウトを設定する](w06-websocket-timeouts)

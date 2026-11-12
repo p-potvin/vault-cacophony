@@ -17,6 +17,8 @@ auto res = cli.Get("/users");
 
 The request goes through the proxy. For HTTPS, the client uses the CONNECT method to tunnel through — no extra setup required.
 
+If the proxy refuses the tunnel, the request fails with `Error::ProxyConnection`. The exception is a 407: it comes back as the response, so `res` is truthy and `res->status` is 407, while `res.error()` still returns `Error::ProxyConnection`.
+
 ## Proxy authentication
 
 If the proxy itself requires authentication, use `set_proxy_basic_auth()` or `set_proxy_bearer_token_auth()`.
@@ -55,7 +57,7 @@ You often want internal endpoints to skip the proxy. Configure a bypass list wit
 
 ```cpp
 cli.set_proxy("proxy.internal", 8080);
-cli.set_no_proxy({"internal.corp", "10.0.0.0/8", "*.dev.local"});
+cli.set_no_proxy({"internal.corp", "10.0.0.0/8", ".dev.local"});
 ```
 
 Each entry is one of:
@@ -68,6 +70,20 @@ Each entry is one of:
 Hostname matching is case-insensitive and uses a dot-boundary rule, so an entry of `example.com` does **not** match `evilexample.com`. IP comparisons are normalized through `inet_pton`, so `127.0.0.1` cannot be bypassed via alternate string forms (e.g. `127.000.000.001`). When an entry matches, the `Proxy-Authorization` header is suppressed as well.
 
 Malformed entries are silently dropped. Port-specific entries such as `example.com:8080` are not supported (cpp-httplib's other host-keyed APIs are also keyed on hostname only).
+
+## Use a proxy for WebSocket
+
+`ws::WebSocketClient` has the same proxy setters.
+
+```cpp
+httplib::ws::WebSocketClient cli("wss://ws.example.com/chat");
+cli.set_proxy("proxy.internal", 8080);
+cli.set_proxy_basic_auth("user", "password");
+
+auto res = cli.connect();
+```
+
+For both `ws://` and `wss://`, the client opens a tunnel with the CONNECT method and then performs the WebSocket handshake through it. `set_no_proxy()` works the same way.
 
 ## Read proxy settings from the environment
 

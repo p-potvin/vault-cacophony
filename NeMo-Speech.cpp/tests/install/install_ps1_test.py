@@ -24,6 +24,10 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
+def log(message: str) -> None:
+    print(f"[install-test] {message}", flush=True)
+
+
 def archive(version: str, arch: str, binary: Path) -> tuple[str, bytes, str]:
     name = f"nemo-speech-{version}-windows-{arch}-cpu.zip"
     with tempfile.TemporaryDirectory(prefix="nemo-speech-windows-archive-") as temporary:
@@ -49,13 +53,21 @@ def source_repository(root: Path, version: str, binary: Path) -> Path:
     scripts = repository / "scripts" / "windows"
     scripts.mkdir(parents=True)
     shutil.copy2(binary, repository / "nemo-speech.exe")
+    # The CLI links its libraries as DLLs; without them the installed binary
+    # fails its version check with STATUS_DLL_NOT_FOUND.
+    libraries = sorted(path.name for path in binary.parent.glob("*.dll"))
+    for name in libraries:
+        shutil.copy2(binary.parent / name, repository / name)
+    install_libraries = (
+        f"install(FILES {' '.join(libraries)} DESTINATION bin)\n" if libraries else ""
+    )
     (repository / "LICENSE").write_text("test license\n", encoding="utf-8")
     (repository / "CMakeLists.txt").write_text(
-        """cmake_minimum_required(VERSION 3.26)
-project(installer_source_fixture NONE)
-install(PROGRAMS nemo-speech.exe DESTINATION bin)
-install(FILES LICENSE DESTINATION share/licenses/nemo-speech)
-""",
+        "cmake_minimum_required(VERSION 3.26)\n"
+        "project(installer_source_fixture NONE)\n"
+        "install(PROGRAMS nemo-speech.exe DESTINATION bin)\n"
+        + install_libraries
+        + "install(FILES LICENSE DESTINATION share/licenses/nemo-speech)\n",
         encoding="utf-8",
     )
     (scripts / "build.ps1").write_text(
@@ -111,6 +123,17 @@ def main() -> None:
         raise RuntimeError("install_ps1_test.py is a Windows-only test")
     powershell = sys.argv[1]
     binary = Path(sys.argv[2]).resolve()
+    # The fixture packages this binary as the "cpu" release. install.ps1 runs
+    # `doctor` as a health check, which fails when the binary carries a GPU
+    # backend but the host exposes no GPU. That is correct installer behavior
+    # and unrelated to what this test covers, so skip rather than fail.
+    doctor = subprocess.run(
+        [str(binary), "--json", "doctor"], capture_output=True, text=True, check=False
+    )
+    if doctor.returncode != 0:
+        print("[install-test] skipped: the built CLI fails its own health check here:")
+        print(doctor.stdout.strip() or doctor.stderr.strip())
+        raise SystemExit(77)
     source_root = Path(__file__).resolve().parents[2]
     installer = source_root / "scripts" / "install.ps1"
     arch = "aarch64" if platform.machine().lower() in {"aarch64", "arm64"} else "x86_64"
@@ -136,6 +159,16 @@ def main() -> None:
                 self.send_error(404)
                 return
             self.send_response(200)
+            # Without a text Content-Type, PowerShell 7 exposes .Content as
+            # byte[] and the installer's VERSION regex cannot match.
+            self.send_header(
+                "Content-Type",
+                (
+                    "text/plain; charset=utf-8"
+                    if self.path == "/VERSION"
+                    else "application/octet-stream"
+                ),
+            )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -164,24 +197,38 @@ def main() -> None:
             )
 
             def run(*arguments: str, ok: bool = True) -> subprocess.CompletedProcess[str]:
-                result = subprocess.run(
-                    [
-                        powershell,
-                        "-NoLogo",
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-ExecutionPolicy",
-                        "Bypass",
-                        "-File",
-                        str(installer),
-                        *arguments,
-                    ],
+                command = [
+                    powershell,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(installer),
+                    *arguments,
+                ]
+                with subprocess.Popen(
+                    command,
                     env=environment,
                     text=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    check=False,
-                )
+                ) as process:
+                    try:
+                        output, _ = process.communicate(timeout=300)
+                    except subprocess.TimeoutExpired:
+                        # Popen.kill() stops only pwsh; take its children with it.
+                        subprocess.run(
+                            ["taskkill", "/T", "/F", "/PID", str(process.pid)],
+                            check=False,
+                            capture_output=True,
+                        )
+                        output, _ = process.communicate()
+                        raise RuntimeError(
+                            f"installer timed out after 300s; output so far:\n{output}"
+                        ) from None
+                result = subprocess.CompletedProcess(command, process.returncode, output, None)
                 if ok and result.returncode != 0:
                     raise RuntimeError(f"installer failed ({result.returncode}):\n{result.stdout}")
                 if not ok and result.returncode == 0:
@@ -191,6 +238,7 @@ def main() -> None:
             remote_source = "https://github.com/NVIDIA/NeMo-Speech.cpp.git"
             environment["NEMO_SPEECH_SOURCE_URL"] = remote_source
             environment.pop("NEMO_SPEECH_SOURCE_REF", None)
+            log("dry-run plans")
             remote_plan = run("-Source", "-Backend", "cpu", "-DryRun")
             require(f"{remote_source}#main" in remote_plan.stdout, "remote source ref")
             environment["NEMO_SPEECH_SOURCE_REF"] = "review-test"
@@ -199,6 +247,7 @@ def main() -> None:
             environment["NEMO_SPEECH_SOURCE_URL"] = str(source)
             environment.pop("NEMO_SPEECH_SOURCE_REF")
 
+            log("binary install")
             run("-Prefix", str(prefix), "-Backend", "cpu", "-NoModifyPath")
             metadata = prefix / ".nemo-speech-install"
             require(
@@ -236,6 +285,7 @@ def main() -> None:
             require(metadata.read_text(encoding="utf-8").startswith("1.2.4 "), "rollback")
 
             source_prefix = root / "source-install"
+            log("source fallback build")
             fallback = run(
                 "-Prefix",
                 str(source_prefix),
@@ -263,6 +313,7 @@ def main() -> None:
             )
             require("Already installed from source" in repeated.stdout, "source idempotence")
 
+            log("published binary replaces source install")
             name, contents, checksum = archive("1.2.6", arch, binary)
             releases[f"/releases/download/v1.2.6/{name}"] = contents
             releases[f"/releases/download/v1.2.6/{name}.sha256"] = f"{checksum}  {name}\n".encode()

@@ -53,6 +53,18 @@ struct params {
     fs::path model;
     std::string text;
     std::string language = "en";
+    std::string tokenizer_name;
+    std::string locale;
+    std::string grapheme_case;
+    std::string grapheme_prefix;
+    std::string ascii_letter_case;
+    std::string phoneme_dict;
+    std::string heteronyms;
+    int offset = 0;
+    int eos_id = 0;
+    int expected_vocab_size = 0;
+    bool apostrophe = true;
+    bool pad_with_space = false;
     bool sentence_chunking = true;
     std::function<std::string(const std::string&, bool)> chunk_text_transform;
 };
@@ -65,7 +77,7 @@ struct chunk {
 struct tokenizer_result {
     std::string language;
     std::string tokenizer_name;
-    int eos_id = 2361;
+    int eos_id = 0;
     std::vector<chunk> chunks;
 };
 
@@ -98,15 +110,6 @@ split_utf8(const std::string& s) {
         }
         out.push_back(s.substr(i, n));
         i += n;
-    }
-    return out;
-}
-
-static std::string
-join_utf8(const std::vector<std::string>& chars) {
-    std::string out;
-    for (const auto& c : chars) {
-        out += c;
     }
     return out;
 }
@@ -331,21 +334,29 @@ hindi_tokens() {
 
 #ifdef NEMO_SPEECH_TTS_WITH_JA
 static std::vector<std::string>
-japanese_tokens() {
-    return {" ",  "0",  "1",  "ァ", "ア",    "ィ",   "イ", "ゥ", "ウ",     "ェ", "エ", "ォ", "オ",
-            "カ", "ガ", "キ", "ギ", "ク",    "グ",   "ケ", "ゲ", "コ",     "ゴ", "サ", "ザ", "シ",
-            "ジ", "ス", "ズ", "セ", "ゼ",    "ソ",   "ゾ", "タ", "ダ",     "チ", "ヂ", "ッ", "ツ",
-            "ヅ", "テ", "デ", "ト", "ド",    "ナ",   "ニ", "ヌ", "ネ",     "ノ", "ハ", "バ", "パ",
-            "ヒ", "ビ", "ピ", "フ", "ブ",    "プ",   "ヘ", "ベ", "ペ",     "ホ", "ボ", "ポ", "マ",
-            "ミ", "ム", "メ", "モ", "ャ",    "ヤ",   "ュ", "ユ", "ョ",     "ヨ", "ラ", "リ", "ル",
-            "レ", "ロ", "ヮ", "ワ", "ヲ",    "ン",   "ヴ", "ヵ", "ヶ",     "ー", "A",  "B",  "C",
-            "D",  "E",  "F",  "G",  "H",     "I",    "J",  "K",  "L",      "M",  "N",  "O",  "P",
-            "Q",  "R",  "S",  "T",  "U",     "V",    "W",  "X",  "Y",      "Z",  "!",  "\"", "(",
-            ")",  ",",  "-",  ".",  "/",     ":",    ";",  "?",  "[",      "]",  "{",  "}",  "«",
-            "»",  "•",  "‥",  "…",  "‹",     "›",    "※",  "◦",  "、",     "。", "〃", "〈", "〉",
-            "《", "》", "「", "」", "『",    "』",   "【", "】", "〒",     "〓", "〔", "〕", "〖",
-            "〗", "〘", "〙", "〚", "〛",    "〜",   "〽", "・", "・・・", "ー", "﹅", "﹆", "！",
-            "＊", "？", "｟", "｠", "<pad>", "<oov>"};
+japanese_tokens(bool lowercase_ascii = false) {
+    std::vector<std::string> tokens = {
+        " ",  "0",  "1",  "ァ", "ア", "ィ",    "イ",   "ゥ", "ウ", "ェ", "エ",     "ォ", "オ", "カ",
+        "ガ", "キ", "ギ", "ク", "グ", "ケ",    "ゲ",   "コ", "ゴ", "サ", "ザ",     "シ", "ジ", "ス",
+        "ズ", "セ", "ゼ", "ソ", "ゾ", "タ",    "ダ",   "チ", "ヂ", "ッ", "ツ",     "ヅ", "テ", "デ",
+        "ト", "ド", "ナ", "ニ", "ヌ", "ネ",    "ノ",   "ハ", "バ", "パ", "ヒ",     "ビ", "ピ", "フ",
+        "ブ", "プ", "ヘ", "ベ", "ペ", "ホ",    "ボ",   "ポ", "マ", "ミ", "ム",     "メ", "モ", "ャ",
+        "ヤ", "ュ", "ユ", "ョ", "ヨ", "ラ",    "リ",   "ル", "レ", "ロ", "ヮ",     "ワ", "ヲ", "ン",
+        "ヴ", "ヵ", "ヶ", "ー", "A",  "B",     "C",    "D",  "E",  "F",  "G",      "H",  "I",  "J",
+        "K",  "L",  "M",  "N",  "O",  "P",     "Q",    "R",  "S",  "T",  "U",      "V",  "W",  "X",
+        "Y",  "Z",  "!",  "\"", "(",  ")",     ",",    "-",  ".",  "/",  ":",      ";",  "?",  "[",
+        "]",  "{",  "}",  "«",  "»",  "•",     "‥",    "…",  "‹",  "›",  "※",      "◦",  "、", "。",
+        "〃", "〈", "〉", "《", "》", "「",    "」",   "『", "』", "【", "】",     "〒", "〓", "〔",
+        "〕", "〖", "〗", "〘", "〙", "〚",    "〛",   "〜", "〽", "・", "・・・", "ー", "﹅", "﹆",
+        "！", "＊", "？", "｟", "｠", "<pad>", "<oov>"};
+    if (lowercase_ascii) {
+        for (auto& token : tokens) {
+            if (token.size() == 1 && token[0] >= 'A' && token[0] <= 'Z') {
+                token[0] = static_cast<char>(token[0] - 'A' + 'a');
+            }
+        }
+    }
+    return tokens;
 }
 #endif
 
@@ -371,6 +382,9 @@ ipa_punct(const std::string& locale) {
     } else if (locale == "es-ES") {
         p.insert("¿");
         p.insert("¡");
+    } else if (locale == "hi-IN") {
+        p.insert("।");
+        p.insert("॥");
     }
     return std::vector<std::string>(p.begin(), p.end());
 }
@@ -850,50 +864,6 @@ pad_short_text_chunk_before_eos(chunk& ch, int eos_id, int pad_id) {
     ch.tokens.insert(ch.tokens.begin() + 1, pad_count, pad_id);
 }
 
-static std::string
-tokenizer_for_language(const std::string& lang) {
-    if (lang == "en")
-        return "english_phoneme";
-    if (lang == "de")
-        return "german_phoneme";
-    if (lang == "es")
-        return "spanish_phoneme";
-    if (lang == "fr")
-        return "french_chartokenizer";
-    if (lang == "it")
-        return "italian_phoneme";
-    if (lang == "vi")
-        return "vietnamese_phoneme";
-#ifdef NEMO_SPEECH_TTS_WITH_ZH
-    if (lang == "zh")
-        return "mandarin_phoneme";
-#endif
-    if (lang == "hi")
-        return "hindi_chartokenizer";
-#ifdef NEMO_SPEECH_TTS_WITH_JA
-    if (lang == "ja")
-        return "japanese_phoneme";
-#endif
-    return "";
-}
-
-static fs::path
-find_file_containing(const fs::path& root, const std::string& needle) {
-    if (!fs::is_directory(root)) {
-        return {};
-    }
-    for (const auto& entry : fs::directory_iterator(root)) {
-        if (!entry.is_regular_file()) {
-            continue;
-        }
-        const std::string name = entry.path().filename().string();
-        if (name.find(needle) != std::string::npos) {
-            return entry.path();
-        }
-    }
-    return {};
-}
-
 struct ipa_config {
     std::string tokenizer_name;
     int offset = 0;
@@ -907,34 +877,14 @@ struct ipa_config {
 };
 
 static ipa_config
-ipa_config_for_language(const std::string& lang) {
-    if (lang == "en") {
-        return {"english_phoneme",
-                0,
-                "ipa_cmudict",
-                "heteronyms-052722",
-                "en-US",
-                "upper",
-                "",
-                true,
-                false};
+ipa_config_for_params(const params& p) {
+    if (p.tokenizer_name.empty() || p.phoneme_dict.empty()) {
+        throw std::runtime_error("incomplete IPA tokenizer profile for language " + p.language);
     }
-    if (lang == "es") {
-        return {"spanish_phoneme", 96, "es_ES", "", "es-ES", "upper", "", true, true};
-    }
-    if (lang == "de") {
-        return {
-            "german_phoneme",
-            199,
-            "de_nv230119.dict",
-            "de_nv230119.heteronym",
-            "de-DE",
-            "mixed",
-            "#",
-            true,
-            true};
-    }
-    throw std::runtime_error("no native IPA tokenizer for language " + lang);
+    return {
+        p.tokenizer_name, p.offset,          p.phoneme_dict, p.heteronyms,     p.locale,
+        p.grapheme_case,  p.grapheme_prefix, p.apostrophe,   p.pad_with_space,
+    };
 }
 
 static std::vector<std::string>
@@ -976,17 +926,43 @@ exact_ipa_tokens(const std::string& tokenizer_name) {
             "“",  "„",  "‹",  "›",  " ",  "<pad>", "<oov>",
         };
     }
+    if (tokenizer_name == "portuguese_Brazilian_phoneme") {
+        return {"!",  "\"", "#A", "#B", "#C", "#D",    "#E",   "#F", "#G", "#H", "#I", "#J", "#K",
+                "#L", "#M", "#N", "#O", "#P", "#Q",    "#R",   "#S", "#T", "#U", "#V", "#W", "#X",
+                "#Y", "#Z", "#À", "#Á", "#Â", "#Ã",    "#Ç",   "#É", "#Ê", "#Í", "#Ó", "#Ô", "#Õ",
+                "#Ú", "#Ü", "'",  "(",  ")",  ",",     "-",    ".",  "/",  ":",  ";",  "?",  "[",
+                "]",  "a",  "b",  "d",  "e",  "f",     "h",    "i",  "j",  "k",  "l",  "m",  "n",
+                "o",  "p",  "r",  "s",  "t",  "u",     "v",    "w",  "x",  "y",  "z",  "{",  "}",
+                "ð",  "õ",  "ĩ",  "ŋ",  "ũ",  "ɐ",     "ɑ",    "ɒ",  "ɔ",  "ə",  "ɛ",  "ɜ",  "ɡ",
+                "ɪ",  "ɲ",  "ɹ",  "ɾ",  "ʁ",  "ʃ",     "ʊ",    "ʌ",  "ʎ",  "ʒ",  "ʲ",  "ˈ",  "ˌ",
+                "ː",  "̃",   "θ",  "ẽ",  " ",  "<pad>", "<oov>"};
+    }
+    if (tokenizer_name == "hindi_phoneme") {
+        return {
+            "!", "\"", "'", "(", ")", ",", "-", ".",     "/",     "0", "1", "2", "3", "4", "5", "6",
+            "7", "8",  "9", ":", ";", "?", "A", "B",     "C",     "D", "E", "F", "G", "H", "I", "J",
+            "K", "L",  "M", "N", "O", "P", "Q", "R",     "S",     "T", "U", "V", "W", "X", "Y", "Z",
+            "[", "]",  "a", "b", "c", "d", "e", "f",     "h",     "i", "j", "k", "l", "m", "n", "o",
+            "p", "q",  "r", "s", "t", "u", "v", "w",     "x",     "z", "{", "}", "À", "É", "ã", "æ",
+            "ð", "õ",  "ĩ", "ŋ", "ũ", "ɑ", "ɔ", "ɖ",     "ə",     "ɚ", "ɛ", "ɝ", "ɟ", "ɡ", "ɣ", "ɪ",
+            "ɭ", "ɲ",  "ɳ", "ɹ", "ɾ", "ʂ", "ʃ", "ʈ",     "ʊ",     "ʋ", "ʌ", "ʒ", "ʰ", "ˈ", "ˌ", "ː",
+            "̃",  "̩",   "θ", "χ", "ँ",  "ं",  "ः", "अ",     "आ",     "इ", "ई", "उ", "ऊ", "ऋ", "ऌ", "ऍ",
+            "ऎ", "ए",  "ऐ", "ऑ", "ओ", "औ", "क", "ख",     "ग",     "घ", "ङ", "च", "छ", "ज", "झ", "ञ",
+            "ट", "ठ",  "ड", "ढ", "ण", "त", "थ", "द",     "ध",     "न", "ऩ", "प", "फ", "ब", "भ", "म",
+            "य", "र",  "ऱ", "ल", "ळ", "ऴ", "व", "श",     "ष",     "स", "ह", "ऺ",  "़",  "ऽ", "ा", "ि",
+            "ी", "ु",   "ू",  "ृ",  "ॅ",  "ॆ",  "े",  "ै",      "ॉ",     "ॊ", "ो", "ौ", "्",  "ॐ", "॓",  "ॠ",
+            "ॡ", "ॢ",   "।", "॥", "॰", "ẽ", " ", "<pad>", "<oov>",
+        };
+    }
     return {};
-}
-
-static int
-ipa_pad_id_for_config(const ipa_config& cfg) {
-    return token_id_for_symbol(exact_ipa_tokens(cfg.tokenizer_name), cfg.offset, "<pad>");
 }
 
 class ipa_tokenizer {
    public:
     ipa_tokenizer(const fs::path& root, ipa_config cfg) : cfg_(std::move(cfg)) { load(root); }
+
+    int vocab_size() const { return static_cast<int>(tokens_.size()); }
+    int pad_id() const { return cfg_.offset + token_to_id_.at("<pad>"); }
 
     std::vector<int> encode(const std::string& raw_text) const {
         std::string text = raw_text;
@@ -1054,17 +1030,17 @@ class ipa_tokenizer {
     std::unordered_set<std::string> punct_;
 
     void load(const fs::path& root) {
-        const fs::path dict_path = find_file_containing(root, cfg_.dict_hint);
-        if (dict_path.empty()) {
+        const fs::path dict_path = root / cfg_.dict_hint;
+        if (!fs::is_regular_file(dict_path)) {
             throw std::runtime_error(
-                "failed to find tokenizer dictionary containing '" + cfg_.dict_hint + "'");
+                "failed to find tokenizer dictionary '" + dict_path.string() + "'");
         }
         for (const auto& p : ipa_punct(cfg_.locale)) {
             punct_.insert(p);
         }
         if (!cfg_.heteronym_hint.empty()) {
-            const fs::path heteronym_path = find_file_containing(root, cfg_.heteronym_hint);
-            if (!heteronym_path.empty()) {
+            const fs::path heteronym_path = root / cfg_.heteronym_hint;
+            if (fs::is_regular_file(heteronym_path)) {
                 std::istringstream in(read_file(heteronym_path));
                 std::string line;
                 while (std::getline(in, line)) {
@@ -1140,12 +1116,12 @@ class ipa_tokenizer {
         tokens_ = exact_ipa_tokens(cfg_.tokenizer_name);
         if (tokens_.empty()) {
             tokens_ = std::vector<std::string>(symbols.begin(), symbols.end());
+            if (std::find(tokens_.begin(), tokens_.end(), " ") == tokens_.end()) {
+                tokens_.push_back(" ");
+            }
+            tokens_.push_back("<pad>");
+            tokens_.push_back("<oov>");
         }
-        if (std::find(tokens_.begin(), tokens_.end(), " ") == tokens_.end()) {
-            tokens_.push_back(" ");
-        }
-        tokens_.push_back("<pad>");
-        tokens_.push_back("<oov>");
 
         for (size_t i = 0; i < tokens_.size(); ++i) {
             token_to_id_[tokens_[i]] = (int)i;
@@ -1334,42 +1310,20 @@ class ipa_tokenizer {
 };
 
 static tokenizer_result
-run_byt5_native(const params& p, int offset, const std::string& tokenizer_name) {
+run_byt5_native(const params& p) {
     tokenizer_result result;
     result.language = p.language;
-    result.tokenizer_name = tokenizer_name;
+    result.tokenizer_name = p.tokenizer_name;
+    result.eos_id = p.eos_id;
     for (const std::string& sentence : tokenizer_input_units(p, p.text)) {
         chunk ch;
         ch.text = sentence;
         for (unsigned char b : sentence) {
-            ch.tokens.push_back(offset + (int)b + 3);
+            ch.tokens.push_back(p.offset + (int)b + 3);
         }
-        ch.tokens.push_back(offset + 1);
+        ch.tokens.push_back(p.offset + 1);
         ch.tokens.push_back(result.eos_id);
-        pad_short_text_chunk_before_eos(ch, result.eos_id, offset);
-        result.chunks.push_back(std::move(ch));
-    }
-    return result;
-}
-
-static tokenizer_result
-run_ipa_native(const params& p) {
-    if (!fs::is_directory(p.model)) {
-        throw std::runtime_error(
-            "native IPA tokenization requires an extracted Magpie .nemo directory");
-    }
-    const ipa_config cfg = ipa_config_for_language(p.language);
-    ipa_tokenizer tok(p.model, cfg);
-    tokenizer_result result;
-    result.language = p.language;
-    result.tokenizer_name = cfg.tokenizer_name;
-    const int pad_id = ipa_pad_id_for_config(cfg);
-    for (const std::string& sentence : tokenizer_input_units(p, p.text)) {
-        chunk ch;
-        ch.text = sentence;
-        ch.tokens = tok.encode(sentence);
-        ch.tokens.push_back(result.eos_id);
-        pad_short_text_chunk_before_eos(ch, result.eos_id, pad_id);
+        pad_short_text_chunk_before_eos(ch, result.eos_id, p.offset);
         result.chunks.push_back(std::move(ch));
     }
     return result;
@@ -1377,17 +1331,20 @@ run_ipa_native(const params& p) {
 
 static tokenizer_result
 run_hindi_native(const params& p) {
-    static const int offset = 1017;
     const std::vector<std::string> tokens = hindi_tokens();
+    if (static_cast<int>(tokens.size()) != p.expected_vocab_size) {
+        throw std::runtime_error("Hindi character vocabulary does not match tokenizer profile");
+    }
     std::unordered_map<std::string, int> token_to_id;
     for (size_t i = 0; i < tokens.size(); ++i) {
         token_to_id[tokens[i]] = (int)i;
     }
-    const int pad_id = token_id_for_symbol(tokens, offset, "<pad>");
+    const int pad_id = token_id_for_symbol(tokens, p.offset, "<pad>");
 
     tokenizer_result result;
     result.language = p.language;
-    result.tokenizer_name = "hindi_chartokenizer";
+    result.tokenizer_name = p.tokenizer_name;
+    result.eos_id = p.eos_id;
     for (const std::string& sentence : tokenizer_input_units(p, replace_all(p.text, "’", "'"))) {
         chunk ch;
         ch.text = sentence;
@@ -1411,9 +1368,64 @@ run_hindi_native(const params& p) {
         for (const auto& c : chars) {
             const auto it = token_to_id.find(c);
             if (it != token_to_id.end()) {
-                ch.tokens.push_back(offset + it->second);
+                ch.tokens.push_back(p.offset + it->second);
             }
         }
+        ch.tokens.push_back(result.eos_id);
+        pad_short_text_chunk_before_eos(ch, result.eos_id, pad_id);
+        result.chunks.push_back(std::move(ch));
+    }
+    return result;
+}
+
+static std::vector<std::string>
+arabic_tokens() {
+    std::vector<std::string> tokens = {" ", "ء", "آ", "أ", "إ", "ؤ", "ئ", "ا", "ب", "ة", "ت", "ث",
+                                       "ج", "ح", "خ", "د", "ذ", "ر", "ز", "س", "ش", "ص", "ض", "ط",
+                                       "ظ", "ع", "غ", "ف", "ق", "ك", "ل", "م", "ن", "ه", "و", "ى",
+                                       "ي", "ً",  "ٌ",  "ٍ",  "َ",  "ُ",  "ِ",  "ّ",  "ٰ",  "ْ"};
+    // v2607 pins NeMo ArabicCharsTokenizer charset_version=1, whose mixed-case
+    // Arabic character set deliberately contains this second copy.
+    const std::vector<std::string> arabic_chars(tokens.begin() + 1, tokens.end());
+    tokens.insert(tokens.end(), arabic_chars.begin(), arabic_chars.end());
+    for (char c = 'a'; c <= 'z'; ++c) tokens.emplace_back(1, c);
+    for (char c = 'A'; c <= 'Z'; ++c) tokens.emplace_back(1, c);
+    tokens.push_back("'");
+    const auto punct = default_punct();
+    tokens.insert(tokens.end(), punct.begin(), punct.end());
+    tokens.insert(tokens.end(), {"،", "؛", "؟", "<pad>", "<oov>"});
+    return tokens;
+}
+
+static tokenizer_result
+run_arabic_native(const params& p) {
+    const auto tokens = arabic_tokens();
+    if (static_cast<int>(tokens.size()) != p.expected_vocab_size) {
+        throw std::runtime_error("Arabic vocabulary does not match tokenizer profile");
+    }
+    std::unordered_map<std::string, int> ids;
+    for (size_t i = 0; i < tokens.size(); ++i) ids[tokens[i]] = (int)i;
+    tokenizer_result result;
+    result.language = p.language;
+    result.tokenizer_name = p.tokenizer_name;
+    result.eos_id = p.eos_id;
+    const int pad_id = token_id_for_symbol(tokens, p.offset, "<pad>");
+    for (const std::string& sentence : tokenizer_input_units(p, p.text)) {
+        chunk ch;
+        ch.text = sentence;
+        std::vector<std::string> symbols;
+        for (const auto& symbol : split_utf8(sentence)) {
+            if (symbol == " ") {
+                if (!symbols.empty() && symbols.back() != symbol)
+                    symbols.push_back(symbol);
+            } else if (ids.count(symbol) != 0) {
+                symbols.push_back(symbol);
+            }
+        }
+        while (!symbols.empty() && symbols.back() == " ") symbols.pop_back();
+        symbols.insert(symbols.begin(), " ");
+        symbols.push_back(" ");
+        for (const auto& symbol : symbols) ch.tokens.push_back(p.offset + ids[symbol]);
         ch.tokens.push_back(result.eos_id);
         pad_short_text_chunk_before_eos(ch, result.eos_id, pad_id);
         result.chunks.push_back(std::move(ch));
@@ -1426,7 +1438,8 @@ static tokenizer_result
 run_mandarin_native(const params& p, const mandarin_tokenizer& tok) {
     tokenizer_result result;
     result.language = p.language;
-    result.tokenizer_name = "mandarin_phoneme";
+    result.tokenizer_name = p.tokenizer_name;
+    result.eos_id = p.eos_id;
     for (const std::string& sentence : tokenizer_input_units(p, p.text)) {
         chunk ch;
         ch.text = sentence;
@@ -1441,12 +1454,14 @@ run_mandarin_native(const params& p, const mandarin_tokenizer& tok) {
 
 #ifdef NEMO_SPEECH_TTS_WITH_JA
 static bool
-is_ascii_upper_word(const std::string& text) {
+is_ascii_letter_word(const std::string& text, bool lowercase) {
     if (text.empty()) {
         return false;
     }
     for (const unsigned char c : text) {
-        if (c < 'A' || c > 'Z') {
+        const unsigned char first = lowercase ? 'a' : 'A';
+        const unsigned char last = lowercase ? 'z' : 'Z';
+        if (c < first || c > last) {
             return false;
         }
     }
@@ -1484,13 +1499,13 @@ process_japanese_chain(
 }
 
 static std::vector<std::string>
-japanese_g2p(openjtalk_frontend& frontend, const std::string& text) {
+japanese_g2p(openjtalk_frontend& frontend, const std::string& text, bool lowercase_ascii) {
     const std::vector<japanese_frontend_word> words = frontend.run(text);
     std::vector<std::string> result;
     std::vector<japanese_frontend_word> current_chain;
-    const std::unordered_map<std::string, int> token_to_id = [] {
+    const std::unordered_map<std::string, int> token_to_id = [lowercase_ascii] {
         std::unordered_map<std::string, int> ids;
-        const auto tokens = japanese_tokens();
+        const auto tokens = japanese_tokens(lowercase_ascii);
         for (size_t i = 0; i < tokens.size(); ++i) {
             ids[tokens[i]] = (int)i;
         }
@@ -1499,7 +1514,7 @@ japanese_g2p(openjtalk_frontend& frontend, const std::string& text) {
 
     for (size_t idx = 0; idx < words.size(); ++idx) {
         const auto& word = words[idx];
-        if (is_ascii_upper_word(word.text)) {
+        if (is_ascii_letter_word(word.text, lowercase_ascii)) {
             process_japanese_chain(current_chain, result);
             current_chain.clear();
             const auto chars = split_utf8(word.text);
@@ -1536,7 +1551,7 @@ japanese_g2p(openjtalk_frontend& frontend, const std::string& text) {
 
 static tokenizer_result
 run_japanese_native(const params& p) {
-    static const int offset = 458;
+    const bool lowercase_ascii = p.ascii_letter_case == "lower";
     const fs::path dictionary_dir = find_openjtalk_dictionary_dir(p.model);
     if (dictionary_dir.empty()) {
         throw std::runtime_error(
@@ -1544,22 +1559,27 @@ run_japanese_native(const params& p) {
             "open_jtalk_dic");
     }
     const auto frontend = openjtalk_frontend_for_dictionary(dictionary_dir);
-    const std::vector<std::string> tokens = japanese_tokens();
+    const std::vector<std::string> tokens = japanese_tokens(lowercase_ascii);
+    if (static_cast<int>(tokens.size()) != p.expected_vocab_size) {
+        throw std::runtime_error("Japanese vocabulary does not match tokenizer profile");
+    }
     std::unordered_map<std::string, int> token_to_id;
     for (size_t i = 0; i < tokens.size(); ++i) {
         token_to_id[tokens[i]] = (int)i;
     }
-    const int pad_id = token_id_for_symbol(tokens, offset, "<pad>");
+    const int pad_id = token_id_for_symbol(tokens, p.offset, "<pad>");
 
     tokenizer_result result;
     result.language = p.language;
-    result.tokenizer_name = "japanese_phoneme";
-    for (const std::string& sentence : tokenizer_input_units(p, ascii_upper(p.text))) {
+    result.tokenizer_name = p.tokenizer_name;
+    result.eos_id = p.eos_id;
+    const std::string cased_text = lowercase_ascii ? ascii_lower(p.text) : ascii_upper(p.text);
+    for (const std::string& sentence : tokenizer_input_units(p, cased_text)) {
         chunk ch;
         ch.text = sentence;
         std::vector<std::string> symbols;
         const std::string space = " ";
-        for (const auto& symbol : japanese_g2p(*frontend, sentence)) {
+        for (const auto& symbol : japanese_g2p(*frontend, sentence, lowercase_ascii)) {
             if (symbol == space) {
                 if (!symbols.empty() && symbols.back() != space) {
                     symbols.push_back(symbol);
@@ -1577,7 +1597,7 @@ run_japanese_native(const params& p) {
         for (const auto& symbol : symbols) {
             const auto it = token_to_id.find(symbol);
             if (it != token_to_id.end()) {
-                ch.tokens.push_back(offset + it->second);
+                ch.tokens.push_back(p.offset + it->second);
             }
         }
         ch.tokens.push_back(result.eos_id);
@@ -1587,59 +1607,3 @@ run_japanese_native(const params& p) {
     return result;
 }
 #endif
-
-static bool
-supports_native(const params& p) {
-    if (p.language == "fr" || p.language == "it" || p.language == "vi") {
-        return true;
-    }
-    if (p.language == "hi") {
-        return true;
-    }
-#ifdef NEMO_SPEECH_TTS_WITH_JA
-    if (p.language == "ja") {
-        return !find_openjtalk_dictionary_dir(p.model).empty();
-    }
-#endif
-#ifdef NEMO_SPEECH_TTS_WITH_ZH
-    if (p.language == "zh") {
-        return mandarin_tokenizer_available(p.model);
-    }
-#endif
-    if ((p.language == "en" || p.language == "es" || p.language == "de") &&
-        fs::is_directory(p.model)) {
-        return true;
-    }
-    return false;
-}
-
-static tokenizer_result
-run_native(const params& p) {
-    if (p.language == "fr") {
-        return run_byt5_native(p, 633, "french_chartokenizer");
-    }
-    if (p.language == "it") {
-        return run_byt5_native(p, 1208, "italian_phoneme");
-    }
-    if (p.language == "vi") {
-        return run_byt5_native(p, 1592, "vietnamese_phoneme");
-    }
-    if (p.language == "hi") {
-        return run_hindi_native(p);
-    }
-#ifdef NEMO_SPEECH_TTS_WITH_JA
-    if (p.language == "ja") {
-        return run_japanese_native(p);
-    }
-#endif
-#ifdef NEMO_SPEECH_TTS_WITH_ZH
-    if (p.language == "zh") {
-        const mandarin_tokenizer tok(p.model);
-        return run_mandarin_native(p, tok);
-    }
-#endif
-    if (p.language == "en" || p.language == "es" || p.language == "de") {
-        return run_ipa_native(p);
-    }
-    throw std::runtime_error("native tokenizer is not available for language '" + p.language + "'");
-}

@@ -4,8 +4,6 @@
 // Portions derived from parakeet.cpp:
 // Copyright (c) 2025 Jason Ni
 // Licensed under the MIT License. See THIRD_PARTY_NOTICES.md.
-#include <cstdlib>
-
 #include "fastconformer.h"
 
 using namespace nemo_speech::asr;
@@ -24,7 +22,7 @@ static inline ggml_tensor*
 pad_ext_backend(
     ggml_context* ctx, ggml_tensor* t, int lp0, int rp0, int lp1, int rp1, int lp2, int rp2,
     int lp3, int rp3) {
-#ifdef NEMO_SPEECH_FASTCONFORMER_CUDA_FUSIONS
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
     return ggml_pad_ext(ctx, t, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3);
 #else
     ggml_tensor* right_padded =
@@ -454,7 +452,7 @@ ConformerConv::build_graph(
                    : ggml_add_inplace(bf_ctx.ctx, x_ct, b1.tensor);
     }
     ggml_runtime::TensorBag out_bag;
-#ifdef NEMO_SPEECH_FASTCONFORMER_CUDA_FUSIONS
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
     if (session->params.use_gpu) {
         // Split contiguous (2*C,T,B) in the CUDA GLU kernel and materialize
         // only the final (T,C,B) depthwise-convolution layout.
@@ -921,7 +919,7 @@ ConformerLayer::build_mha_cached(
     const float scale = 1.0f / std::sqrt(static_cast<float>(d_k));
 
     ggml_tensor* ctx_attn = nullptr;
-#ifdef NEMO_SPEECH_FUSED_RELPOS_ATTN
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
     // Single-kernel path: bias adds, content+position scores, the rel-shift,
     // scale+mask, softmax and the attn@V context all happen inside
     // ggml_fused_relpos_attn (the same op the offline encoder uses; its
@@ -1325,79 +1323,6 @@ FastConformerEncoder::build_graph_from_embeddings(
             const int R = (cfg_.offline_right_ctx < 0) ? T : cfg_.offline_right_ctx;
             auto bf_ctx = session_tensor_container->get_ctx_of_buffer_type(x.buft);
 
-            // Mirror the mask arithmetic on the host so the window can be read
-            // straight off the log instead of inferred from the graph. Gated on
-            // NEMO_SPEECH_DEBUG_ENC; this block builds no tensors, it only
-            // prints.
-            //
-            // The reference implementation this must match is
-            // transformers/models/nemotron_asr_streaming:
-            //
-            //     chunk_size          = right_ctx + 1
-            //     left_context_chunks = left_ctx // chunk_size
-            //     visible = (q//chunk - k//chunk) in [0, left_context_chunks]
-            //
-            // with left_ctx = config.sliding_window - 1 and right_ctx =
-            // num_lookahead_tokens. Note what that means: the window is over
-            // CHUNKS aligned to absolute frame 0, not a per-frame band. A query
-            // at the START of its chunk sees R frames of lookahead; a query at
-            // the END of the same chunk sees zero. That asymmetry is in the
-            // reference too, so it is correct, but it makes the effective
-            // lookahead position-dependent, which is worth seeing explicitly
-            // when a specific frame range misbehaves.
-            //
-            // left_context_chunks uses integer division, so any remainder in
-            // L % chunk is silently dropped: L=56, R=3 divides exactly into 14
-            // chunks, but a mismatched pair would quietly shorten the reach.
-            if (std::getenv("NEMO_SPEECH_DEBUG_ENC")) {
-                const bool chunked = cfg_.chunked_limited_attention && R >= 0;
-                std::fprintf(
-                    stderr, "[enc ] OFFLINE MASK: T=%d L=%d R=%d style=%s\n", T, L, R,
-                    chunked ? "chunked_limited" : "regular");
-                if (chunked) {
-                    const int chunk = R + 1;
-                    const int left_chunks = L / chunk;
-                    std::fprintf(
-                        stderr,
-                        "[enc ]   chunk=%d frames, left_chunks = L/chunk = %d/%d = %d"
-                        " (remainder %d frames dropped by integer division)\n"
-                        "[enc ]   max reach = (left_chunks+1)*chunk = %d keys\n",
-                        chunk, L, chunk, left_chunks, L % chunk, (left_chunks + 1) * chunk);
-                } else {
-                    std::fprintf(
-                        stderr, "[enc ]   band = [q-%d, q+%d] = %d keys\n", L, R, L + R + 1);
-                }
-                // Per-query visible span, recomputed with the SAME integer
-                // arithmetic the graph uses. Sampled rather than per-frame so
-                // the log stays readable. `ahead` is the lookahead this
-                // particular query actually gets, which is the number that
-                // varies inside a chunk.
-                std::fprintf(
-                    stderr, "[enc ]      q   visible keys     count   ahead\n");
-                const int stride = (T > 40) ? (T / 20) : 1;
-                for (int q = 0; q < T; q += stride) {
-                    int lo = T, hi = -1, n = 0;
-                    for (int k = 0; k < T; ++k) {
-                        bool vis;
-                        if (chunked) {
-                            const int d = (q / (R + 1)) - (k / (R + 1));
-                            vis = (d >= 0 && d <= L / (R + 1));
-                        } else {
-                            const int d = k - q;
-                            vis = (d >= -L && d <= R);
-                        }
-                        if (vis) {
-                            lo = std::min(lo, k);
-                            hi = std::max(hi, k);
-                            ++n;
-                        }
-                    }
-                    std::fprintf(
-                        stderr, "[enc ] %6d  [%4d..%4d] %8d %7d%s\n", q, lo, hi, n,
-                        (hi > q) ? (hi - q) : 0, (n == 0) ? "   <-- SEES NOTHING" : "");
-                }
-            }
-
             // pos = arange(T): (T,) f32.
             ggml_tensor* pos = ggml_arange(bf_ctx.ctx, 0.0f, static_cast<float>(T), 1.0f);
             // Two interpretations of `pos`: (T, 1) gives the key position
@@ -1485,11 +1410,17 @@ FastConformerEncoder::build_graph(
         pre.set_first_tensor(ggml_runtime::ggml_bf_tensor(x_scaled, x.buft));
     }
 
+    // Only subsequent chunks carry overlap. The shorter first-chunk shape
+    // already produces exactly cache_chunk_frames, with causal padding handled
+    // independently by each subsampling convolution. A shape-based distinction
+    // also keeps concurrent first/steady-state streams in separate graph keys.
+    const bool first_chunk =
+        input_tensors.get_tensor(0).tensor->ne[1] == cfg_.cache_first_chunk_mel_frames();
     // Then drop the leading `cache_drop_extra` frames from the subsampled
     // output so the visible chunk length is exactly cache_chunk_frames
     // (= 1 + R). The dropped frames overlap with the tail of the previous
     // chunk (handled by the K/V cache).
-    if (cfg_.cache_drop_extra > 0) {
+    if (!first_chunk && cfg_.cache_drop_extra > 0) {
         auto x = pre.get_tensor(0);
         auto bf_ctx = session_tensor_container->get_ctx_of_buffer_type(x.buft);
         auto x_view = ggml_view_4d(
@@ -1514,7 +1445,7 @@ FastConformerEncoder::build_graph(
     // gathers degenerate to arena views and feedback uses in-place copies.
     // Multi-slot arenas retain indexed gather/scatter.
     const bool single_slot = cfg_.cache_state_slots == 1 && batch == 1;
-#ifdef NEMO_SPEECH_FUSED_RELPOS_ATTN
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
     const int d_k = cfg_.d_model / cfg_.n_heads;
     const bool direct_kv_arena =
         session->params.use_gpu && mask_t.tensor != nullptr && (d_k & (d_k - 1)) == 0;
@@ -1568,9 +1499,9 @@ FastConformerEncoder::build_graph(
         cache.attn_mask = mask_t.tensor;
         cache.pos_proj =
             session->model_tensor_container->get_tensor_by_name(pos_proj_name(l)).tensor;
-#ifdef NEMO_SPEECH_DIRECT_DW_CONV
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
         // Repacked channel-inner dw weight enables the (d_model, T)-layout
-        // conv module; the cwhn direct kernel is CUDA-only (patch 0004), so a
+        // conv module; the cwhn direct kernel is CUDA-only (depthwise-conv patch), so a
         // CPU session in a CUDA build leaves it null and the layer takes the
         // portable transpose-based conv path (runtime-gated in nn.cpp).
         if (session->params.use_gpu) {

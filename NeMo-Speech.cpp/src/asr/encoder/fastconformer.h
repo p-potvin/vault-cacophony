@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,25 @@ struct EncoderConfig {
     // `drop_extra_pre_encoded`). For pre_encode_cache_size=9 / sub=8 this is
     // 2 frames, giving cache_chunk_frames = 1 + R after the drop.
     int cache_drop_extra = 2;
+
+    // Causal subsampling starts at frame zero, without a preceding overlap.
+    // Subsequent-chunk geometry remains owned by the runner.
+    int cache_first_chunk_mel_frames() const { return 1 + subsampling_factor * cache_right_ctx; }
+
+    // Exclusive mel frontier: causal encoder frame f ends at mel f*sub.
+    // The first emitted frame therefore covers one real mel frame, not sub.
+    int64_t cache_decoded_mel_frames(int64_t emitted_frames) const {
+        return emitted_frames > 0 ? 1 + (emitted_frames - 1) * subsampling_factor : 0;
+    }
+
+    // Centre of encoder frame f's subsampling receptive field, in mel frames
+    // relative to f*sub. Every k=3/stride-2 stage pads (2, 1) when causal and
+    // (1, 1) otherwise, so causal frame f sees mel [f*sub - 2*(sub-1), f*sub]
+    // and is centred sub-1 mel frames before f*sub; symmetric frames are
+    // centred on f*sub.
+    int frame_center_mel_offset() const {
+        return conv_context == ConvContext::Causal ? 1 - subsampling_factor : 0;
+    }
 
     // Offline attention limits are independent of the streaming cache context.
     // -1 means unlimited; finite values preserve a model's trained attention window.

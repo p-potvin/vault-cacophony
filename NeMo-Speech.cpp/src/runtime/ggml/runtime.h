@@ -11,6 +11,11 @@
 #include <ggml-cpp.h>
 #include <ggml.h>
 
+// CUDA paths that use operations added by patches/ (see patches/README.md).
+#if defined(NEMO_SPEECH_GGML_PATCHED) && defined(GGML_USE_CUDA)
+#define NEMO_SPEECH_CUDA_FAST_PATHS 1
+#endif
+
 #include <chrono>
 #include <cstdarg>
 #include <cstdint>
@@ -55,8 +60,27 @@ std::string format(const char* fmt, ...);
     ::ggml_runtime::log_internal(GGML_LOG_LEVEL_INFO, __FILE__, __LINE__, __func__, __VA_ARGS__)
 
 struct llama_file;
+struct llama_mmap;
 
 namespace ggml_runtime {
+
+// ggml_conv_1d with the batch axis kept apart from the output channels for a batch
+// (b->ne[2]) > 1, which ggml_conv_1d mixes up (ggml-org/llama.cpp#28738).
+// Use ggml_conv_1d again once that fix is in the pinned llama.cpp.
+inline ggml_tensor*
+conv_1d(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b, int s0, int p0, int d0) {
+    ggml_tensor* im2col = ggml_im2col(
+        ctx, a, b, s0, 0, p0, 0, d0, 0, false,
+        a->type == GGML_TYPE_BF16 ? GGML_TYPE_F32 : GGML_TYPE_F16);  // [N, OL, IC * K]
+    ggml_tensor* result = ggml_mul_mat(
+        ctx, ggml_reshape_2d(ctx, im2col, im2col->ne[0], im2col->ne[2] * im2col->ne[1]),
+        ggml_reshape_2d(ctx, a, a->ne[0] * a->ne[1], a->ne[2]));  // [N * OL, OC]
+    if (im2col->ne[2] == 1) {
+        return ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], 1);
+    }
+    result = ggml_reshape_3d(ctx, result, im2col->ne[1], im2col->ne[2], a->ne[2]);
+    return ggml_cont(ctx, ggml_permute(ctx, result, 0, 2, 1, 3));  // [OL, OC, N]
+}
 
 class GGUFLoader {
    public:
@@ -77,6 +101,18 @@ class GGUFLoader {
     std::vector<int64_t> get_tensor_ne(const std::string& tensor_name) const;
     bool has_tensor(const std::string& tensor_name) const;
 
+    // False when mmap is unsupported or failed; use get_tensor_file_data() then.
+    bool is_mmapped() const;
+    // Absolute file offset (includes the GGUF data offset); the mapping starts
+    // at file offset 0, so mapped_base() + offset addresses the tensor.
+    uint64_t get_tensor_offset(const std::string& tensor_name) const;
+    // Pointer to `size` bytes of the tensor in the mapping. Throws logic_error
+    // without a mapping, runtime_error ("out of range") past the end of the file.
+    void* mapped_tensor_ptr(const std::string& tensor_name, size_t size) const;
+    void* mapped_base() const;
+    // Null when not mapped. Hold this while keeping pointers into the mapping.
+    std::shared_ptr<void> mapping_handle() const;
+
     // Metadata accessors (return `def` if key missing).
     uint32_t get_u32(const std::string& key, uint32_t def = 0) const;
     int32_t get_i32(const std::string& key, int32_t def = 0) const;
@@ -91,12 +127,20 @@ class GGUFLoader {
     std::string m_path;
     gguf_context_ptr m_context;
     std::unique_ptr<llama_file> m_file;
+    // Out-of-line dtor sees the complete llama_mmap type; never released by
+    // release_file_resources() — see loader.cpp for why.
+    std::shared_ptr<llama_mmap> m_mapping;
     std::map<std::string, std::tuple<ggml_type, uint64_t>> m_tensor_infos;
     // Per-tensor on-disk dimensionality.
     std::map<std::string, int> m_tensor_n_dims;
     std::map<std::string, std::vector<int64_t>> m_tensor_ne;
     std::vector<char> m_tensor_buffer;
 };
+
+// Whether the GGUF holds a model of architecture `arch`: its general.architecture, or one of the
+// models listed in nemo_speech.components (a speech-LLM's encoder file holds its speech encoder and
+// CTC timestamp head).
+bool gguf_holds(const GGUFLoader& loader, const std::string& arch);
 
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
 
@@ -165,16 +209,32 @@ class Module {
     virtual void set_data(Session* session) = 0;
 };
 
+// Process-wide settings for the patched CUDA backend (see patches/README.md). They
+// are read when a CUDA backend is created, so call them before loading models, and
+// they leave a value the user already set in the environment alone.
+//
+// Keep captured CUDA graphs instead of evicting ones idle for 10 s. For TTS and
+// VoiceChat, whose per-frame graphs must stay resident between requests.
+void keep_cuda_graphs_resident();
+// Repack skinny-Q8 encoder weights into a separate buffer instead of in place. The
+// in-place copy races with llama.cpp's multi-stream scheduler in the same process.
+void keep_skinny_q8_weights_separate();
+
 struct Params {
     bool use_gpu = false;
     int gpu_device_idx = 0;
     char* pe_bin_path = nullptr;
+    int n_threads = 4;  // CPU backend threads
 };
 
 // Owns ggml backend handles shared by one or more Sessions.
 class BackendManager {
    public:
     explicit BackendManager(Params params);
+    // Reuse an already initialized GPU backend owned by another pipeline object. The manager
+    // creates/owns only its auxiliary backends (for example CPU fallback); the borrowed handle
+    // must outlive this manager and every Session created from it.
+    BackendManager(Params params, ggml_backend_t borrowed_gpu_backend);
     // Out-of-line so ggml_backend_ptr's deleter is instantiated in the implementation TU.
     ~BackendManager();
 
@@ -198,6 +258,7 @@ class BackendManager {
 
    private:
     Params params;
+    ggml_backend_t borrowed_gpu_backend_ = nullptr;
     std::vector<ggml_backend_ptr> backends;
     // Non-owning alias into `backends`.
     ggml_backend_t gpu_backend = nullptr;
@@ -205,10 +266,21 @@ class BackendManager {
     std::mutex compute_mu_;
 };
 
+// Grow-only device buffers shared by every cached run's named tensors (inputs and registered aux
+// outputs). Valid only when runs are serialized and no run's named tensors are read after the next
+// run starts: then each cached run places its named tensors at the start of the same buffers
+// instead of owning a buffer per input shape (whose cudaMalloc/cudaFree on every LRU miss
+// synchronized the device). Growth bumps *generation so older placements are rebuilt before reuse.
+struct SharedNamedArena {
+    std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_ptr> bufs;
+    uint64_t* generation = nullptr;
+};
+
 class TensorContainer {
    public:
     // Arena sizes for metadata and buffer-type-specific graph contexts.
     struct ArenaSizes {
+        SharedNamedArena* shared_named = nullptr;      // sched_managed only
         size_t temp_ctx_bytes = 64 * 1024 * 1024;      // 64 MB virtual default
         size_t default_buft_bytes = 64 * 1024 * 1024;  // 64 MB virtual default
         std::map<ggml_backend_buffer_type_t, size_t> per_buft;
@@ -234,9 +306,20 @@ class TensorContainer {
     ggml_bf_context get_ctx_of_buffer_type(ggml_backend_buffer_type_t buft);
     void allocate_tensors_on_backend_buffers();
     void free_temp_ctx();
+
+    // Opt in to zero-copy weight binding for GGUF-backed tensors on
+    // eligible bufts; see allocate_tensors_on_backend_buffers.
+    void set_mmap_loader(GGUFLoader* loader) { mmap_loader_ = loader; }
+    // Non-null once allocate_tensors_on_backend_buffers() built a
+    // zero-copy buffer for this buft.
+    ggml_backend_buffer_t mmap_buffer_for(ggml_backend_buffer_type_t buft) const;
     ggml_bf_tensor get_tensor_by_name(const std::string& name);
     bool has_tensor_by_name(const std::string& name);
     void cache_tensor(std::string name, ggml_bf_tensor tensor);
+
+    // Register storage owned outside this TensorContainer. Imported tensors participate in graph
+    // construction like ordinary model tensors but are never allocated or freed by the runtime.
+    ggml_bf_tensor import_tensor(std::string name, ggml_tensor* tensor);
 
     // Declares tensors on the primary device's main buffer type.
     ggml_bf_tensor create_tensor_1d(std::string name, ggml_type data_type, int64_t ne0);
@@ -257,8 +340,14 @@ class TensorContainer {
     // (the ggml_bf_context.ctx field) into these contexts.
     std::vector<ggml_context_ptr> owned_ctxs_;
     buft_ctx_map_t ctx_map;
+    // Outlives backend_buffers (declared first) so mmap-backed buffers stay valid.
+    std::shared_ptr<void> mmap_keepalive_;
     std::vector<ggml_backend_buffer_ptr> backend_buffers;
     std::map<std::string, ggml_bf_tensor> tensor_lookup;
+    // Non-owning, used only while allocating; see set_mmap_loader(). Null unless opted in.
+    GGUFLoader* mmap_loader_ = nullptr;
+    // Non-owning views into backend_buffers, keyed by buft; see mmap_buffer_for().
+    std::map<ggml_backend_buffer_type_t, ggml_backend_buffer_t> mmap_bufs_;
 
     ggml_bf_tensor m_create_tensor(ggml_tensor* meta, std::string& name);
 };
@@ -289,6 +378,14 @@ class Session {
     // Allows exact dtype copies and F32-to-F16 conversion.
     void load_weight(const std::string& gguf_key);
 
+    // Verbatim bind-or-copy of a GGUF tensor, for set_data() overrides that
+    // read GGUF directly instead of going through load_weight().
+    void bind_or_copy_tensor(ggml_bf_tensor t, const std::string& gguf_key);
+
+    // Import a model tensor whose storage is owned by the embedding pipeline. Call only from
+    // Module::define_tensors(); the tensor and its backend buffer must outlive this Session.
+    ggml_bf_tensor import_model_tensor(const std::string& name, ggml_tensor* tensor);
+
     // Invoked before upload so model code can annotate destination storage.
     // Install before setup(), which loads the model weights.
     using WeightLoadHook =
@@ -312,6 +409,16 @@ class Session {
         // Bind an existing backend tensor instead of allocating and uploading
         // a host input. The referenced storage must outlive this Session run.
         const DeviceTensor* device_tensor = nullptr;
+        // Fill the input from device memory instead of host_data: each range copies `bytes` from
+        // `src` (at src_offset past its own offset) to byte dst_offset of the input, on the
+        // input's backend before the graph runs. The ranges must cover the input.
+        struct DeviceRange {
+            const DeviceTensor* src = nullptr;
+            size_t src_offset = 0;
+            size_t dst_offset = 0;
+            size_t bytes = 0;
+        };
+        std::vector<DeviceRange> gather = {};
     };
 
     // Select by exactly one of TensorBag index or cached name. nbytes is the
@@ -325,6 +432,9 @@ class Session {
         // When non-null, receives a non-owning backend reference without
         // synchronizing the graph merely to copy the output to the host.
         DeviceTensor* device_tensor = nullptr;
+        // Download only the tensor's leading bytes (0 = all of it), e.g. the real items of a batch
+        // padded to a reusable shape.
+        size_t download_bytes = 0;
     };
 
     // Reuse a SessionState across calls to preserve device-updated stream state;
@@ -421,13 +531,25 @@ class Session {
     std::unordered_map<uint64_t, CachedRun> run_cache_;
     std::vector<uint64_t> run_cache_lru_;  // back() = most-recent
     size_t run_cache_capacity_ = 4;
+    size_t run_cache_misses_ = 0;
+    size_t run_cache_stale_ = 0;
     // Pool growth invalidates cached device placements.
     std::vector<size_t> sched_pool_sizes_;
     uint64_t sched_pool_generation_ = 0;
 
    public:
+    SharedNamedArena shared_named_;
+    bool share_named_ = false;
+
+   public:
     // Maximum number of cached input shapes.
     void set_run_cache_capacity(size_t cap) { run_cache_capacity_ = cap; }
+    // Graphs built for input shapes that were not cached (diagnostics).
+    size_t run_cache_misses() const { return run_cache_misses_; }
+    // Of those, rebuilds of cached shapes whose placements went stale when the pool grew.
+    size_t run_cache_stale() const { return run_cache_stale_; }
+    // Place every cached run's named tensors in one shared grow-only arena (see SharedNamedArena).
+    void set_shared_named_arena(bool on) { share_named_ = on; }
 };
 
 }  // namespace ggml_runtime

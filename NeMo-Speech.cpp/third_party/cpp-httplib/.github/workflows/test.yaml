@@ -31,12 +31,19 @@ env:
 
 jobs:
   style-check:
-    runs-on: ubuntu-latest
+    # Uses the macOS runner's pre-installed Homebrew so clang-format tracks
+    # whatever version `brew install clang-format` currently resolves to on
+    # the maintainer's own Mac, instead of a version pinned in this file.
+    runs-on: macos-latest
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name
     continue-on-error: true
     steps:
       - name: checkout
         uses: actions/checkout@v4
+      - name: install clang-format
+        run: |
+          brew update
+          brew install clang-format coreutils
       - name: run style check
         run: |
           clang-format --version
@@ -104,10 +111,7 @@ jobs:
           LSAN_OPTIONS: suppressions=lsan_suppressions.txt
       - name: build and run tests (Mbed TLS)
         if: matrix.tls_backend == 'mbedtls'
-        # Run mbedTLS shards with reduced parallelism — under ASAN+mbedTLS the
-        # default 4 shards overload CI runners enough that timing-sensitive
-        # ServerTest cases flake on first-request keep-alive reuse.
-        run: cd test && make test_split_mbedtls && SHARDS=2 make test_mbedtls_parallel
+        run: cd test && make test_split_mbedtls && make test_mbedtls_parallel
       - name: build and run tests (wolfSSL)
         if: matrix.tls_backend == 'wolfssl'
         run: cd test && make test_split_wolfssl && make test_wolfssl_parallel
@@ -117,8 +121,35 @@ jobs:
       - name: build and run WebSocket heartbeat test
         if: matrix.tls_backend == 'openssl'
         run: cd test && make test_websocket_heartbeat && ./test_websocket_heartbeat
+      - name: build and run WebSocket TLS thread safety test
+        if: matrix.tls_backend == 'openssl'
+        run: cd test && make test_websocket_thread_safety && ./test_websocket_thread_safety
       - name: build and run ThreadPool test
         run: cd test && make test_thread_pool && ./test_thread_pool
+
+  # Ubuntu 26.04's apt ships Mbed TLS 3.6, giving 3.x coverage that
+  # ubuntu-latest (24.04 = 2.28) and macOS (Homebrew = 4.x) no longer provide.
+  # Uses the 26.04 public-preview image; fold into the main ubuntu matrix once
+  # ubuntu-latest moves to 26.04.
+  ubuntu-2604-mbedtls:
+    runs-on: ubuntu-26.04
+    if: >
+      (github.event_name == 'push') ||
+      (github.event_name == 'pull_request'  &&
+       github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name) ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.test_linux == 'true')
+    name: ubuntu-26.04 (mbedtls 3.x)
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+      - name: install common libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev zlib1g-dev libbrotli-dev libzstd-dev
+      - name: install Mbed TLS
+        run: sudo apt-get install -y libmbedtls-dev
+      - name: build and run tests (Mbed TLS)
+        run: cd test && make test_split_mbedtls && make test_mbedtls_parallel
 
   # BoringSSL is Google's fork of OpenSSL. It has no API stability guarantee
   # and is not packaged by distros, so we build it from source. cpp-httplib
@@ -178,7 +209,11 @@ jobs:
           git clone https://boringssl.googlesource.com/boringssl boringssl
           cd boringssl
           git checkout "${{ steps.boringssl-rev.outputs.sha }}"
+          # GCC 15 reports a false -Wstringop-overflow in BoringSSL's Keccak
+          # code, which its -Werror makes fatal. Clang is its primary compiler.
           cmake -S . -B build \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
@@ -288,10 +323,9 @@ jobs:
        github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name) ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.test_linux == 'true')
     name: issue-2431 repro (Linux + ASAN)
-    # Bound the whole job in case anything in the test harness hangs
-    # unexpectedly. With the fixture in place a normal run is well under
-    # a minute either way (ASAN abort on broken HEAD, clean pass on fix).
-    timeout-minutes: 5
+    # Loose, because apt on the runner mirror can crawl for minutes; the test
+    # step has its own tight limit.
+    timeout-minutes: 15
     env:
       DNS_FIXTURE_PORT: "15353"
       DNS_FIXTURE_DELAY: "3"
@@ -339,6 +373,8 @@ jobs:
       - name: build test binary
         run: cd test && make test
       - name: run GetAddrInfoAsyncCancelTest
+        # A normal run takes about 80s.
+        timeout-minutes: 3
         run: |
           cd test
           ARCH=$(uname -m)
@@ -372,7 +408,7 @@ jobs:
         uses: actions/checkout@v4
       - name: install Mbed TLS
         if: matrix.tls_backend == 'mbedtls'
-        run: brew install mbedtls@3
+        run: brew install mbedtls
       - name: install wolfSSL
         if: matrix.tls_backend == 'wolfssl'
         run: brew install wolfssl
@@ -383,10 +419,7 @@ jobs:
           LSAN_OPTIONS: suppressions=lsan_suppressions.txt
       - name: build and run tests (Mbed TLS)
         if: matrix.tls_backend == 'mbedtls'
-        # macOS runners under ASAN+mbedTLS still flake at SHARDS=2 (rapid
-        # bind/connect on the fixture's fixed port races on the slower
-        # macos-latest runner). Serialize fully here; ubuntu stays at 2.
-        run: cd test && make test_split_mbedtls && SHARDS=1 make test_mbedtls_parallel
+        run: cd test && make test_split_mbedtls && make test_mbedtls_parallel
       - name: build and run tests (wolfSSL)
         if: matrix.tls_backend == 'wolfssl'
         run: cd test && make test_split_wolfssl && make test_wolfssl_parallel
@@ -396,6 +429,9 @@ jobs:
       - name: build and run WebSocket heartbeat test
         if: matrix.tls_backend == 'openssl'
         run: cd test && make test_websocket_heartbeat && ./test_websocket_heartbeat
+      - name: build and run WebSocket TLS thread safety test
+        if: matrix.tls_backend == 'openssl'
+        run: cd test && make test_websocket_thread_safety && ./test_websocket_thread_safety
       - name: build and run ThreadPool test
         run: cd test && make test_thread_pool && ./test_thread_pool
 
@@ -449,6 +485,8 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    permissions:
+      contents: read
     if: >
       (github.event_name == 'push') ||
       (github.event_name == 'pull_request'  &&
@@ -497,7 +535,52 @@ jobs:
       run: vcpkg install gtest curl zlib brotli zstd
     - name: Install OpenSSL
       if: ${{ matrix.config.with_ssl }}
-      run: choco install openssl
+      shell: pwsh
+      run: |
+        # Chocolatey's openssl package hardcodes a versioned slproweb URL, and
+        # slproweb keeps only the newest build of each branch. The package
+        # therefore 404s on every OpenSSL release until someone respins it.
+        # Read slproweb's own manifest instead: it is updated at the same time
+        # as the downloads it points at, so the URL is always live.
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'  # Invoke-WebRequest is slow with it
+
+        $manifest = 'https://raw.githubusercontent.com/slproweb/opensslhashes/master/win32_openssl_hashes.json'
+        $entry = (Invoke-RestMethod $manifest).files.PSObject.Properties.Value |
+          Where-Object {
+            $_.bits -eq 64 -and $_.arch -eq 'INTEL' -and
+            -not $_.light -and $_.installer -eq 'exe' -and $_.basever -like '4.*'
+          } |
+          Sort-Object { [version]$_.basever } | Select-Object -Last 1
+        if (-not $entry) { throw 'No 64-bit OpenSSL 4.x installer found in the manifest' }
+        Write-Host "Installing OpenSSL $($entry.basever) from $($entry.url)"
+
+        $installer = Join-Path $env:RUNNER_TEMP 'Win64OpenSSL.exe'
+        Invoke-WebRequest $entry.url -OutFile $installer
+        $actual = (Get-FileHash $installer -Algorithm SHA512).Hash.ToLower()
+        if ($actual -ne $entry.sha512.ToLower()) {
+          throw "SHA512 mismatch: expected $($entry.sha512), got $actual"
+        }
+
+        # Same silent flags the Chocolatey package used. The installer is Inno
+        # Setup, so /DIR pins the location CMake already looks in. The inner
+        # quotes matter: ArgumentList joins on spaces, so an unquoted /DIR
+        # would install to C:\Program and only fail later, at load time.
+        $dir = 'C:\Program Files\OpenSSL'
+        $proc = Start-Process $installer -Wait -PassThru -ArgumentList `
+          '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', "/DIR=`"$dir`""
+        if ($proc.ExitCode -ne 0) { throw "Installer exited with $($proc.ExitCode)" }
+
+        # Catch a misplaced install here rather than at link or load time.
+        if (-not (Test-Path "$dir\lib\VC\x64\MD\libcrypto.lib")) {
+          throw "OpenSSL import libraries missing under $dir"
+        }
+        if (-not (Get-ChildItem "$dir\bin\libcrypto-*.dll" -ErrorAction SilentlyContinue)) {
+          throw "OpenSSL runtime DLLs missing under $dir\bin"
+        }
+
+        "$dir\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+        "OPENSSL_CONF=$dir\bin\openssl.cfg" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
     - name: Configure CMake ${{ matrix.config.name }}
       run: >
         cmake -B build -S .

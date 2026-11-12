@@ -11,11 +11,15 @@ void llama_model_plamo2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_SSM_TIME_STEP_RANK, hparams.ssm_dt_rank);
     ml.get_key(LLM_KV_SSM_GROUP_COUNT,    hparams.ssm_n_group);
 
-    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
-        hparams.recurrent_layer_arr[i] = hparams.n_head_kv(i) == 0;
+    // Load attention parameters
+    ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH,   hparams.n_embd_head_k_full, false);
+    ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH, hparams.n_embd_head_v_full, false);
+
+    for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
+        hparams.is_recr_impl[i] = hparams.n_head_kv(i) == 0;
     }
 
-    switch (hparams.n_layer) {
+    switch (hparams.n_layer()) {
         case 16: type = LLM_TYPE_1B; break;
         case 32:
             if (hparams.n_embd == 2048) {
@@ -54,7 +58,7 @@ void llama_model_plamo2::load_arch_tensors(llama_model_loader &) {
 
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
-        bool is_mamba_layer = hparams.is_recurrent(i);
+        bool is_mamba_layer = hparams.is_recr(i);
 
         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
 
@@ -100,10 +104,10 @@ void llama_model_plamo2::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_plamo2::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
-llama_model_plamo2::graph::graph(const llama_model & model, const llm_graph_params & params) :
+llama_model_plamo2::graph::graph(const llm_graph_params & params) :
     llm_build_mamba_base(params) {
     ggml_tensor * cur;
     ggml_tensor * inpL;
@@ -128,14 +132,19 @@ llama_model_plamo2::graph::graph(const llama_model & model, const llm_graph_para
         cur = build_norm(inpL, model.layers[il].attn_norm, NULL, LLM_NORM_RMS, il);
 
         // check if this layer is Mamba or Attention
-        const bool is_mamba_layer = hparams.is_recurrent(il);
+        const bool is_mamba_layer = hparams.is_recr(il);
 
         if (is_mamba_layer) {
             // PLaMo-2 Mamba layer
-            cur = build_plamo2_mamba_layer(inp_hybrid->get_recr(), cur, model, ubatch, il);
+            cur = build_plamo2_mamba_layer(inp_hybrid->get_recr(), cur, ubatch, il);
         } else {
             // PLaMo-2 Attention layer
-            cur = build_plamo2_attn_layer(inp_hybrid->get_attn(), inp_pos, cur, model, il);
+            cur = build_plamo2_attn_layer(inp_hybrid->get_attn(), inp_pos, cur, il);
+        }
+
+        if (il == n_layer - 1 && inp_out_ids) {
+            cur      = ggml_get_rows(ctx0, cur, inp_out_ids);
+            residual = ggml_get_rows(ctx0, residual, inp_out_ids);
         }
 
         // post_mixer_norm
@@ -163,11 +172,6 @@ llama_model_plamo2::graph::graph(const llama_model & model, const llm_graph_para
         cur = build_norm(cur, model.layers[il].ffn_post_norm, NULL, LLM_NORM_RMS, il);
         cb(cur, "ffn_post_norm", il);
 
-        if (il == n_layer - 1 && inp_out_ids) {
-            cur      = ggml_get_rows(ctx0, cur, inp_out_ids);
-            residual = ggml_get_rows(ctx0, residual, inp_out_ids);
-        }
-
         // residual connection
         cur = ggml_add(ctx0, cur, residual);
         cb(cur, "ffn_residual", il);
@@ -192,14 +196,11 @@ llama_model_plamo2::graph::graph(const llama_model & model, const llm_graph_para
     ggml_set_output(cur);
 
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }
 
 ggml_tensor * llama_model_plamo2::graph::build_plamo2_attn_layer(llm_graph_input_attn_kv * inp,
                                                         ggml_tensor *             inp_pos,
                                                         ggml_tensor *             cur,
-                                                        const llama_model &       model,
                                                         int                       il) {
     // self-attention
     {
@@ -232,14 +233,12 @@ ggml_tensor * llama_model_plamo2::graph::build_plamo2_attn_layer(llm_graph_input
         Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, NULL, LLM_NORM_RMS, il);
         cb(Qcur, "Qcur_normed", il);
 
-        Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                             ext_factor, attn_factor, beta_fast, beta_slow);
+        Qcur = build_rope(Qcur, inp_pos, il);
 
         Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, NULL, LLM_NORM_RMS, il);
         cb(Kcur, "Kcur_normed", il);
 
-        Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr, n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                             ext_factor, attn_factor, beta_fast, beta_slow);
+        Kcur = build_rope(Kcur, inp_pos, il);
 
         cur = build_attn(inp,
             model.layers[il].wo, NULL, model.layers[il].wo_s,
@@ -253,7 +252,6 @@ ggml_tensor * llama_model_plamo2::graph::build_plamo2_attn_layer(llm_graph_input
 
 ggml_tensor * llama_model_plamo2::graph::build_plamo2_mamba_layer(llm_graph_input_rs * inp,
                                                          ggml_tensor *        cur,
-                                                         const llama_model &  model,
                                                          const llama_ubatch & ubatch,
                                                          int                  il) {
     const auto * mctx_cur = inp->mctx;
@@ -273,7 +271,7 @@ ggml_tensor * llama_model_plamo2::graph::build_plamo2_mamba_layer(llm_graph_inpu
     GGML_ASSERT(n_seqs != 0);
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
-    GGML_ASSERT(d_inner % n_head == 0);
+    GGML_ASSERT(d_inner % n_heads == 0);
     GGML_ASSERT(n_group == 0);
 
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
@@ -378,7 +376,7 @@ ggml_tensor * llama_model_plamo2::graph::build_plamo2_mamba_layer(llm_graph_inpu
             // Custom operator to optimize the parallel associative scan
             // as described in the Annex D of the Mamba paper.
             // => {d_inner, n_seq_tokens, n_seqs} and {d_state, d_inner, n_seqs}
-            return ggml_ssm_scan(ctx, ssm, x, dt, A, B, C, ids);
+            return ggml_ssm_scan(ctx, ssm, x, dt, A, B, C, ids, /*K=*/1);
         };
 
         ggml_tensor * y_ssm = build_rs(inp, ssm_states_all, hparams.n_embd_s(), ubatch.n_seqs, get_ssm_rows);

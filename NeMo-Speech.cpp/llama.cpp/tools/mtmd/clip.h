@@ -6,24 +6,40 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <map>
+
 // !!! Internal header, to be used by mtmd only !!!
 
 #define MTMD_INTERNAL_HEADER
 
 struct clip_ctx;
+struct clip_enc_state;
+struct clip_gen_state;
 
 struct clip_image_size {
     int width;
     int height;
+    bool operator==(const clip_image_size & other) const {
+        return width == other.width && height == other.height;
+    }
+    bool operator!=(const clip_image_size & other) const {
+        return !(*this == other);
+    }
+    int area() const {
+        // avoid overflow when computing area
+        GGML_ASSERT(width  >= 0 && width  <= 46000);
+        GGML_ASSERT(height >= 0 && height <= 46000);
+        return width * height;
+    }
 };
 
 struct clip_image_f32;
-struct clip_image_u8_batch;
 struct clip_image_f32_batch;
 
 enum clip_modality {
     CLIP_MODALITY_VISION,
     CLIP_MODALITY_AUDIO,
+    CLIP_MODALITY_GEN_AUDIO,
 };
 
 enum clip_flash_attn_type {
@@ -34,90 +50,143 @@ enum clip_flash_attn_type {
 
 struct clip_context_params {
     bool use_gpu;
+    ggml_backend_dev_t device;
     enum clip_flash_attn_type flash_attn_type;
     int image_min_tokens;
     int image_max_tokens;
     bool warmup;
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+    bool no_alloc;
+    mtmd_progress_callback progress_callback;
+    void * progress_callback_user_data;
 };
 
 struct clip_init_result {
     struct clip_ctx * ctx_v; // vision context
     struct clip_ctx * ctx_a; // audio context
+    struct clip_ctx * ctx_gen_a; // audio generation context
 };
 
 struct clip_init_result clip_init(const char * fname, struct clip_context_params ctx_params);
 
+// max number of output tokens per image, -1 if not dynamic size
+int clip_get_image_max_tokens(const struct clip_ctx * ctx);
+
 void clip_free(struct clip_ctx * ctx);
-
-size_t clip_embd_nbytes(const struct clip_ctx * ctx);
-size_t clip_embd_nbytes_by_img(const struct clip_ctx * ctx, int img_w, int img_h);
-
-int32_t clip_get_image_size (const struct clip_ctx * ctx);
-int32_t clip_get_patch_size (const struct clip_ctx * ctx);
-int32_t clip_get_hidden_size(const struct clip_ctx * ctx);
 
 // TODO: should be enum, not string
 const char * clip_patch_merge_type(const struct clip_ctx * ctx);
 
-int clip_n_output_tokens(const struct clip_ctx * ctx, struct clip_image_f32 * img);
+int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img);
 
 // for M-RoPE, this will be the number of token positions in X and Y directions
 // for other models, X will be the total number of tokens and Y will be 1
-int clip_n_output_tokens_x(const struct clip_ctx * ctx, struct clip_image_f32 * img);
-int clip_n_output_tokens_y(const struct clip_ctx * ctx, struct clip_image_f32 * img);
+int clip_n_output_tokens_x(const clip_ctx * ctx, const clip_image_f32 * img);
+int clip_n_output_tokens_y(const clip_ctx * ctx, const clip_image_f32 * img);
 
 // this should be equal to the embedding dimension of the text model
 int clip_n_mmproj_embd(const struct clip_ctx * ctx);
 
-struct clip_image_size      * clip_image_size_init(void);
-struct clip_image_u8        * clip_image_u8_init (void);
-struct clip_image_f32       * clip_image_f32_init(void);
-struct clip_image_f32_batch * clip_image_f32_batch_init(void); // only used by libllava
+// TODO: remove clip_image_encode() and always use batched version
+bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, const clip_image_f32 * img, std::vector<float> & out_vec);
+bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct clip_image_f32_batch * imgs, std::vector<float> & out_batch_embd);
 
-// nx, ny are the output image dimensions
-unsigned char * clip_image_u8_get_data(struct clip_image_u8 * img, uint32_t * nx, uint32_t * ny);
+enum clip_gen_process_type {
+    CLIP_GEN_PROCESS_GEN_UNKNOWN,
+    CLIP_GEN_PROCESS_GEN_CODE, // h_state to codes
+    CLIP_GEN_PROCESS_GEN_WAV,  // codes to raw PCM audio
+    CLIP_GEN_PROCESS_TTS,        // full utterance of codes to raw PCM audio
+    CLIP_GEN_PROCESS_TTS_VOCODE, // internal: mel + source stft to istft input
+    CLIP_GEN_PROCESS_TOKENIZE,   // raw PCM audio to semantic speech tokens
+};
 
-void clip_image_size_free (struct clip_image_size * img_size);
-void clip_image_u8_free (struct clip_image_u8  * img);
-void clip_image_f32_free(struct clip_image_f32 * img);
-void clip_image_u8_batch_free (struct clip_image_u8_batch  * batch);
-void clip_image_f32_batch_free(struct clip_image_f32_batch * batch);
+// gen-side voice reference (chatterbox): speech tokens, mel-rate features and the speaker vector
+struct clip_gen_ref {
+    std::vector<int32_t> tokens;
+    std::vector<float>   feat;
+    std::vector<float>   spk;
+};
 
-// use for accessing underlay data of clip_image_f32_batch
-size_t clip_image_f32_batch_n_images(const struct clip_image_f32_batch * batch); // equivalent to batch->size()
-size_t clip_image_f32_batch_nx(const struct clip_image_f32_batch * batch, int idx); // equivalent to batch[idx]->nx
-size_t clip_image_f32_batch_ny(const struct clip_image_f32_batch * batch, int idx); // equivalent to batch[idx]->ny
-struct clip_image_f32 * clip_image_f32_get_img(const struct clip_image_f32_batch * batch, int idx); // equivalent to batch[idx]->data
+struct clip_encode_params {
+    int n_threads = 1;
+    const clip_image_f32_batch * imgs = nullptr;
+    std::vector<float> * out_embd = nullptr;
 
-/**
- * Build image from pixels decoded by other libraries instead of stb_image.h for better performance.
- * The memory layout is RGBRGBRGB..., input buffer length must be 3*nx*ny bytes
- */
-void clip_build_img_from_pixels(const unsigned char * rgb_pixels, int nx, int ny, struct clip_image_u8 * img);
+    // for audio gen, imgs has exactly one entry: hidden state from backbone (GEN_CODE) or unused (GEN_WAV)
+    clip_gen_process_type gen_process = CLIP_GEN_PROCESS_GEN_UNKNOWN;
 
-struct ggml_tensor * clip_get_newline_tensor(const struct clip_ctx * ctx);
+    // GEN_CODE: out_embd receives the embd to feed back to the backbone
+    int32_t code0 = 0; // semantic code sampled by the backbone
+    int32_t top_k = 50;
+    float   top_p = 1.0f;
+    std::vector<int32_t> * out_codes = nullptr; // this frame's 16 sampled codes
+    std::vector<float> * out_feats = nullptr; // continuous counterpart of out_codes
+    float   temp = 0.0f;                      // sampling temperature, noise scale for flow-matching decoders
+    bool * out_is_eos = nullptr;
 
-bool clip_image_encode      (struct clip_ctx * ctx, int n_threads, struct clip_image_f32 * img, float * vec);
-bool clip_image_batch_encode(struct clip_ctx * ctx, int n_threads, const struct clip_image_f32_batch * imgs, float * vec);
+    // TOKENIZE: speech embedding rows of the produced codes
+    std::vector<float> * out_code_embd = nullptr;
 
-int clip_is_minicpmv(const struct clip_ctx * ctx);
-bool clip_is_glm(const struct clip_ctx * ctx);
+    // GEN_WAV
+    const std::vector<int32_t> * codes = nullptr;     // this frame's 16 RVQ codes
+    const std::vector<float> *   feats = nullptr;     // continuous counterpart of codes
+    std::vector<float> * out_audio = nullptr;         // decoded PCM samples, F32
+    const clip_gen_ref * ref = nullptr; // TTS reference conditioning of the voice
+    // TTS_VOCODE internal stage inputs
+    const std::vector<float> * mel_in   = nullptr;
+    const std::vector<float> * sstft_in = nullptr;
+    int vocode_n_mel  = 0;
+    int vocode_n_stft = 0;
+    std::vector<float> * out_spec = nullptr;
+
+    // audio gen: state of one sequence, clip_encode() updates it in place
+    struct clip_gen_state * gen_state = nullptr;
+
+    // streaming audio input, updated in place by clip_encode()
+    struct clip_enc_state * enc_state = nullptr;
+};
+bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params);
+
+// persistent state of a causal audio encoder, for streaming input (one per stream)
+// it holds the sliding window of past keys/values, so each clip_encode() call only takes the new frames
+// n_frames_max is the maximum number of encoder frames per call
+struct clip_enc_state * clip_enc_state_init(struct clip_ctx * ctx, int32_t n_frames_max);
+void                    clip_enc_state_free(struct clip_enc_state * state);
+
+// per-sequence state of audio generation: RNG and the slots kept between GEN_WAV calls
+// seed UINT32_MAX means random; reset() clears the slots and keeps the RNG stream
+struct clip_gen_state * clip_gen_state_init(struct clip_ctx * ctx, uint32_t seed);
+void                    clip_gen_state_free(struct clip_gen_state * state);
+void                    clip_gen_state_reset(struct clip_gen_state * state);
+
+// read a chatterbox tensor by name as F32, returns the element count (0 if not found), out may be null to query the size
+size_t clip_cbx_read_tensor(struct clip_ctx * ctx, const char * name, float * out, size_t n_max);
+
+// a predefined voice: backbone rows, plus the gen-side reference when the gen stack needs one
+struct clip_gen_voice {
+    std::vector<float> rows;
+    clip_gen_ref       ref;
+};
+
+const std::map<std::string, clip_gen_voice> & clip_gen_get_voices(const struct clip_ctx * ctx);
+
 bool clip_is_llava(const struct clip_ctx * ctx);
 // note for contributor: this clip_is_(model) pattern is deprecated
 //                       do NOT add new functions like this
 
-bool clip_encode_float_image (struct clip_ctx * ctx, int n_threads, float * img, int h, int w, float * vec);
-
-// use by audio input
-void clip_image_f32_batch_add_mel(struct clip_image_f32_batch * batch, int n_mel, int n_frames, float * mel);
-
 bool clip_has_vision_encoder(const struct clip_ctx * ctx);
 bool clip_has_audio_encoder(const struct clip_ctx * ctx);
+
+bool clip_support_batch(const struct clip_ctx * ctx);
+
+int clip_model_n_temporal_merge(const struct clip_ctx * ctx); // TODO @ngxson : remove, refactor this
+
+std::map<ggml_backend_dev_t, size_t> clip_get_mem_usage(const struct clip_ctx * ctx);
 
 struct clip_cap {
     bool has_vision;
     bool has_audio;
+    bool has_gen_audio;
 };
 struct clip_cap clip_get_cap(const char * fname);

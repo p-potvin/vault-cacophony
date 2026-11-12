@@ -9,7 +9,8 @@
 
 class mandarin_tokenizer {
    public:
-    explicit mandarin_tokenizer(const std::filesystem::path& model_dir);
+    explicit mandarin_tokenizer(
+        const std::filesystem::path& model_dir, int offset, std::string phoneme_dict);
     ~mandarin_tokenizer();
 
     mandarin_tokenizer(const mandarin_tokenizer&) = delete;

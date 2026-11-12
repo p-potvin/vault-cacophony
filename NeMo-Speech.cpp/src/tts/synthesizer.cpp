@@ -61,6 +61,15 @@ struct Synthesizer::Impl {
         if (!config.tokenizer_model_dir.empty()) {
             tokenizer = std::make_unique<MagpieNativeTokenizer>(
                 std::move(config.tokenizer_model_dir), config.tokenizer);
+            if (tokenizer->profile_id() != runtime.tokenizer_profile() ||
+                tokenizer->text_vocab_size() != runtime.text_vocab_size()) {
+                throw std::invalid_argument(
+                    "Magpie model/tokenizer mismatch: GGUF requires tokenizer profile '" +
+                    runtime.tokenizer_profile() + "' with text vocabulary " +
+                    std::to_string(runtime.text_vocab_size()) + ", but tokenizer directory is '" +
+                    tokenizer->profile_id() + "' with text vocabulary " +
+                    std::to_string(tokenizer->text_vocab_size()));
+            }
         }
     }
 
@@ -304,7 +313,8 @@ Synthesizer::speaker_names() const {
 
 std::vector<std::string>
 Synthesizer::supported_language_codes() const {
-    return MagpieNativeTokenizer::supported_language_codes();
+    return impl_->tokenizer ? impl_->tokenizer->supported_language_codes()
+                            : std::vector<std::string>{};
 }
 
 const std::string&

@@ -16,12 +16,40 @@ options are omitted.
 
 Hugging Face: [nvidia/magpie_tts_multilingual_357m](https://huggingface.co/nvidia/magpie_tts_multilingual_357m)
 
+Use `nemo-speech pull magpie` to download the F16 GGUF and matching tokenizer
+assets pinned by the model index. For manually managed checkpoints, download
+the GGUF and `.nemo` archive from the same Hugging Face revision and pass their
+local paths explicitly.
+
+v2602 generates one codec frame per autoregressive step, while v2607 uses a
+frame-stacking factor of 2. This is independent of `tts.chunk-frames`, which
+groups generated frames for NanoCodec streaming. Both versions use the same
+NanoCodec decoder.
+
+The fused CUDA decode path, which the published TTS benchmarks use, needs a
+Q8_0 GGUF; the pulled F16 GGUF runs the unfused path. Convert the `.nemo`
+locally (Q8_0 is the converter default):
+
+```bash
+python3 convert_model.py magpie_tts_multilingual_357m.nemo \
+    --outfile magpie_tts_multilingual_357m.v2607.q8_0.gguf
+```
+
 **Tokenizer.** MagpieTTS's tokenizer assets live *inside* the `.nemo` archive -
 they are not part of the GGUF. The built-in pull extracts only the required,
 pinned tokenizer members and verifies each one. For a custom Magpie checkpoint,
 extract its `.nemo` archive and pass that directory as `--tokenizer-dir` or
 `--tts.tokenizer-model-dir`.
 The model-specific IPA/text tokenizer assets are loaded from this directory.
+The GGUF and extracted directory must come from the same model revision. The
+runtime recognizes the exact v2602 and v2607 tokenizer layouts from
+`model_config.yaml` and rejects unknown layouts or a profile mismatch at
+startup. Newly converted GGUFs record the profile explicitly; older v2602 and
+v2607 GGUFs are identified from their text-vocabulary and frame-stacking
+dimensions. In particular, v2602 uses the Hindi character tokenizer, while
+v2607 uses the bundled Hindi IPA dictionary and also changes tokenizer order,
+Japanese ASCII casing, Italian/Vietnamese tokenizer names, and the supported
+language set.
 Japanese tokenization requires a build with `NEMO_SPEECH_TTS_WITH_JA=ON`
 (disabled by default), which builds Open JTalk, MeCab, and the NAIST dictionary.
 Mandarin requires `NEMO_SPEECH_TTS_WITH_ZH=ON` (disabled by default) and
@@ -61,14 +89,55 @@ nemo-speech synthesize "Hello from Magpie Multilingual." --output output.wav
 
 The unified [`convert_model.py`](../../convert_model.py) entry point accepts
 compatible local `.nemo` archives and extracted NeMo checkpoints. It defaults
-to `--outtype f16` for MagpieTTS and NanoCodec; pass `--outtype f32` to retain
-full precision. The converter is a source-tree Python tool and is not included
+to `--outtype q8_0` for MagpieTTS and `--outtype f16` for NanoCodec; pass
+`--outtype f16` or `--outtype f32` to keep MagpieTTS unquantized. The `q8_0`
+output stores the attention and feed-forward projections of the text encoder,
+decoder and local transformer, the local-transformer output projections and the
+final projection as Q8_0, keeps norms and biases f32, and everything else f16.
+In an ASR round trip on the 10 LJSpeech sentences of
+[`ljs_audio_text_test_filelist_small.txt`](../../test_files/tts/ljs_audio_text_test_filelist_small.txt)
+(three seeds each, transcribed with Nemotron Speech Streaming 0.6B), MagpieTTS v2607 Q8_0 scores
+5.6% WER and 2.2% CER against 4.7% and 2.1% for f16. On CUDA GPUs
+with compute capability 8.0 or newer and at least 48 SMs it also enables the
+fused decoder kernel and, when classifier-free guidance is on (the default;
+`--tts.no-cfg` turns it off), the fused local-transformer kernel. Both are
+selected automatically.
+On Hopper and newer, build with native code for the GPU (for example
+`-DCMAKE_CUDA_ARCHITECTURES=native`). The converter is a source-tree
+Python tool and is not included
 in native release archives; see [Model conversion](../model-conversion.md) for
 environment setup.
 
 ```bash
-python3 convert_model.py custom-magpie.nemo --outfile custom-magpie.f16.gguf
+python3 convert_model.py custom-magpie.nemo --outfile custom-magpie.q8_0.gguf
 ```
+
+Voice names are read from the checkpoint's `speaker_map` (including its bundled
+`speakers.json`) and stored in `magpietts.speaker_names` in numeric speaker ID
+order. Conversion rejects missing maps or IDs that do not match the baked
+speaker count. Extracted checkpoints must retain the referenced speaker file.
+The mappings differ between releases:
+
+| Speaker ID | v2602 | v2607 |
+|---|---|---|
+| 0 | John | Aria |
+| 1 | Sofia | Jason |
+| 2 | Aria | John |
+| 3 | Jason | Leo |
+| 4 | Leo | Sofia |
+
+Older converters wrote the v2602 names into every GGUF, causing v2607 named
+voices to select the wrong speaker. Reconvert the v2607 `.nemo` with the updated
+converter and select the new GGUF, then restart the runtime:
+
+```bash
+python3 convert_model.py magpie_tts_multilingual_357m.nemo \
+    --outtype f16 --outfile magpie_tts_multilingual_357m.v2607.fixed.f16.gguf
+```
+
+Updating the converter does not change existing GGUFs or published downloads.
+Until the affected GGUF is replaced, requesting the numeric voice `"2"` selects
+John on v2607. v2602's John remains at ID 0.
 
 Conversion does not require `nemo_toolkit`. The optional
 `scripts/tts/tokenize-magpietts.py` debugging helper does.

@@ -9,7 +9,7 @@ void llama_model_rwkv6qwen2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_RESCALE_EVERY_N_LAYERS,      hparams.rescale_every_n_layers, false);
     ml.get_key(LLM_KV_TOKEN_SHIFT_COUNT,           hparams.token_shift_count, false);
 
-    switch (hparams.n_layer) {
+    switch (hparams.n_layer()) {
         case 24: type = LLM_TYPE_1_6B; break;
         case 32:
             switch (hparams.n_embd) {
@@ -78,10 +78,10 @@ void llama_model_rwkv6qwen2::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_rwkv6qwen2::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
-llama_model_rwkv6qwen2::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_build_rwkv6_base(model, params) {
+llama_model_rwkv6qwen2::graph::graph(const llm_graph_params & params) : llm_build_rwkv6_base(params) {
     GGML_ASSERT(n_embd == hparams.n_embd_r());
 
     ggml_tensor * cur;
@@ -162,6 +162,4 @@ llama_model_rwkv6qwen2::graph::graph(const llama_model & model, const llm_graph_
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }

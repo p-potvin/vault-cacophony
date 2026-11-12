@@ -9,10 +9,11 @@ checkouts and are summarized here.
 
 ### ggml
 
-- Source: [`ggml-org/ggml`](https://github.com/ggml-org/ggml)
-- Path: `ggml`
+- Source: [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) (`ggml/`,
+  developed and vendored in llama.cpp)
+- Path: `llama.cpp/ggml`
 - Copyright (c) 2023-2026 The ggml authors
-- License: MIT; upstream text: [`ggml/LICENSE`](ggml/LICENSE)
+- License: MIT; upstream text: [`llama.cpp/LICENSE`](llama.cpp/LICENSE)
 
 ### llama.cpp
 
@@ -135,8 +136,8 @@ project notice set is installed under
 - Copyright (c) NVIDIA CORPORATION & AFFILIATES
 - License: NVIDIA Software License Agreement and CUDA Supplement
 
-CUDA release archives include the redistributable CUDA runtime library. The
-applicable agreement is installed with the archive under
+CUDA release archives include the redistributable CUDA runtime, cuBLAS and
+cuBLASLt libraries. The applicable agreement is installed with the archive under
 `share/licenses/nemo-speech/nvidia/cuda-runtime/`.
 
 ## Other incorporated third-party code and data
@@ -147,19 +148,21 @@ applicable agreement is installed with the archive under
   0.11.25 at commit `9634bedb5b5a2ca38c1ee7108a9358a4e233f14d`, vendored by
   the pinned llama.cpp checkout
 - Path: `llama.cpp/vendor/miniaudio/miniaudio.h`
-- Copyright 2025 David Reid
+- Copyright 2026 David Reid
 - License: Public Domain (Unlicense) or MIT No Attribution (MIT-0); upstream
   text is reproduced at
   [`third_party/miniaudio/LICENSE`](third_party/miniaudio/LICENSE)
 
 The command-line microphone capture layer compiles miniaudio directly into
-`nemo-speech`. Release archives install its license under
-`share/licenses/nemo-speech/third_party/miniaudio/`.
+`nemo-speech`, and the audio ingest (`src/common/audio_miniaudio.cpp`) compiles
+its embedded dr_flac and dr_mp3 decoders into every build, with all miniaudio
+symbols internal to that translation unit. Release archives install its license
+under `share/licenses/nemo-speech/third_party/miniaudio/`.
 
 ### SentencePiece
 
 - Source: [`google/sentencepiece`](https://github.com/google/sentencepiece),
-  revision `17d7580d6407802f85855d2cc9190634e2c95624`
+  revision `31646a467d2051eb904e0b45de3a73e91fe1c1e3`
 - Copyright 2018 Google Inc.
 - License: Apache License 2.0
 
@@ -167,6 +170,27 @@ Default Windows ASR, macOS, and Linux release builds statically link the
 SentencePiece runtime and its bundled Abseil, protobuf-lite, and Darts-clone
 components. Their Apache 2.0 and BSD license texts are installed under
 `share/licenses/nemo-speech/third_party/sentencepiece/`.
+
+### Text normalization runtime
+
+`scripts/build_itn_deps.sh` builds these pinned sources for ITN and TN:
+
+- OpenFST: [`sarane22/openfst`](https://github.com/sarane22/openfst), revision
+  `fc23b4cf529429284b874a26f28b15c6cc94f404`; Copyright 2005-2024 Google LLC;
+  Apache License 2.0
+- Sparrowhawk: [`sarane22/sparrowhawk`](https://github.com/sarane22/sparrowhawk),
+  revision `8b082acc507312077a096be8398584a13832c490`; Copyright 2015 and
+  onwards Google, Inc.; Apache License 2.0
+- Protocol Buffers:
+  [`protocolbuffers/protobuf`](https://github.com/protocolbuffers/protobuf)
+  v21.12; Copyright 2008 Google Inc.; BSD 3-Clause License
+- RE2: [`google/re2`](https://github.com/google/re2) 2023-03-01; Copyright (c)
+  2009 The RE2 Authors; BSD 3-Clause License
+
+Linux and macOS release archives statically link all four into
+`libnemo_speech_text_normalization`. Builds that use system Protocol Buffers and
+RE2 link those instead. The license texts are installed under
+`share/licenses/nemo-speech/third_party/`.
 
 ### whisper.cpp sample audio
 
@@ -196,6 +220,38 @@ The generated Mandarin tokenizer tables contain data derived from:
 
 The CppJieba and limonp sources used to consume these tables are listed above.
 
+### SciPy, NumPy and PyTorch numerics
+
+The speech-LLM word aligner (`src/speechlm/pee/timestamp_alignment.cpp`) reproduces
+these routines so that its alignments equal NeMo's Python aligner exactly:
+
+- SciPy's rectangular linear sum assignment
+  (`scipy/optimize/rectangular_lsap/rectangular_lsap.cpp`, the shortest augmenting
+  path algorithm after D. F. Crouse; author P. M. Larsen):
+  [`scipy/scipy`](https://github.com/scipy/scipy); Copyright (c) 2001-2002
+  Enthought, Inc. 2003, SciPy Developers; BSD 3-Clause License
+- NumPy's float32 logarithm kernel (`simd_log_FLOAT`, including its polynomial
+  coefficients) and its pairwise summation:
+  [`numpy/numpy`](https://github.com/numpy/numpy); Copyright (c) 2005-2025, NumPy
+  Developers; BSD 3-Clause License
+- PyTorch's float32 `linspace` arithmetic:
+  [`pytorch/pytorch`](https://github.com/pytorch/pytorch); Copyright (c) 2016-
+  Facebook, Inc (Adam Paszke) and the other contributors listed in its `LICENSE`;
+  BSD 3-Clause License
+
+The BSD 3-Clause license text is reproduced below.
+
+### Unicode Character Database
+
+The generated tables `src/common/grapheme_break_table.inc` (ICU 74, Unicode 15.1),
+`src/speechlm/pee/timestamp_unit_tables.inc` (Unicode 15.1) and
+`src/speechlm/letter_mark_table.inc` (Unicode 15.0) contain data derived from the
+Unicode Character Database (`scripts/gen_grapheme_tables.py`,
+`scripts/gen_timestamp_unit_tables.py`, `scripts/gen_letter_mark_table.py`).
+
+Copyright © 1991-2026 Unicode, Inc. License: Unicode License v3; the license text
+is reproduced below.
+
 ## MIT License
 
 The following text applies to the MIT-licensed components and derived material
@@ -220,9 +276,84 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-## NVIDIA ggml patches
+## BSD 3-Clause License
 
-The `ggml-patches/` directory contains NVIDIA-authored changes applied to the
-pinned MIT-licensed ggml source. New source files created by those patches
-carry the NVIDIA Apache-2.0 header; existing ggml files retain their upstream
-notices. The resulting combined source and binaries retain ggml's MIT notice.
+The following text applies to the BSD-licensed material identified above, with
+the copyright notices listed for each.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above
+   copyright notice, this list of conditions and the following
+   disclaimer in the documentation and/or other materials provided
+   with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived
+   from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## Unicode License v3
+
+UNICODE LICENSE V3
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright © 1991-2026 Unicode, Inc.
+
+NOTICE TO USER: Carefully read the following legal agreement. BY
+DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of data files and any associated documentation (the "Data Files") or
+software and any associated documentation (the "Software") to deal in the
+Data Files or Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, and/or sell
+copies of the Data Files or Software, and to permit persons to whom the
+Data Files or Software are furnished to do so, provided that either (a)
+this copyright and permission notice appear with all copies of the Data
+Files or Software, or (b) this copyright and permission notice appear in
+associated Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+THIRD PARTY RIGHTS.
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+FILES OR SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder shall
+not be used in advertising or otherwise to promote the sale, use or other
+dealings in these Data Files or Software without prior written
+authorization of the copyright holder.
+
+## NVIDIA llama.cpp and ggml patches
+
+The `patches/` directory contains NVIDIA-authored changes applied to the pinned
+MIT-licensed llama.cpp and ggml source. New source files created by those patches
+carry the NVIDIA Apache-2.0 header; existing files retain their upstream
+notices. The resulting combined source and binaries retain the MIT notice.

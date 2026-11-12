@@ -1,6 +1,6 @@
 ---
 title: "E04. SSEをクライアントで受信する"
-order: 50
+order: 51
 status: "draft"
 ---
 
@@ -25,7 +25,7 @@ sse.start(); // ブロッキング
 
 ## イベント名で分岐する
 
-サーバー側で`event:`を付けて送られてくる場合は、`on_event()`で名前ごとにハンドラを登録できます。
+サーバーが`event:`を付けてイベントを送ってくる場合は、`on_event()`で名前ごとにハンドラを登録できます。
 
 ```cpp
 sse.on_event("message", [](const auto &msg) {
@@ -41,7 +41,7 @@ sse.on_event("leave", [](const auto &msg) {
 });
 ```
 
-`on_message()`は、名前なし（デフォルトの`message`イベント）を受け取る汎用ハンドラとして使えます。
+`on_message()`は、`on_event()`で登録していない名前のイベントをまとめて受け取る汎用ハンドラです。上の例のように`on_event("message", ...)`を登録した場合、`message`イベントは`on_message()`ではなくそちらに届きます。
 
 ## 接続イベントとエラーハンドリング
 
@@ -55,7 +55,9 @@ sse.on_error([](httplib::Error err) {
 });
 ```
 
-接続確立時やエラー発生時にもフックを挟めます。エラーハンドラが呼ばれても、`SSEClient`は内部で再接続を試みます。
+接続確立時やエラー発生時にもフックを挟めます。エラーハンドラが呼ばれても、`SSEClient`は内部で再接続を試みます。ただし、サーバーが204、403、404のいずれかを返したときや、`set_max_reconnect_attempts()`で決めた回数を使い切ったときは再接続しません。
+
+また、1つのイベントや、まだ改行が来ていない行が`CPPHTTPLIB_SSE_MAX_EVENT_LENGTH`（デフォルトは16MB、0なら無制限）を超えたときも止まります。このときエラーハンドラには`Error::ExceedMaxPayloadSize`が渡されます。イベントストリームには終わりがないので、クライアントの`set_payload_max_length()`はストリーム全体には適用されません。
 
 ## 非同期で動かす
 
@@ -87,6 +89,8 @@ sse.set_max_reconnect_attempts(10);  // 10回まで（0=無制限）
 ## Last-Event-IDの自動管理
 
 `SSEClient`は受信したイベントの`id`を内部で保持していて、再接続時に`Last-Event-ID`ヘッダーとして送ってくれます。この挙動はサーバー側で`id:`付きイベントを送っていれば自動で有効になります。
+
+空の`id:`を受け取ると、保持しているIDはクリアされます。ヘッダーの値として送れない`id:`（NULなどの制御文字を含むものや、前後に空白があるもの）は無視され、それまでのIDがそのまま残ります。
 
 ```cpp
 std::cout << "last id: " << sse.last_event_id() << std::endl;

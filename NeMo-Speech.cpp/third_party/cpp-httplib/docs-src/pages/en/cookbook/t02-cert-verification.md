@@ -1,6 +1,6 @@
 ---
 title: "T02. Control SSL Certificate Verification"
-order: 43
+order: 44
 status: "draft"
 ---
 
@@ -18,6 +18,8 @@ auto res = cli.Get("/");
 ```
 
 The first argument is the CA certificate file; the second is an optional CA directory. With the OpenSSL backend, you can also pass an `X509_STORE*` directly via `set_ca_cert_store()`.
+
+Once you set a custom CA, the client trusts only that CA and skips the OS store. To trust both, also call `cli.enable_system_ca(true)`. CA certificates are loaded once, on the client's first connection, so make these settings before the first request.
 
 ## Disable certificate verification (not recommended)
 
@@ -46,8 +48,10 @@ The certificate itself is still validated, so this is safer than fully disabling
 
 ## Use the OS cert store as-is
 
-On most Linux distributions, root certificates live in a single file like `/etc/ssl/certs/ca-certificates.crt`. cpp-httplib reads the OS default store at startup, so for most servers you don't need to configure anything.
+On most Linux distributions, root certificates live in a single file like `/etc/ssl/certs/ca-certificates.crt`. cpp-httplib loads the OS default store on the client's first connection, so for most servers you don't need to configure anything.
 
 > The same APIs work on the mbedTLS and wolfSSL backends. For choosing between backends, see [T01. Choosing between OpenSSL, mbedTLS, and wolfSSL](../t01-tls-backends).
 
 > For details on diagnosing failures, see [C18. Handle SSL errors](../c18-ssl-errors).
+
+> For TLS configuration on a WebSocket client (`wss://`), see [W05. Configure TLS for wss:// Connections](../w05-websocket-tls).

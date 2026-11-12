@@ -39,9 +39,10 @@ ARG ENABLE_TESTS=OFF
 ARG ENABLE_NMT=OFF
 # Full-duplex VoiceChat via llama.cpp. Set ON to build realtime server support.
 ARG ENABLE_S2S=OFF
-# Apply the project ggml patches and build the ASR against them. Set OFF to
-# build the ASR against STANDARD upstream ggml (stock ops only, no patches):
-# skips apply-ggml-patches.sh and sets -DNEMO_SPEECH_GGML_PATCHED=OFF.
+# SALM speech-LLM transcription (speech encoder + llama.cpp decoder). Set OFF to leave it out.
+ARG ENABLE_SPEECHLM=ON
+# Build ggml and llama.cpp with patches/ applied (CMake applies them). Set OFF to
+# build against pristine upstream llama.cpp (stock ggml ops only).
 ARG ENABLE_GGML_PATCHES=ON
 ARG JOBS=
 # GPU arch(es) for ggml-cuda. Empty = ggml's portable default (sm_86/89/120/121
@@ -66,6 +67,7 @@ ARG ENABLE_TTS_ZH
 ARG ENABLE_TESTS
 ARG ENABLE_NMT
 ARG ENABLE_S2S
+ARG ENABLE_SPEECHLM
 ARG ENABLE_GGML_PATCHES
 ARG JOBS
 ARG CUDA_ARCH
@@ -120,12 +122,9 @@ COPY README.md CONTRIBUTING.md /work/
 COPY docs /work/docs
 COPY config /work/config
 COPY models/index.json /work/models/index.json
-# Core submodules: ggml (every backend) and llama.cpp (NMT and VoiceChat;
-# copied unconditionally so the layer cache is stable).
-COPY ggml /work/ggml
+# llama.cpp provides ggml for every backend (and libllama for NMT and VoiceChat).
 COPY llama.cpp /work/llama.cpp
-COPY ggml-patches /work/ggml-patches
-COPY llama-patches /work/llama-patches
+COPY patches /work/patches
 COPY proto /work/proto
 COPY include /work/include
 COPY src /work/src
@@ -161,30 +160,14 @@ RUN if [ "${ENABLE_FLASHLIGHT}" = "ON" ]; then \
         && rm -rf /work/.deps/sentencepiece-build; \
     fi
 
-# Apply the project ggml patches (fused rel-pos attention, NVFP4 quantization,
-# norm fusion, dw-conv F16, skinny-q8, BF16 fusions, and CUDA correctness) onto the clean
-# vendored ggml. Idempotent: a working tree that already has them applied is
-# detected and skipped. Skipped entirely when ENABLE_GGML_PATCHES=OFF — the ASR
-# then builds against standard upstream ggml (see NEMO_SPEECH_GGML_PATCHED).
-RUN if [ "${ENABLE_GGML_PATCHES}" = "ON" ]; then bash /work/scripts/apply-ggml-patches.sh; fi
-
-# NMT and VoiceChat rely on the project's llama.cpp compatibility and
-# quantization patches. The patch script is idempotent for prepatched trees.
-RUN if [ "${ENABLE_NMT}" = "ON" ] || [ "${ENABLE_S2S}" = "ON" ]; then \
-        bash /work/scripts/apply-llama-patches.sh; \
-    fi
-
 # NCCL disabled: single-GPU inference does not use multi-GPU collectives,
 # and the linked libnccl is otherwise dead runtime weight.
-# NEMO_SPEECH_CUBLAS_SHIM=ON builds the drop-in libcublas.so.<CUDA-major>
-# (native GEMM, no cuBLASLt) as a normal build target.
 RUN cmake -G Ninja -S /work -B /work/build \
         -DCMAKE_BUILD_TYPE=Release \
         -DGGML_CUDA=${ENABLE_CUDA} \
         -DGGML_CUDA_NCCL=OFF \
         -DGGML_CUDA_GRAPHS=${ENABLE_CUDA_GRAPHS} \
         -DGGML_NATIVE=OFF \
-        -DNEMO_SPEECH_CUBLAS_SHIM=${ENABLE_CUDA} \
         -DNEMO_SPEECH_GGML_PATCHED=${ENABLE_GGML_PATCHES} \
         ${CUDA_ARCH:+-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCH}} \
         -DNEMO_SPEECH_BUILD_GRPC=${ENABLE_GRPC} \
@@ -196,6 +179,7 @@ RUN cmake -G Ninja -S /work -B /work/build \
         -DNEMO_SPEECH_TTS_WITH_ZH=${ENABLE_TTS_ZH} \
         -DNEMO_SPEECH_BUILD_NMT=${ENABLE_NMT} \
         -DNEMO_SPEECH_BUILD_S2S=${ENABLE_S2S} \
+        -DNEMO_SPEECH_BUILD_SPEECHLM=${ENABLE_SPEECHLM} \
         -DNEMO_SPEECH_BUILD_TESTS=${ENABLE_TESTS} \
         -DNEMO_SPEECH_BUILD_TOOLS=${ENABLE_TESTS} \
     && cmake --build /work/build ${JOBS:+-- -j${JOBS}}
@@ -219,8 +203,7 @@ RUN mkdir -p /out/bin /out/lib /out/share/nemo-speech \
            /work/build/bin/libggml*.so* \
            /work/build/bin/libllama*.so* \
            /work/build/bin/libnemo_speech*.so* \
-           /work/build/bin/libkenlm*.so* \
-           /work/build/bin/libcublas.so*; \
+           /work/build/bin/libkenlm*.so*; \
        do \
            if [ -e "${library}" ]; then cp -a "${library}" /out/lib/; fi; \
        done \
@@ -229,7 +212,7 @@ RUN mkdir -p /out/bin /out/lib /out/share/nemo-speech \
     && install -Dm0644 /work/build/share/nemo-speech/model-index.json \
         /out/share/nemo-speech/model-index.json \
     && license_dir=/out/share/licenses/nemo-speech/third_party \
-    && install -Dm0644 /work/ggml/LICENSE "$license_dir/ggml/LICENSE" \
+    && install -Dm0644 /work/llama.cpp/LICENSE "$license_dir/ggml/LICENSE" \
     && install -Dm0644 /work/llama.cpp/LICENSE "$license_dir/llama.cpp/LICENSE" \
     && if [ "${ENABLE_GRPC}" = "ON" ]; then \
            install -Dm0644 /work/proto/riva-common/LICENSE \
@@ -317,11 +300,10 @@ RUN set -eux; \
     }; \
     copy_dep() { \
         dep="$1"; \
-        # Skip the CUDA driver (toolkit-injected at run time) and real cuBLAS/
-        # cuBLASLt: the in-tree shim in /opt/nemo-speech/lib provides
-        # libcublas.so.<CUDA-major>, and nothing else needs cuBLASLt.
+        # Skip the CUDA driver (toolkit-injected at run time). The CUDA runtime,
+        # cuBLAS and cuBLASLt are copied from the toolkit like any other dependency.
         case "$dep" in \
-            */libcuda.so*|*/libcublas.so*|*/libcublasLt.so*) return 0;; \
+            */libcuda.so*) return 0;; \
         esac; \
         dest="$root${dep}"; \
         mkdir -p "$(dirname "$dest")"; \
@@ -346,9 +328,6 @@ RUN set -eux; \
             break; \
         fi; \
     done; \
-    # The cuBLAS shim (CMake target -DNEMO_SPEECH_CUBLAS_SHIM=ON, staged via
-    # /out/lib) is the only libcublas.so.<CUDA-major> in the image and is first on
-    # LD_LIBRARY_PATH; real cuBLAS/cuBLASLt were skipped by copy_dep above.
     for b in "$root"/opt/nemo-speech/bin/*; do [ -f "$b" ] && strip --strip-unneeded "$b" || true; done; \
     chmod 0755 "$root"/opt/nemo-speech/bin/*; \
     chown -R 1000:1000 "$root/home/nemo" "$root/opt/nemo-speech"

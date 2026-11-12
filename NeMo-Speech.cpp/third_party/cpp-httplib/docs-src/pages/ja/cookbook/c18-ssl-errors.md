@@ -17,26 +17,34 @@ if (!res) {
   std::cerr << "error: " << httplib::to_string(err) << std::endl;
 
   if (err == httplib::Error::SSLConnection ||
-      err == httplib::Error::SSLServerVerification) {
+      err == httplib::Error::SSLServerVerification ||
+      err == httplib::Error::Read || err == httplib::Error::Write) {
     std::cerr << "ssl_error: " << res.ssl_error() << std::endl;
     std::cerr << "ssl_backend_error: " << res.ssl_backend_error() << std::endl;
   }
 }
 ```
 
-`ssl_error()`はSSLライブラリが返したエラーコード（OpenSSLの`SSL_get_error()`の値など）、`ssl_backend_error()`はバックエンドがさらに詳しく提供するエラー値です。OpenSSLなら`ERR_get_error()`の値が入ります。
+`ssl_error()`は、どのTLSバックエンドでも共通のエラー種別（`httplib::tls::ErrorCode`）を`int`で返します。`ssl_backend_error()`は、バックエンドが返したエラー値そのものです。OpenSSLなら、ハンドシェイクやその後の読み書きの失敗では`ERR_get_error()`の値が、証明書検証の失敗では検証結果のコード（`X509_V_ERR_*`）が入ります。
+
+ハンドシェイクのあとで失敗したリクエストは、`Error::Read`や`Error::Write`を返します。その場合も、`ssl_error()`と`ssl_backend_error()`には原因となったTLSのエラーが入ります。たとえば、サーバーが要求するクライアント証明書を送らなかった場合、OpenSSLのエラーは「tlsv13 alert certificate required」になります。どちらの値もリクエストごとにリセットされ、TLSのエラーが絡んでいなければ`0`です。
 
 ## OpenSSLのエラーを文字列化する
 
-`ssl_backend_error()`で取得した値を、OpenSSLの`ERR_error_string()`で文字列にするとデバッグに便利です。
+`ssl_backend_error()`の値は、OpenSSLの関数で文字列にしておくとデバッグに便利です。使う関数は失敗の種類によって変わります。
 
 ```cpp
 #include <openssl/err.h>
+#include <openssl/x509.h>
 
-if (res.ssl_backend_error() != 0) {
+if (res.error() == httplib::Error::SSLConnection) {
   char buf[256];
   ERR_error_string_n(res.ssl_backend_error(), buf, sizeof(buf));
   std::cerr << "openssl: " << buf << std::endl;
+} else if (res.error() == httplib::Error::SSLServerVerification ||
+           res.error() == httplib::Error::SSLServerHostnameVerification) {
+  auto code = static_cast<long>(res.ssl_backend_error());
+  std::cerr << "openssl: " << X509_verify_cert_error_string(code) << std::endl;
 }
 ```
 

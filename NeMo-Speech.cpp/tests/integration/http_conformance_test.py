@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import wave
 from pathlib import Path
@@ -41,12 +42,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--openai-js-package")
     parser.add_argument("--openai-js-example")
     parser.add_argument("--timeout", type=int, default=180)
+    parser.add_argument("--tts-preempt", action="store_true")
     return parser.parse_args()
 
 
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise RuntimeError(message)
+
+
+def wait_for_log_entry(log_file, start: int, marker: bytes, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        size = os.fstat(log_file.fileno()).st_size
+        if size > start and marker in os.pread(log_file.fileno(), size - start, start):
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def test_javascript_client(args: argparse.Namespace, base: str, api_key: str) -> None:
@@ -128,6 +140,8 @@ def main() -> None:
     ):
         if value:
             command.extend((option, value))
+    if args.tts_preempt:
+        command.extend(("--tts.preempt", "--verbose"))
 
     server_log = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
     process = subprocess.Popen(
@@ -417,6 +431,43 @@ def main() -> None:
                 json={"input": "Invalid sample rate.", "voice": voice, "sample_rate": 96001},
             )
             require(response.status_code == 400, "invalid TTS sample rate was accepted")
+            if args.tts_preempt:
+
+                def synthesize_long_text() -> tuple[int, bytes]:
+                    with httpx.Client(timeout=args.timeout, trust_env=False) as concurrent_client:
+                        response = concurrent_client.post(
+                            f"{base}/v1/audio/speech",
+                            headers=headers,
+                            json={"input": "NeMo-Speech.cpp runs locally. " * 100, "voice": voice},
+                        )
+                        return response.status_code, response.content
+
+                first_result: list[tuple[int, bytes]] = []
+
+                def collect_first() -> None:
+                    first_result.append(synthesize_long_text())
+
+                admission_log_offset = os.fstat(server_log.fileno()).st_size
+                first = threading.Thread(target=collect_first)
+                first.start()
+                require(
+                    wait_for_log_entry(server_log, admission_log_offset, b"riva_tts encoding", 5),
+                    "long TTS request was not admitted",
+                )
+                with httpx.Client(timeout=args.timeout, trust_env=False) as concurrent_client:
+                    latest = concurrent_client.post(
+                        f"{base}/v1/audio/speech",
+                        headers=headers,
+                        json={"input": "Newest synthesis request.", "voice": voice},
+                    )
+                first.join(args.timeout)
+                require(not first.is_alive(), "preempted TTS request did not finish")
+                require(
+                    first_result and first_result[0][0] == 409,
+                    "older TTS request was not canceled",
+                )
+                require(latest.status_code == 200, f"newest TTS request failed: {latest.text}")
+                require(latest.content.startswith(b"RIFF"), "newest TTS response is not WAV")
             if args.nmt_model:
                 with Path(args.audio).open("rb") as audio:
                     response = client.post(

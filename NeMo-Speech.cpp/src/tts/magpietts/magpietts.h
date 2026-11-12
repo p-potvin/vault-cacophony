@@ -50,7 +50,7 @@ struct magpie_stream_params {
     int seed = -1;
     int steps = -1;
     int top_k = -1;
-    int chunk_frames = 3;
+    int chunk_frames = 4;
     int codec_queue_depth = 4;
     int codec_history_frames = -1;
     int codec_future_frames = 1;
@@ -143,6 +143,8 @@ class MagpieStreamingRuntime {
     int sampleRate() const;
     int speakerCount() const;
     std::vector<std::string> speakerNames() const;
+    const std::string& tokenizerProfile() const;
+    int textVocabSize() const;
     bool synthesize(
         magpie_stream_params& params, const std::vector<int32_t>& tokens,
         const magpie_pcm_callback& pcm_callback, stream_run_metrics& metrics);

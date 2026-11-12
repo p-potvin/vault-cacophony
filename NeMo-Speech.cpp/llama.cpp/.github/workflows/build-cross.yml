@@ -15,6 +15,10 @@ on:
   schedule:
     - cron: '0 0 * * 0'
 
+cache-mode: none
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
   cancel-in-progress: true
@@ -277,7 +281,7 @@ jobs:
 
     env:
       # Make sure this is in sync with build-cache.yml
-      SPACEMIT_IME_TOOLCHAIN_VERSION: "1.1.2"
+      SPACEMIT_IME_TOOLCHAIN_VERSION: "1.2.4"
 
     steps:
       - uses: actions/checkout@v6
@@ -287,7 +291,7 @@ jobs:
       #  id: cache-toolchain
       #  with:
       #    path: ./spacemit_toolchain
-      #    key: spacemit-ime-toolchain-v${{ env.SPACEMIT_IME_TOOLCHAIN_VERSION }}-${{ runner.os }}
+      #    key: cache-gha-spacemit-ime-toolchain-v${{ env.SPACEMIT_IME_TOOLCHAIN_VERSION }}-${{ runner.os }}
 
       - name: Setup SpacemiT Toolchain
         #if: steps.cache-toolchain.outputs.cache-hit != 'true'

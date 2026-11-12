@@ -1,6 +1,6 @@
 ---
 title: "W02. Set a WebSocket Heartbeat"
-order: 52
+order: 53
 status: "draft"
 ---
 
@@ -43,7 +43,7 @@ The default interval is set by the build-time macro `CPPHTTPLIB_WEBSOCKET_PING_I
 
 ## What about Pong?
 
-The WebSocket protocol requires that Ping frames are answered with Pong frames. cpp-httplib responds to Pings automatically — you don't need to think about it in application code.
+The WebSocket protocol requires that Ping frames are answered with Pong frames. cpp-httplib answers Pings automatically inside `read()` — as long as your code keeps calling `read()`, you don't need to think about it.
 
 ## Picking an interval
 
@@ -67,7 +67,7 @@ cli.set_websocket_max_missed_pongs(2); // close after 2 consecutive unacked ping
 
 The server side has the same `set_websocket_max_missed_pongs()`.
 
-With a 30-second ping interval and `max_missed_pongs = 2`, a dead peer is detected within roughly 60 seconds and the connection is closed with `CloseStatus::GoingAway` and the reason `"pong timeout"`.
+With a 30-second ping interval and `max_missed_pongs = 2`, a dead peer is detected 60 to 90 seconds after it stops answering, and the connection is closed with `CloseStatus::GoingAway` and the reason `"pong timeout"`. A `read()` waiting on the peer at that moment returns `Fail`.
 
 The counter is reset whenever `read()` consumes an incoming Pong frame, so this only works if your code is actively calling `read()` in a loop — which is what a normal WebSocket client does anyway.
 
@@ -75,6 +75,6 @@ The counter is reset whenever `read()` consumes an incoming Pong frame, so this 
 
 `max_missed_pongs` defaults to `0`, which means "never close the connection because of missing pongs." Pings are still sent on the heartbeat interval, but their responses aren't checked. If you want unresponsive-peer detection, set it explicitly to `1` or higher.
 
-Even with `0`, a dead connection won't linger forever: while your code is inside `read()`, `CPPHTTPLIB_WEBSOCKET_READ_TIMEOUT_SECOND` (default **300 seconds = 5 minutes**) acts as a backstop and `read()` fails if no frame arrives in time. Think of `max_missed_pongs` as the knob for detecting an unresponsive peer **faster** than that.
+On the server side, even with `0`, a dead connection won't linger forever: while a handler is inside `read()`, `CPPHTTPLIB_WEBSOCKET_SERVER_READ_TIMEOUT_SECOND` (default **300 seconds = 5 minutes**) acts as a backstop. A client has no backstop of its own — it waits forever unless you set a read timeout — so there `max_missed_pongs` is what notices an unresponsive peer at all. On either side, it is also how you notice one **faster** than that 5-minute fallback.
 
 > For handling a closed connection, see [W03. Handle connection close](../w03-websocket-close).

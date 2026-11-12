@@ -129,6 +129,25 @@ BackendTensor::alloc2d(
         ggml_set_name(tensor, name);
         return true;
     }
+    // Grow-only: a smaller or equal shape reuses the existing device buffer (cudaFree/cudaMalloc
+    // pairs on the streaming path stall other threads' launches).
+    if (buffer && ctx &&
+        ggml_backend_buffer_get_size(buffer) >= ggml_row_size(type, ne0) * (size_t)ne1) {
+        ggml_free(ctx);
+        ggml_init_params view_params = {
+            /*.mem_size   =*/ggml_tensor_overhead(),
+            /*.mem_buffer =*/nullptr,
+            /*.no_alloc   =*/true,
+        };
+        ctx = ggml_init(view_params);
+        if (ctx) {
+            tensor = ggml_new_tensor_2d(ctx, type, ne0, ne1);
+            ggml_set_name(tensor, name);
+            ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer));
+            return true;
+        }
+        tensor = nullptr;
+    }
 
     reset();
     ggml_init_params params = {
@@ -158,6 +177,16 @@ bool
 magpietts_backend_is_cuda(ggml_backend_t backend) {
 #if defined(MAGPIETTS_CUDA_SAMPLING)
     return ggml_backend_is_cuda(backend);
+#else
+    (void)backend;
+    return false;
+#endif
+}
+
+bool
+magpietts_fused_cached_attention_available(ggml_backend_t backend) {
+#if defined(NEMO_SPEECH_GGML_PATCHED)
+    return magpietts_backend_is_cuda(backend);
 #else
     (void)backend;
     return false;
@@ -611,6 +640,8 @@ MagpieModel::operator=(MagpieModel&& other) noexcept {
     if (this != &other) {
         reset();
         hparams = other.hparams;
+        tokenizer_profile = std::move(other.tokenizer_profile);
+        nemo_version = std::move(other.nemo_version);
         gguf = other.gguf;
         ctx = other.ctx;
         backend = other.backend;
@@ -673,6 +704,8 @@ MagpieModel::reset() {
         ctx = nullptr;
     }
     hparams = {};
+    tokenizer_profile.clear();
+    nemo_version.clear();
     cuda_unified_memory = false;
     text_embedding = nullptr;
     audio_embeddings.clear();
@@ -717,6 +750,28 @@ magpietts_model_load_impl(
     h.mask_token_id = gguf_i32(model.gguf, "magpietts.mask_token_id", h.mask_token_id);
     h.frame_stacking_factor =
         gguf_i32(model.gguf, "magpietts.frame_stacking_factor", h.frame_stacking_factor);
+    if (h.audio_codebooks < 1 || h.frame_stacking_factor < 1) {
+        fprintf(
+            stderr, "invalid stacked audio layout: codebooks=%d frame_stacking_factor=%d\n",
+            h.audio_codebooks, h.frame_stacking_factor);
+        return false;
+    }
+    const int64_t stacked_audio_codebooks_64 =
+        static_cast<int64_t>(h.audio_codebooks) * h.frame_stacking_factor;
+    if (stacked_audio_codebooks_64 > std::numeric_limits<int32_t>::max()) {
+        fprintf(
+            stderr,
+            "stacked audio layout overflows int32: codebooks=%d frame_stacking_factor=%d "
+            "slots=%lld\n",
+            h.audio_codebooks, h.frame_stacking_factor,
+            static_cast<long long>(stacked_audio_codebooks_64));
+        return false;
+    }
+    const int32_t expected_stacked_codebooks = static_cast<int32_t>(stacked_audio_codebooks_64);
+    model.tokenizer_profile = gguf_string(model.gguf, "magpietts.tokenizer_profile");
+    model.nemo_version = gguf_string(model.gguf, "magpietts.nemo_version");
+    const int32_t stored_stacked_codebooks =
+        gguf_i32(model.gguf, "magpietts.stacked_audio_codebooks", expected_stacked_codebooks);
     h.n_embd = gguf_i32(model.gguf, "magpietts.embedding_dim", h.n_embd);
     h.n_ffn = gguf_i32(model.gguf, "magpietts.ffn_dim", h.n_ffn);
     h.n_ctx = gguf_i32(model.gguf, "magpietts.context_length", h.n_ctx);
@@ -795,10 +850,22 @@ magpietts_model_load_impl(
         return false;
     }
 
-    if (h.frame_stacking_factor != 1) {
+    if (model.tokenizer_profile.empty()) {
+        model.tokenizer_profile = magpietts_infer_tokenizer_profile(h);
+    }
+    if (!magpietts_tokenizer_profile_matches(model.tokenizer_profile, h)) {
         fprintf(
-            stderr, "unsupported frame_stacking_factor=%d; this example currently supports 1\n",
-            h.frame_stacking_factor);
+            stderr,
+            "unsupported or inconsistent Magpie tokenizer profile '%s': "
+            "text_vocab_size=%d frame_stacking_factor=%d\n",
+            model.tokenizer_profile.c_str(), h.text_vocab_size, h.frame_stacking_factor);
+        return false;
+    }
+    if (stored_stacked_codebooks != expected_stacked_codebooks) {
+        fprintf(
+            stderr,
+            "invalid stacked audio layout: codebooks=%d frame_stacking_factor=%d stored_slots=%d\n",
+            h.audio_codebooks, h.frame_stacking_factor, stored_stacked_codebooks);
         return false;
     }
 
@@ -806,10 +873,22 @@ magpietts_model_load_impl(
     ggml_backend_load_all();
     if (!force_cpu) {
         model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+        if (!model.backend) {
+            model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
+        }
     }
     if (!model.backend) {
         model.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
+#if defined(GGML_USE_CUDA) && defined(NEMO_SPEECH_GGML_PATCHED)
+    if (model.backend && ggml_backend_is_cuda(model.backend)) {
+        // The decoder/local-transformer stream is the latency-critical path; run it at the
+        // highest CUDA stream priority so the concurrent NanoCodec worker (priority -2) and
+        // default-priority side streams do not delay its small kernels.
+        constexpr int kHighestPriority = -100;  // clamped to the device range by ggml
+        ggml_backend_cuda_set_stream_priority(model.backend, kHighestPriority);
+    }
+#endif
     if (!model.backend) {
         fprintf(stderr, "failed to initialize ggml backend\n");
         return false;
@@ -881,11 +960,23 @@ magpietts_model_load_impl(
     model.baked_context = require_tensor(model, "baked_context_embedding.weight");
     model.final_proj_w = require_tensor(model, "final_proj.weight");
     model.final_proj_b = require_tensor(model, "final_proj.bias");
-    model.lt_in_w = require_tensor(model, "local_transformer_in_projection.weight");
-    model.lt_in_b = require_tensor(model, "local_transformer_in_projection.bias");
+    // v2602 projects decoder/audio embeddings into the local-transformer
+    // dimension.  In v2607 those dimensions are both 768 and the checkpoint
+    // intentionally omits the projection (identity input).
+    model.lt_in_w = ggml_get_tensor(model.ctx, "local_transformer_in_projection.weight");
+    model.lt_in_b = ggml_get_tensor(model.ctx, "local_transformer_in_projection.bias");
+    if ((model.lt_in_w == nullptr) != (model.lt_in_b == nullptr)) {
+        fprintf(stderr, "local-transformer input projection must include both weight and bias\n");
+        return false;
+    }
+    if (model.lt_in_w == nullptr && h.n_embd != h.lt_hidden) {
+        fprintf(
+            stderr, "local-transformer input projection is missing for incompatible dimensions\n");
+        return false;
+    }
 
-    model.audio_embeddings.resize(h.audio_codebooks);
-    for (int i = 0; i < h.audio_codebooks; ++i) {
+    model.audio_embeddings.resize(h.stacked_audio_codebooks());
+    for (int i = 0; i < h.stacked_audio_codebooks(); ++i) {
         model.audio_embeddings[i] =
             require_tensor(model, "audio_embeddings." + std::to_string(i) + ".weight");
     }
@@ -910,28 +1001,27 @@ magpietts_model_load_impl(
     }
 #endif
 
-    model.lt_out_w.resize(h.audio_codebooks);
-    model.lt_out_b.resize(h.audio_codebooks);
-    for (int i = 0; i < h.audio_codebooks; ++i) {
+    model.lt_out_w.resize(h.stacked_audio_codebooks());
+    model.lt_out_b.resize(h.stacked_audio_codebooks());
+    for (int i = 0; i < h.stacked_audio_codebooks(); ++i) {
         model.lt_out_w[i] = require_tensor(
             model, "local_transformer_out_projections." + std::to_string(i) + ".weight");
         model.lt_out_b[i] = require_tensor(
             model, "local_transformer_out_projections." + std::to_string(i) + ".bias");
     }
 
-    if (verbose) {
-        fprintf(
-            stderr,
-            "loaded MagpieTTS GGUF: text_vocab=%d audio_codebooks=%d audio_vocab=%d speakers=%d "
-            "attention_prior=%s epsilon=%.4g lookahead=%d start_step=%d advance_threshold=%d "
-            "decay_threshold=%d estimate_layers=%s apply_layers=%s\n",
-            h.text_vocab_size, h.audio_codebooks, h.audio_vocab_size, h.baked_speakers,
-            h.apply_attention_prior ? "on" : "off", h.attention_prior_epsilon,
-            h.attention_prior_lookahead_window, h.start_prior_after_n_audio_steps,
-            h.attention_prior_advance_threshold, h.attention_prior_decay_threshold,
-            format_i32_list(h.estimate_alignment_from_layers).c_str(),
-            format_i32_list(h.apply_prior_to_layers).c_str());
-    }
+    fprintf(
+        stderr,
+        "loaded MagpieTTS GGUF: text_vocab=%d audio_codebooks=%d stacked_slots=%d audio_vocab=%d "
+        "speakers=%d "
+        "attention_prior=%s epsilon=%.4g lookahead=%d start_step=%d advance_threshold=%d "
+        "decay_threshold=%d estimate_layers=%s apply_layers=%s\n",
+        h.text_vocab_size, h.audio_codebooks, h.stacked_audio_codebooks(), h.audio_vocab_size,
+        h.baked_speakers, h.apply_attention_prior ? "on" : "off", h.attention_prior_epsilon,
+        h.attention_prior_lookahead_window, h.start_prior_after_n_audio_steps,
+        h.attention_prior_advance_threshold, h.attention_prior_decay_threshold,
+        format_i32_list(h.estimate_alignment_from_layers).c_str(),
+        format_i32_list(h.apply_prior_to_layers).c_str());
     return true;
 }
 
@@ -1127,20 +1217,21 @@ cross_attention(
     return linear(ctx, layer.cross_o, out);
 }
 
-static ggml_tensor*
+ggml_tensor*
 cross_attention_cached(
     ggml_context* ctx, const magpietts_transformer& tr, const magpietts_layer& layer,
     const DecoderCrossKvCache& cross_kv, int layer_index, ggml_tensor* x, ggml_tensor* attn_prior,
-    ggml_tensor** last_attn) {
+    ggml_tensor** last_attn, bool prior_is_log, ggml_tensor* softmax_bias, int64_t n_kv_override) {
     const int64_t d_head = tr.n_cross_dhead;
     const int64_t n_head = tr.n_cross_head;
     const int64_t cross_dim = d_head * n_head;
     const int64_t n_q = x->ne[1];
-    const int64_t n_kv = cross_kv.text_len;
+    const int64_t n_kv = softmax_bias ? n_kv_override : cross_kv.text_len;
+    const int64_t row_stride = cross_kv.capacity > 0 ? cross_kv.capacity : cross_kv.text_len;
 
     ggml_tensor* q = linear(ctx, layer.cross_q, x);
     const size_t layer_offset =
-        (size_t)layer_index * n_kv * cross_dim * ggml_element_size(cross_kv.memory_k);
+        (size_t)layer_index * row_stride * cross_dim * ggml_element_size(cross_kv.memory_k);
 
     ggml_tensor* qh = ggml_permute(ctx, ggml_cont_3d(ctx, q, d_head, n_head, n_q), 0, 2, 1, 3);
     ggml_tensor* kh = ggml_permute(
@@ -1150,13 +1241,23 @@ cross_attention_cached(
             n_head, n_kv),
         0, 2, 1, 3);
     ggml_tensor* kq = ggml_mul_mat(ctx, kh, qh);
-    kq = ggml_scale(ctx, kq, 1.0f / std::sqrt((float)d_head));
-    ggml_tensor* kq_soft = ggml_soft_max(ctx, kq);
-    if (attn_prior) {
-        ggml_tensor* prior = ggml_repeat(ctx, attn_prior, kq_soft);
-        kq_soft = ggml_mul(ctx, kq_soft, prior);
-        ggml_tensor* normalizer = ggml_repeat(ctx, ggml_sum_rows(ctx, kq_soft), kq_soft);
-        kq_soft = ggml_div(ctx, kq_soft, normalizer);
+    ggml_tensor* kq_soft = nullptr;
+    if (softmax_bias) {
+        // scale + additive bias (log prior and/or padding mask) + softmax in one kernel
+        kq_soft = ggml_soft_max_ext(ctx, kq, softmax_bias, 1.0f / std::sqrt((float)d_head), 0.0f);
+    } else {
+        kq = ggml_scale(ctx, kq, 1.0f / std::sqrt((float)d_head));
+        if (attn_prior && prior_is_log) {
+            kq_soft = ggml_soft_max(ctx, ggml_add(ctx, kq, ggml_repeat(ctx, attn_prior, kq)));
+        } else {
+            kq_soft = ggml_soft_max(ctx, kq);
+        }
+        if (attn_prior && !prior_is_log) {
+            ggml_tensor* prior = ggml_repeat(ctx, attn_prior, kq_soft);
+            kq_soft = ggml_mul(ctx, kq_soft, prior);
+            ggml_tensor* normalizer = ggml_repeat(ctx, ggml_sum_rows(ctx, kq_soft), kq_soft);
+            kq_soft = ggml_div(ctx, kq_soft, normalizer);
+        }
     }
     if (last_attn) {
         const size_t offset = (size_t)(n_q - 1) * kq_soft->nb[1];
@@ -1321,11 +1422,16 @@ compute_graph(
     const magpietts_model& model, ggml_context* ctx, ggml_cgraph* gf,
     const std::vector<std::pair<std::string, std::vector<int32_t>>>& i32_inputs,
     const std::vector<std::pair<std::string, std::vector<float>>>& f32_inputs, int threads,
-    ggml_gallocr_t* keep_allocr) {
+    ggml_gallocr_t* keep_allocr, ggml_backend_t backend) {
     const ggml_nvtx::range nvtx_range("magpietts_compute_graph");
     tag_graph_first_node(gf);
+    if (!backend) {
+        backend = model.backend;
+    }
 
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
+    const bool owned = !(keep_allocr && *keep_allocr);
+    ggml_gallocr_t allocr =
+        owned ? ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend)) : *keep_allocr;
     if (!allocr) {
         fprintf(stderr, "failed to create graph allocator\n");
         return false;
@@ -1343,7 +1449,9 @@ compute_graph(
             ggml_tensor* t = ggml_graph_get_tensor(gf, it.first.c_str());
             if (!t) {
                 fprintf(stderr, "missing graph input: %s\n", it.first.c_str());
-                ggml_gallocr_free(allocr);
+                if (owned) {
+                    ggml_gallocr_free(allocr);
+                }
                 return false;
             }
             magpietts_backend_tensor_set_staged(
@@ -1353,7 +1461,9 @@ compute_graph(
             ggml_tensor* t = ggml_graph_get_tensor(gf, it.first.c_str());
             if (!t) {
                 fprintf(stderr, "missing graph input: %s\n", it.first.c_str());
-                ggml_gallocr_free(allocr);
+                if (owned) {
+                    ggml_gallocr_free(allocr);
+                }
                 return false;
             }
             magpietts_backend_tensor_set_staged(
@@ -1361,18 +1471,20 @@ compute_graph(
         }
     }
 
-    if (ggml_backend_is_cpu(model.backend)) {
-        ggml_backend_cpu_set_n_threads(model.backend, threads);
+    if (ggml_backend_is_cpu(backend)) {
+        ggml_backend_cpu_set_n_threads(backend, threads);
     }
 
     ggml_status status = GGML_STATUS_FAILED;
     {
         const ggml_nvtx::range nvtx_compute("magpietts_graph_compute");
-        status = ggml_backend_graph_compute(model.backend, gf);
+        status = ggml_backend_graph_compute(backend, gf);
     }
     if (status != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "ggml graph compute failed: %s\n", ggml_status_to_string(status));
-        ggml_gallocr_free(allocr);
+        if (owned) {
+            ggml_gallocr_free(allocr);
+        }
         return false;
     }
 
@@ -1745,11 +1857,13 @@ void
 magpietts_run_metrics::begin() {
     *this = {};
     inter_frame_min_ms = std::numeric_limits<double>::max();
+    // On Windows ggml_time_us divides by a frequency set in ggml_time_init.
+    ggml_time_init();
     start_us = ggml_time_us();
 }
 
 double
-magpietts_run_metrics::record_frame(int64_t now_us, bool& first_frame) {
+magpietts_run_metrics::record_frame(int64_t now_us, bool& first_frame, int emitted_frames) {
     first_frame = first_frame_us == 0;
     double inter_ms = 0.0;
     if (first_frame) {
@@ -1762,7 +1876,8 @@ magpietts_run_metrics::record_frame(int64_t now_us, bool& first_frame) {
         inter_frame_max_ms = std::max(inter_frame_max_ms, inter_ms);
     }
     last_frame_us = now_us;
-    ++frames;
+    frames += emitted_frames;
+    ++timing_events;
     return inter_ms;
 }
 
@@ -1776,12 +1891,12 @@ magpietts_run_metrics::finish(size_t frames_generated, double codec_fps) {
 
 double
 magpietts_run_metrics::inter_frame_avg_ms() const {
-    return frames > 1 ? inter_frame_sum_ms / (double)(frames - 1) : 0.0;
+    return timing_events > 1 ? inter_frame_sum_ms / (double)(timing_events - 1) : 0.0;
 }
 
 double
 magpietts_run_metrics::inter_frame_min_value_ms() const {
-    return frames > 1 ? inter_frame_min_ms : 0.0;
+    return timing_events > 1 ? inter_frame_min_ms : 0.0;
 }
 
 bool
@@ -1812,12 +1927,17 @@ bool
 magpietts_resolve_sampling_backend(
     const magpietts_model& model, magpietts_backend_preference requested, bool& use_cuda_sampling) {
     use_cuda_sampling = false;
-    if (requested == MAGPIETTS_BACKEND_AUTO || requested == MAGPIETTS_BACKEND_CPU) {
+    if (requested == MAGPIETTS_BACKEND_CPU) {
         return true;
     }
 
 #if defined(MAGPIETTS_CUDA_SAMPLING)
-    if (!magpietts_backend_is_cuda(model.backend)) {
+    const bool cuda_backend = magpietts_backend_is_cuda(model.backend);
+    if (requested == MAGPIETTS_BACKEND_AUTO) {
+        use_cuda_sampling = cuda_backend;
+        return true;
+    }
+    if (!cuda_backend) {
         fprintf(
             stderr, "--sampling-backend cuda requires a CUDA ggml backend; current backend is %s\n",
             ggml_backend_name(model.backend));
@@ -1827,6 +1947,9 @@ magpietts_resolve_sampling_backend(
     return true;
 #else
     (void)model;
+    if (requested == MAGPIETTS_BACKEND_AUTO) {
+        return true;
+    }
     fprintf(
         stderr,
         "--sampling-backend cuda requires building MagpieTTS with GGML_CUDA=ON and CUDAToolkit\n");
@@ -1851,6 +1974,10 @@ MagpieCodeGenerator::generate(
     bool use_cuda_sampling = false;
     if (!magpietts_resolve_sampling_backend(model, params.sampling_backend, use_cuda_sampling)) {
         return false;
+    }
+    if (params.sampling_backend == MAGPIETTS_BACKEND_AUTO && params.use_local_transformer &&
+        !use_cuda_lt) {
+        use_cuda_sampling = false;
     }
     if (params.use_local_transformer && !use_cuda_lt && use_cuda_sampling) {
         fprintf(
@@ -1906,7 +2033,7 @@ MagpieCodeGenerator::generate(
 
     std::vector<std::vector<int32_t>> audio_codes(h.audio_codebooks);
     for (int c = 0; c < h.audio_codebooks; ++c) {
-        audio_codes[c].push_back(h.audio_bos_id);
+        audio_codes[c].assign((size_t)h.frame_stacking_factor, h.audio_bos_id);
     }
 
     std::vector<std::vector<int32_t>> generated_frames;
@@ -1943,7 +2070,7 @@ MagpieCodeGenerator::generate(
             }
         }
 #if defined(MAGPIETTS_CUDA_SAMPLING)
-        cuda_sampler.reset(magpietts_cuda_sampler_create(h.audio_codebooks));
+        cuda_sampler.reset(magpietts_cuda_sampler_create(h.stacked_audio_codebooks()));
         if (!cuda_sampler) {
             fprintf(stderr, "failed to create CUDA sampler\n");
             return false;
@@ -1959,14 +2086,20 @@ MagpieCodeGenerator::generate(
     const int64_t generation_start_us = ggml_time_us();
     {
         const ggml_nvtx::range nvtx_loop("magpietts_generate_loop");
-        for (int step = 0; step < h.max_decoder_steps; ++step) {
+        const int max_decoder_positions =
+            (h.max_decoder_steps + h.frame_stacking_factor - 1) / h.frame_stacking_factor;
+        for (int step = 0; step < max_decoder_positions; ++step) {
             const ggml_nvtx::range nvtx_step("magpietts_generate_step");
             const int64_t frame_start_us = ggml_time_us();
+            const int frames_remaining = h.max_decoder_steps - step * h.frame_stacking_factor;
+            if (frames_remaining <= 0) {
+                break;
+            }
             if (step % 10 == 0) {
-                fprintf(stderr, "%s decoding frame %d/%d\n", label, step, h.max_decoder_steps);
+                fprintf(stderr, "%s decoding frame %d/%d\n", label, step, max_decoder_positions);
             }
 
-            const bool forbid_eos = step < h.min_generated_frames;
+            const bool forbid_eos = step * h.frame_stacking_factor < h.min_generated_frames;
             std::vector<int32_t> next_codes;
             std::vector<int32_t> argmax_codes;
             std::vector<float> alignment_scores;
@@ -1981,6 +2114,8 @@ MagpieCodeGenerator::generate(
 
             decoder_result cond;
             decoder_result uncond;
+            cond.logits_required = !params.use_local_transformer;
+            uncond.logits_required = !params.use_local_transformer;
             if (use_cuda_sampling) {
                 if (params.use_local_transformer) {
                     const bool decode_ok =
@@ -1988,9 +2123,9 @@ MagpieCodeGenerator::generate(
                             ? (params.use_kv_cache
                                    ? decoder.evalCachedPair(
                                          text_cond, (int)tokens.size(), audio_codes, params.speaker,
-                                         params.threads, cond_kv, uncond_kv, cond, uncond, nullptr,
-                                         &text_cond_device, &cond_hidden_device,
-                                         &uncond_hidden_device, &cond_cross_kv,
+                                         params.threads, cond_kv, uncond_kv, cond, uncond,
+                                         max_decoder_positions, nullptr, &text_cond_device,
+                                         &cond_hidden_device, &uncond_hidden_device, &cond_cross_kv,
                                          decoder_attention_arg)
                                    : decoder.evalPair(
                                          text_cond, (int)tokens.size(), audio_codes, params.speaker,
@@ -2040,8 +2175,8 @@ MagpieCodeGenerator::generate(
                                    ? decoder.evalCachedPair(
                                          text_cond, (int)tokens.size(), audio_codes, params.speaker,
                                          params.threads, cond_kv, uncond_kv, cond, uncond,
-                                         &cuda_sample, &text_cond_device, nullptr, nullptr,
-                                         &cond_cross_kv, decoder_attention_arg)
+                                         max_decoder_positions, &cuda_sample, &text_cond_device,
+                                         nullptr, nullptr, &cond_cross_kv, decoder_attention_arg)
                                    : decoder.evalPair(
                                          text_cond, (int)tokens.size(), audio_codes, params.speaker,
                                          params.threads, cond, uncond, &cuda_sample,
@@ -2063,8 +2198,8 @@ MagpieCodeGenerator::generate(
                     next_codes = std::move(cuda_sample.codes);
                     argmax_codes = std::move(cuda_sample.argmax_codes);
                 }
-                if ((int)next_codes.size() != h.audio_codebooks ||
-                    (int)argmax_codes.size() != h.audio_codebooks) {
+                if ((int)next_codes.size() != h.stacked_audio_codebooks() ||
+                    (int)argmax_codes.size() != h.stacked_audio_codebooks()) {
                     fprintf(stderr, "CUDA sampler returned an unexpected number of codebooks\n");
                     return false;
                 }
@@ -2074,8 +2209,9 @@ MagpieCodeGenerator::generate(
                         params.use_kv_cache
                             ? decoder.evalCachedPair(
                                   text_cond, (int)tokens.size(), audio_codes, params.speaker,
-                                  params.threads, cond_kv, uncond_kv, cond, uncond, nullptr,
-                                  nullptr, nullptr, nullptr, &cond_cross_kv, decoder_attention_arg)
+                                  params.threads, cond_kv, uncond_kv, cond, uncond,
+                                  max_decoder_positions, nullptr, nullptr, nullptr, nullptr,
+                                  &cond_cross_kv, decoder_attention_arg)
                             : decoder.evalPair(
                                   text_cond, (int)tokens.size(), audio_codes, params.speaker,
                                   params.threads, cond, uncond, nullptr, nullptr, nullptr, nullptr,
@@ -2116,32 +2252,48 @@ MagpieCodeGenerator::generate(
                 attention_prior.update(h, step, (int)tokens.size(), alignment_scores);
             }
 
-            if (!forbid_eos &&
-                MagpieCodebookSampler::hasEos(next_codes, argmax_codes, h.audio_eos_id)) {
+            std::vector<std::vector<int32_t>> codec_frames;
+            if (!magpietts_unstack_codes(next_codes, h, codec_frames)) {
+                fprintf(stderr, "sampled an invalid stacked MagpieTTS frame\n");
+                return false;
+            }
+            const int eos_lane =
+                forbid_eos ? -1 : magpietts_first_eos_lane(next_codes, argmax_codes, h);
+            for (int c = 0; c < h.audio_codebooks; ++c) {
+                for (int lane = 0; lane < h.frame_stacking_factor; ++lane) {
+                    audio_codes[c].push_back(next_codes[c + lane * h.audio_codebooks]);
+                }
+            }
+            const int frames_to_emit =
+                magpietts_frames_to_emit(frames_remaining, h.frame_stacking_factor, eos_lane);
+            for (int lane = 0; lane < frames_to_emit; ++lane) {
+                generated_frames.push_back(codec_frames[(size_t)lane]);
+            }
+            if (eos_lane >= 0) {
                 ggml_nvtx::mark("magpietts_eos");
                 fprintf(stderr, "%s EOS detected at frame %d\n", label, step);
-                break;
             }
 
-            generated_frames.push_back(next_codes);
-            for (int c = 0; c < h.audio_codebooks; ++c) {
-                audio_codes[c].push_back(next_codes[c]);
-            }
-
-            bool first_frame = false;
-            const int64_t frame_done_us = ggml_time_us();
-            const double inter_ms = metrics.record_frame(frame_done_us, first_frame);
-            const double frame_latency_ms = (double)(frame_done_us - frame_start_us) / 1000.0;
-            if (step < 4 || step % 10 == 0) {
-                if (first_frame) {
-                    fprintf(
-                        stderr, "%s frame %d latency=%.2f ms ttff=%.2f ms\n", label, step,
-                        frame_latency_ms, metrics.ttff_ms);
-                } else {
-                    fprintf(
-                        stderr, "%s frame %d latency=%.2f ms inter=%.2f ms\n", label, step,
-                        frame_latency_ms, inter_ms);
+            if (frames_to_emit > 0) {
+                const int64_t frame_done_us = ggml_time_us();
+                bool first_frame = false;
+                const double inter_ms =
+                    metrics.record_frame(frame_done_us, first_frame, frames_to_emit);
+                const double frame_latency_ms = (double)(frame_done_us - frame_start_us) / 1000.0;
+                if (step < 4 || step % 10 == 0) {
+                    if (first_frame) {
+                        fprintf(
+                            stderr, "%s frame %d latency=%.2f ms ttff=%.2f ms\n", label, step,
+                            frame_latency_ms, metrics.ttff_ms);
+                    } else {
+                        fprintf(
+                            stderr, "%s frame %d latency=%.2f ms inter=%.2f ms\n", label, step,
+                            frame_latency_ms, inter_ms);
+                    }
                 }
+            }
+            if (eos_lane >= 0) {
+                break;
             }
         }
     }

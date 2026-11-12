@@ -17,6 +17,8 @@ auto res = cli.Get("/users");
 
 プロキシ経由でリクエストが送られます。HTTPSの場合はCONNECTメソッドでトンネルが張られるので、cpp-httplib側で特別な設定は要りません。
 
+プロキシがトンネルを拒否すると、リクエストは`Error::ProxyConnection`で失敗します。ただし407だけは例外で、レスポンスとして返ってきます。`res`はtruthyで`res->status`は407ですが、`res.error()`は`Error::ProxyConnection`のままです。
+
 ## プロキシに認証を設定する
 
 プロキシ自体が認証を要求する場合は、`set_proxy_basic_auth()`や`set_proxy_bearer_token_auth()`を使います。
@@ -55,7 +57,7 @@ cli.set_bearer_token_auth("api-token"); // エンドサーバー向け
 
 ```cpp
 cli.set_proxy("proxy.internal", 8080);
-cli.set_no_proxy({"internal.corp", "10.0.0.0/8", "*.dev.local"});
+cli.set_no_proxy({"internal.corp", "10.0.0.0/8", ".dev.local"});
 ```
 
 エントリは次のいずれかです。
@@ -68,6 +70,20 @@ cli.set_no_proxy({"internal.corp", "10.0.0.0/8", "*.dev.local"});
 ホスト名のマッチは大文字小文字を区別せず、ドット境界でしか一致しません。たとえば`example.com`というエントリは`evilexample.com`にはマッチしません。IPの比較は`inet_pton`で正規化されるので、`127.0.0.1`を`127.000.000.001`のような別表記でバイパスすることはできません。マッチした場合、`Proxy-Authorization`ヘッダーも自動的に外れます。
 
 不正な書式のエントリは黙って捨てられます。`example.com:8080`のようなポート指定エントリはサポート外です（cpp-httplibの他のホストキーAPIもホスト名のみを扱う設計のため）。
+
+## WebSocketでもプロキシを使う
+
+`ws::WebSocketClient`にも同じプロキシ設定があります。
+
+```cpp
+httplib::ws::WebSocketClient cli("wss://ws.example.com/chat");
+cli.set_proxy("proxy.internal", 8080);
+cli.set_proxy_basic_auth("user", "password");
+
+auto res = cli.connect();
+```
+
+`ws://`でも`wss://`でも、CONNECTメソッドでトンネルを張ってからWebSocketのハンドシェイクを行います。`set_no_proxy()`も同じように使えます。
 
 ## 環境変数からプロキシ設定を読み込む
 

@@ -3,6 +3,7 @@
 // Converts encoder chunks into tokens and owns per-stream decoder state.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -112,6 +113,27 @@ struct Hypothesis {
     std::vector<WordTiming> words;  // empty unless word offsets were requested
 };
 
+// Encoder frames whose emission position, mel frame f * sub, is one of the M
+// real mel frames: (M - 1) / sub + 1. A causal encoder frame f ends at that
+// mel frame, so these frames have seen only real audio.
+inline int64_t
+real_encoder_frames(int64_t mel_frames, int subsampling_factor) {
+    return mel_frames > 0 ? (mel_frames - 1) / subsampling_factor + 1 : 0;
+}
+
+// Word times are emission frames, and runners flush the decoder through
+// synthetic zero frames past the end of the audio. Tokens emitted there keep
+// their text and move onto the last real frame; order and end > start hold.
+inline void
+bound_word_frames(std::vector<WordTiming>& words, int64_t frame_limit) {
+    if (frame_limit <= 0)
+        return;
+    for (auto& word : words) {
+        word.start_frame = std::clamp<int64_t>(word.start_frame, 0, frame_limit - 1);
+        word.end_frame = std::clamp<int64_t>(word.end_frame, word.start_frame + 1, frame_limit);
+    }
+}
+
 // SentencePiece word-boundary marker U+2581 ('▁') = 0xE2 0x96 0x81. A piece
 // starting with it begins a new word (what detokenize_sentencepiece splits on).
 inline bool
@@ -140,6 +162,20 @@ sp_starts_new_word(const std::string& p) {
     return sp_is_word_boundary(p) && !sp_is_sentence_terminator(p);
 }
 
+inline bool
+sp_is_punctuation(const std::string& piece) {
+    const auto text = sp_piece_text(piece);
+    if (text.empty())
+        return false;
+    // Only detachable sentence punctuation: quotes, apostrophes, signs and
+    // brackets can be meaningful word content and must not be discarded.
+    if (text.size() <= 3 && text.find_first_not_of(".,!?;:") == std::string::npos)
+        return true;
+    return text == "\xE0\xA5\xA4" || text == "\xE0\xA5\xA5" || text == "\xE3\x80\x82" ||
+           text == "\xE3\x80\x81" || text == "\xEF\xBC\x81" || text == "\xEF\xBC\x9F" ||
+           text == "\xEF\xBC\x8C" || text == "\xD8\x8C" || text == "\xD8\x9F";
+}
+
 class Decoder {
    public:
     virtual ~Decoder() = default;
@@ -151,23 +187,6 @@ class Decoder {
     // predictor context. Unlike reset(), this keeps the continuing stream
     // alive; CTC still clears collapse state at the boundary.
     virtual void reset_utterance() {}
-
-    // Drop the decoder's language context while KEEPING everything already
-    // transcribed: accumulated word timings, statistics, and the emit cursor
-    // all survive. This is the operation an offline segment boundary needs,
-    // and neither of the other two provides it -- reset() also throws away
-    // word timings and stats, and reset_utterance() clears the words but
-    // deliberately PRESERVES the predictor context, which is the one thing
-    // that has to go.
-    //
-    // Why it matters: an RNN-T predictor is conditioned on the last emitted
-    // token and a blank is not an emission, so a decoder that has committed to
-    // one language can score blank on every following frame and never leave
-    // that state on its own. Re-entering at a silence boundary from a blank
-    // predictor is what stops a stale prior from suppressing the audio after
-    // it. Only call this at a boundary that is genuinely silent: mid-word it
-    // would discard context the model legitimately needs.
-    virtual void reset_context() {}
 
     // Consume one chunk of encoder output (d_model x T frames).
     //
@@ -206,23 +225,25 @@ class Decoder {
     // hypothesis. Called once at end-of-stream.
     virtual void finalize() {}
 
-    // Global encoder frame of the most recent speech evidence this decoder
-    // observed (last non-blank argmax/emission), or -1 before any. Drives
-    // token-silence endpointing: trailing silence = frames since this.
+    // Global encoder frame of the most recent non-blank model emission,
+    // or -1 before any. By default this also supplies endpoint evidence.
     // Survives reset_utterance() (the silence timeline continues across
     // utterances so the endpointer can re-arm); cleared by reset().
     virtual int64_t last_emit_frame() const { return -1; }
 
-    // Hint: last_emit_frame() will be polled (the runner runs token-silence
+    // Endpoint evidence can exclude non-speech emissions such as punctuation.
+    virtual int64_t last_speech_frame() const { return last_emit_frame(); }
+
+    // Hint: the speech frame will be polled (the runner runs token-silence
     // endpointing on this head). Default no-op - heads that derive the frame as
     // part of their normal decode ignore it; FlashlightDecoder uses it to skip
     // an extra per-frame argmax it would otherwise run only to feed this signal.
     virtual void set_track_speech_frame(bool /*on*/) {}
 
-    // Hint: the next step() processes an end-of-utterance (is_last) chunk. RNNT
-    // greedy uses it to apply the end-of-utterance punctuation-logit floor (see
-    // RnntGreedyDecoder); other heads ignore it.
-    virtual void set_finalizing(bool /*on*/) {}
+    // Returns and clears sentence punctuation emitted after an endpoint but
+    // before the next word; it belongs to the already-published utterance.
+    // A mark still waiting for the next word is released only at end of stream.
+    virtual std::string take_late_punctuation(bool /*end_of_stream*/ = false) { return {}; }
 
     // Utterance confidence. Greedy CTC returns the mean emitted-token posterior;
     // heads without a usable posterior return 1.0.

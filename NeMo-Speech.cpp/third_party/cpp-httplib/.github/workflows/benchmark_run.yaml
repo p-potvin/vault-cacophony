@@ -1,0 +1,106 @@
+name: benchmark-run
+
+# Runs the committed benchmark (`just bench`) and records the numbers.
+#
+# This is a measurement, not a test: nothing here fails the build. Unlike
+# benchmark-ab, which compares two refs inside one job, this just reports the
+# absolute throughput of the current ref alongside Crow for reference.
+#
+# Absolute req/s is only meaningful against other runs on the same runner type,
+# so compare like with like when reading the history.
+#
+# Non-SSL only. Windows is excluded: benchmark/Makefile depends on `nc`, `&`
+# and `kill`, so it would need a PowerShell rewrite first.
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Load duration per server"
+        required: false
+        default: "5s"
+      connections:
+        description: "Concurrent connections"
+        required: false
+        default: "10"
+      crow:
+        description: "Also benchmark Crow v1.3.1 for reference"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      # macos runners ship without Go.
+      - name: setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: install bombardier
+        run: go install github.com/codesenberg/bombardier@latest
+
+      # crow_all.h includes <asio.hpp>, which no runner has out of the box.
+      - name: install asio
+        if: ${{ inputs.crow }}
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y libasio-dev
+          else
+            brew install asio
+          fi
+
+      - name: run benchmark
+        run: |
+          # Without pipefail the `tee` below swallows a build failure and the
+          # job reports success having measured nothing.
+          set -o pipefail
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          CROW_FLAGS="-std=c++17"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            CROW_FLAGS="$CROW_FLAGS -I$(brew --prefix asio)/include"
+          fi
+          if [ "${{ inputs.crow }}" = "true" ]; then TARGET=bench-all; else TARGET=bench; fi
+          make -C benchmark "$TARGET" \
+            CROW_CXXFLAGS="$CROW_FLAGS" \
+            BENCH="bombardier -c ${{ inputs.connections }} -d ${{ inputs.duration }} localhost:8080" \
+            2>&1 | tee /tmp/bench.txt
+
+      # pipefail only catches a failed build. Each Makefile recipe ends in
+      # `kill`, so a bombardier that never ran still leaves make happy — check
+      # that the measurements are actually there.
+      - name: check results were produced
+        run: |
+          expected=1
+          if [ "${{ inputs.crow }}" = "true" ]; then expected=2; fi
+          got=$(grep -c "Reqs/sec" /tmp/bench.txt || true)
+          if [ "$got" -lt "$expected" ]; then
+            echo "::error::expected $expected benchmark result(s), found $got"
+            exit 1
+          fi
+
+      - name: record results
+        if: always()
+        run: |
+          {
+            echo "## Benchmark (${{ matrix.os }})"
+            echo ""
+            echo "- ref: \`${{ github.ref_name }}\` (${{ github.sha }})"
+            echo "- connections=${{ inputs.connections }} duration=${{ inputs.duration }}"
+            echo ""
+            echo '```'
+            cat /tmp/bench.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

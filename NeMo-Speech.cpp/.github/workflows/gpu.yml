@@ -1,0 +1,220 @@
+name: GPU Build and Test
+
+# GPU coverage on NVIDIA's self-hosted runners (nv-gpu-general, L4).
+#
+# Coverage per job:
+#   Linux CUDA     - patched-ggml CUDA build, ctest, GPU inference. This is the
+#                    only job that runs inference on a GPU.
+#   Windows Vulkan - Vulkan backend COMPILE AND LINK only; inference runs on
+#                    CPU because the Vulkan build enumerates no GPU device on
+#                    this runner. A non-blocking probe reports if that changes.
+#
+# copy-pr-bot mirrors vetted PRs to pull-request/N branches, which is what
+# triggers these jobs; pull_request events never reach self-hosted runners.
+
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+  workflow_dispatch:
+
+concurrency:
+  group: gpu-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NEMO_SPEECH_MODEL_DIR: ${{ github.workspace }}/.ci-models
+
+jobs:
+  linux-cuda:
+    name: Linux CUDA (L4)
+    if: github.repository == 'NVIDIA/NeMo-Speech.cpp'
+    runs-on: linux-amd64-gpu-l4-latest-1
+    timeout-minutes: 90
+    container:
+      # Same toolchain image as docker/Dockerfile. Self-hosted Linux GPU jobs
+      # must run in a container; these options are the standard NVIDIA setup.
+      image: nvcr.io/nvidia/cuda@sha256:1e8ac7a54c184a1af8ef2167f28fa98281892a835c981ebcddb1fad04bdd452d # 13.0.0-devel-ubuntu24.04
+      options: -u root --security-opt seccomp=unconfined --shm-size 16g
+      env:
+        NVIDIA_VISIBLE_DEVICES: ${{ env.NVIDIA_VISIBLE_DEVICES }}
+    steps:
+      - name: Display GPU information
+        run: nvidia-smi
+
+      - name: Setup proxy cache
+        uses: nv-gha-runners/setup-proxy-cache@eadc57871cde0c92a223d0f486ab669a2360f978 # main 2026-08-31
+        with:
+          enable-apt: true
+
+      - name: Install dependencies
+        # git must exist before checkout so submodules can be initialized.
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config libsentencepiece-dev \
+            git curl ca-certificates python3
+
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Prepare container environment
+        # The container runs as root but the checkout is owned by the runner
+        # user, and checkout's safe.directory exception is removed after its
+        # own steps. ${{ github.workspace }} resolves to the host path inside a
+        # container job, so derive the model directory from $GITHUB_WORKSPACE.
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "NEMO_SPEECH_MODEL_DIR=$GITHUB_WORKSPACE/.ci-models" >> "$GITHUB_ENV"
+
+      - name: Initialize submodules
+        run: git submodule update --init --depth 1 llama.cpp
+
+      - name: Configure
+        # CMake applies patches/ for cuda-* presets.
+        # sm_89 is the L4.
+        run: |
+          scripts/configure.sh cuda-speech \
+            -DNEMO_SPEECH_BUILD_NMT=OFF \
+            -DNEMO_SPEECH_BUILD_SPEECHLM=ON \
+            -DNEMO_SPEECH_BUILD_TESTS=ON \
+            -DCMAKE_CUDA_ARCHITECTURES=89
+
+      - name: Build
+        run: cmake --build --preset cuda-speech --parallel
+
+      - name: Unit tests
+        run: ctest --test-dir build/cuda-speech --output-on-failure --timeout 600
+
+      - name: Cache models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
+          key: models-${{ hashFiles('models/index.json') }}
+
+      - name: Model smoke test
+        run: |
+          python3 tests/ci/model_smoke.py \
+            --binary build/cuda-speech/bin/nemo-speech \
+            --backend cuda \
+            --audio test_files/asr/wav/test/jfk.wav
+
+  windows-vulkan:
+    name: Windows Vulkan (L4, build + CPU smoke)
+    if: github.repository == 'NVIDIA/NeMo-Speech.cpp'
+    runs-on: windows-amd64-gpu-l4-latest-1
+    timeout-minutes: 120
+    # Non-blocking until the runner setup has proven itself on a few PRs.
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Initialize submodules
+        run: git submodule update --init --depth 1 llama.cpp
+
+      - name: Install build prerequisites
+        # The ephemeral VM ships the NVIDIA driver (with the Vulkan ICD) but not
+        # necessarily the build tools. Mirrors docs/development/windows-build.md.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+            Set-ExecutionPolicy Bypass -Scope Process -Force
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-Expression ((New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+            $env:Path = "$env:ProgramData\chocolatey\bin;$env:Path"
+          }
+          $packages = @('vulkan-sdk')
+          foreach ($tool in @{ cmake = 'cmake'; ninja = 'ninja'; python = 'python' }.GetEnumerator()) {
+            if (-not (Get-Command $tool.Key -ErrorAction SilentlyContinue)) { $packages += $tool.Value }
+          }
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $hasVc = (Test-Path $vswhere) -and
+            (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath)
+          if (-not $hasVc) { $packages += 'visualstudio2022-workload-vctools' }
+          choco install -y --no-progress @packages
+          # Later steps run in fresh shells with the job's original PATH, so
+          # publish the updated machine/user PATH and VULKAN_SDK to them.
+          $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+          "$machine;$user" -split ';' | Where-Object { $_ } | ForEach-Object { Add-Content -Path $env:GITHUB_PATH -Value $_ }
+          $vulkan = [Environment]::GetEnvironmentVariable('VULKAN_SDK', 'Machine')
+          if ($vulkan) { Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$vulkan" }
+
+      - name: Display GPU information
+        # nvidia-smi shows the driver mode (TCC has no graphics stack and
+        # therefore no Vulkan); vulkaninfo shows what the loader enumerates.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          nvidia-smi
+          & "$env:VULKAN_SDK\Bin\vulkaninfoSDK.exe" --summary
+
+      - name: Restore vcpkg binaries
+        # actions/cache only saves in its post step when the job succeeds, so
+        # a failing test run threw away 30 minutes of dependency builds.
+        # Split restore/save and save right after a successful build.
+        id: vcpkg-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-windows-x64-${{ hashFiles('vcpkg.json', 'scripts/windows/build.ps1') }}
+          restore-keys: vcpkg-windows-x64-
+
+      - name: Configure and build
+        # build.ps1 re-reads PATH and VULKAN_SDK from the registry, so tools
+        # installed in the previous step are visible without a new shell.
+        id: build
+        shell: pwsh
+        run: |
+          scripts\windows\build.ps1 -Backend vulkan -Profile core -Tests `
+            -BuildDir "${{ github.workspace }}\build\windows-vulkan"
+
+      - name: Save vcpkg binaries
+        # Keys are immutable, so only save a fully built dependency set. Test
+        # failures later in the job do not prevent the save.
+        if: steps.build.outcome == 'success' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - name: Unit tests
+        shell: pwsh
+        run: ctest --test-dir build\windows-vulkan --output-on-failure --timeout 600
+
+      - name: Cache models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
+          key: models-${{ hashFiles('models/index.json') }}
+
+      - name: Model smoke test
+        # The Vulkan-built CLI enumerates no GPU device on this runner (see
+        # the GPU information step for the driver mode). Build and link the
+        # Vulkan backend here, run inference on CPU, and probe Vulkan
+        # non-blockingly below.
+        shell: pwsh
+        run: |
+          python tests\ci\model_smoke.py `
+            --binary build\windows-vulkan\bin\nemo-speech.exe `
+            --backend cpu `
+            --audio test_files\asr\wav\test\jfk.wav
+
+      - name: Vulkan backend probe (non-blocking)
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          build\windows-vulkan\bin\nemo-speech.exe --json doctor
+          build\windows-vulkan\bin\nemo-speech.exe --verbose transcribe `
+            test_files\asr\wav\test\jfk.wav --backend vulkan

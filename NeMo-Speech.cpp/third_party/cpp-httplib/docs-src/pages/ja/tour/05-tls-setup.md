@@ -19,7 +19,7 @@ order: 5
 
 ## コンパイルオプション
 
-TLS機能を有効にするには、`CPPHTTPLIB_OPENSSL_SUPPORT` マクロを定義してコンパイルします。前章までのコンパイルコマンドに、いくつかオプションが増えます。
+TLS機能を有効にするには、`CPPHTTPLIB_OPENSSL_SUPPORT`マクロを定義してコンパイルします。前章までのコンパイルコマンドに、いくつかオプションが増えます。
 
 ```sh
 # macOS (Homebrew)
@@ -48,7 +48,7 @@ cl /EHsc /std:c++17 /DCPPHTTPLIB_OPENSSL_SUPPORT server.cpp libssl.lib libcrypto
 
 ## 動作確認
 
-ちゃんと動くか確認してみましょう。`httplib::Client` にHTTPSのURLを渡してアクセスするだけのプログラムです。
+ちゃんと動くか確認してみましょう。`httplib::Client`にHTTPSのURLを渡してアクセスするだけのプログラムです。
 
 ```cpp
 #define CPPHTTPLIB_OPENSSL_SUPPORT
@@ -67,7 +67,7 @@ int main() {
 }
 ```
 
-コンパイルして実行してみてください。`Status: 200` と表示されれば、セットアップ完了です。
+コンパイルして実行してみてください。`Status: 200`と表示されれば、セットアップ完了です。
 
 ## 他のTLSバックエンド
 
@@ -78,6 +78,8 @@ cpp-httplibはOpenSSL以外にも、Mbed TLSとwolfSSLに対応しています�
 | OpenSSL | `CPPHTTPLIB_OPENSSL_SUPPORT` | `libssl`, `libcrypto` |
 | Mbed TLS | `CPPHTTPLIB_MBEDTLS_SUPPORT` | `libmbedtls`, `libmbedx509`, `libmbedcrypto` |
 | wolfSSL | `CPPHTTPLIB_WOLFSSL_SUPPORT` | `libwolfssl` |
+
+Mbed TLSは2.x、3.x、4.xいずれも対応していて、自動判定されます。4.xでは`libmbedcrypto`が`libtfpsacrypto`という名前に変わっているので、リンクするライブラリはそちらに読み替えてください。
 
 このTourではOpenSSLを前提に進めますが、APIはどのバックエンドでも共通です。
 

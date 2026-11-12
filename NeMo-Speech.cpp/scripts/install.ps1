@@ -172,7 +172,7 @@ if ($Version -eq "latest") {
             if ($BinaryOnly) { throw "Could not resolve the latest release. $($_.Exception.Message)" }
             $binaryCandidate = $false
             $Version = "source"
-            Write-Host "Latest release is unavailable; falling back to the main source branch."
+            Write-Host "Latest release is unavailable ($($_.Exception.Message)); falling back to a source build."
         }
     }
 }
@@ -205,6 +205,19 @@ if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
 }
 
 $installIdentity = "$releaseVersion windows $arch $Backend"
+# The nightly tag is rebuilt in place, so identify a nightly install by its archive digest.
+if ($releaseVersion -eq 'nightly' -and -not $Source -and $binaryCandidate) {
+    $digestFile = [IO.Path]::GetTempFileName()
+    try {
+        Invoke-DownloadWithRetry -Uri "$url.sha256" -OutFile $digestFile
+        $nightlySha256 = ((Get-Content $digestFile -Raw).Trim() -split '\s+')[0]
+        if ($nightlySha256) { $installIdentity += " sha256:$nightlySha256" }
+    } catch {
+        # Without the digest the identity never matches, so the archive is downloaded.
+    } finally {
+        Remove-Item -Force -ErrorAction SilentlyContinue $digestFile
+    }
+}
 $extraComponents = [Collections.Generic.List[string]]::new()
 foreach ($component in @(
     @{ Name = 'grpc'; Enabled = $Grpc }, @{ Name = 'nmt'; Enabled = $Nmt },

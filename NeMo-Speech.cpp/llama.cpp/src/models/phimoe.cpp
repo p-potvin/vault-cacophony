@@ -3,7 +3,7 @@
 void llama_model_phimoe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
-    switch (hparams.n_layer) {
+    switch (hparams.n_layer()) {
         case 32: type = LLM_TYPE_16x3_8B; break;
         default: type = LLM_TYPE_UNKNOWN;
     }
@@ -47,9 +47,9 @@ void llama_model_phimoe::load_arch_tensors(llama_model_loader &) {
 
 std::unique_ptr<llm_graph_context> llama_model_phimoe::build_arch_graph(const llm_graph_params & params) const {
     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-        return std::make_unique<graph<true>> (*this, params);
+        return std::make_unique<graph<true>> (params);
     } else {
-        return std::make_unique<graph<false>>(*this, params);
+        return std::make_unique<graph<false>>(params);
     }
 }
 

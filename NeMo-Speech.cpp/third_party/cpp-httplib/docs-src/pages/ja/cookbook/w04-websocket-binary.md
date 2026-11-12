@@ -1,6 +1,6 @@
 ---
 title: "W04. バイナリフレームを送受信する"
-order: 54
+order: 55
 status: "draft"
 ---
 
@@ -42,6 +42,9 @@ switch (result) {
   case httplib::ws::ReadResult::Fail:
     // エラーまたは切断
     break;
+  case httplib::ws::ReadResult::Timeout:
+    // 読み取りタイムアウト。接続は開いたまま
+    break;
 }
 ```
 
@@ -82,4 +85,4 @@ if (cli.read(buf) == httplib::ws::ReadResult::Binary) {
 
 テキストとバイナリを混ぜて送ることもできます。たとえば「制御メッセージはJSON、データ本体はバイナリ」といったプロトコルを組み立てると、メタデータと生データを効率よく扱えます。
 
-> **Note:** WebSocketのフレームサイズには上限がないわけではありません。巨大なデータを送るときは、アプリケーション側で分割して送るのが安全です。cpp-httplibのデフォルトでは大きなフレームもそのまま処理されますが、メモリを一気に使う点は変わりません。
+> **Note:** 受信できるメッセージの大きさは`CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH`（デフォルトは16MB、0なら無制限）までです。これを超えると`read()`は`Fail`を返し、接続は終了します。上限以内でもメッセージはまるごとメモリに載るので、巨大なデータを送るときは、アプリケーション側で分割して送るのが安全です。

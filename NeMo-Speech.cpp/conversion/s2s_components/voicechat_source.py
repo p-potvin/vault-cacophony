@@ -214,14 +214,18 @@ def find_quantizer(
             )
         return resolved
 
-    candidates = [
-        llama_cpp / "build" / "bin" / "llama-quantize",
-        llama_cpp / "build-quantize" / "bin" / "llama-quantize",
-    ]
-    candidates.extend(sorted(llama_cpp.glob("build*/bin/llama-quantize")))
-    installed = shutil.which("llama-quantize")
-    if installed:
-        candidates.append(Path(installed))
+    if profile and profile.lower() == "q2_0":
+        # Q2_0 needs the scale fitting of patches/: only the converter-managed build has it
+        candidates = [default_quantizer_path(llama_cpp)]
+    else:
+        candidates = [
+            llama_cpp / "build" / "bin" / "llama-quantize",
+            llama_cpp / "build-quantize" / "bin" / "llama-quantize",
+        ]
+        candidates.extend(sorted(llama_cpp.glob("build*/bin/llama-quantize")))
+        installed = shutil.which("llama-quantize")
+        if installed:
+            candidates.append(Path(installed))
     for candidate in candidates:
         resolved = candidate.resolve()
         if (
@@ -248,15 +252,24 @@ def ensure_quantizer(
     checkout = llama_cpp.expanduser().resolve()
     if explicit is not None:
         return find_quantizer(checkout, explicit, profile=profile)
-    try:
-        return find_quantizer(checkout, profile=profile)
-    except FileNotFoundError as missing:
-        if not auto_build:
-            raise FileNotFoundError(
-                f"{missing}; automatic build is disabled, so pass --llama-quantize PATH"
-            ) from missing
-
     root = (repo_root or _project_root()).expanduser().resolve()
+    q2_0 = bool(profile) and profile.lower() == "q2_0"
+    if q2_0 and checkout != (root / "llama.cpp").resolve():
+        raise RuntimeError(
+            "q2_0 needs the Q2_0 scale fitting in patches/, which the converter applies only to this "
+            "repository's llama.cpp; omit --llama-cpp, or pass --llama-quantize built with patches/"
+        )
+    # q2_0 always goes through the build, so the managed quantizer carries the current patches/
+    # (an incremental no-op when it does)
+    if not (q2_0 and auto_build and shutil.which("cmake")):
+        try:
+            return find_quantizer(checkout, profile=profile)
+        except FileNotFoundError as missing:
+            if not auto_build:
+                raise FileNotFoundError(
+                    f"{missing}; automatic build is disabled, so pass --llama-quantize PATH"
+                ) from missing
+
     checkout = ensure_llama_checkout(checkout, root)
     cmake = shutil.which("cmake")
     if cmake is None:
@@ -265,18 +278,36 @@ def ensure_quantizer(
             "C++ compiler; install the build prerequisites or pass --llama-quantize PATH"
         )
 
+    source = checkout
     if checkout == (root / "llama.cpp").resolve():
-        patch_script = root / "scripts" / "apply-llama-patches.sh"
-        if not patch_script.is_file():
-            raise RuntimeError(f"missing llama.cpp patch helper: {patch_script}")
-        print("[convert-s2s] applying pinned llama.cpp compatibility patches")
-        subprocess.run(["bash", str(patch_script)], cwd=root, check=True)
+        # Build from a patched copy; the submodule itself stays pristine.
+        materialize = root / "cmake" / "llama_cpp.cmake"
+        if not materialize.is_file():
+            raise RuntimeError(f"missing llama.cpp patch helper: {materialize}")
+        source = root / ".deps" / "llama.cpp-patched"
+        print("[convert-s2s] applying patches/ to a copy of the pinned llama.cpp")
+        subprocess.run(
+            [
+                cmake,
+                f"-DSOURCE_DIR={checkout}",
+                f"-DPATCH_DIR={root / 'patches'}",
+                f"-DDEST_DIR={source}",
+                "-P",
+                str(materialize),
+            ],
+            check=True,
+        )
 
     build_dir = checkout / "build-quantize"
+    cache = build_dir / "CMakeCache.txt"
+    if cache.is_file() and f"CMAKE_HOME_DIRECTORY:INTERNAL={source}\n" not in cache.read_text():
+        # Configured from a different source tree; CMake cannot switch sources
+        # in place.
+        shutil.rmtree(build_dir)
     configure = [
         cmake,
         "-S",
-        str(checkout),
+        str(source),
         "-B",
         str(build_dir),
         "-DCMAKE_BUILD_TYPE=Release",

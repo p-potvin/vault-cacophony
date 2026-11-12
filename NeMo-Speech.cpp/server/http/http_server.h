@@ -6,6 +6,8 @@
 #include <memory>
 #include <string>
 
+#include "chat_api.h"
+
 namespace nemo_speech {
 class EngineRegistry;
 namespace http {
@@ -19,6 +21,10 @@ struct ServerConfig {
     size_t max_upload_bytes = 512ULL * 1024ULL * 1024ULL;
     bool access_log = false;
     bool json_logs = false;
+    // Emit per-request TTS runtime timings to stderr.
+    bool tts_benchmark = false;
+    // Keep only the latest HTTP TTS request; newer requests cancel older synthesis.
+    bool preempt_tts = false;
     std::string tls_certificate;
     std::string tls_private_key;
     std::string api_key;
@@ -27,6 +33,8 @@ struct ServerConfig {
     int realtime_s2s_max_session_seconds = 300;
     size_t realtime_s2s_max_pending_function_responses = 64;
     bool realtime_s2s_output_text_events = false;
+    // Chat API limits (http.chat.*).
+    chat::ApiConfig chat;
 };
 
 class Server {

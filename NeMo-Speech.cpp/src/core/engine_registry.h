@@ -36,7 +36,7 @@ struct WarmupOptions {
     bool tts = true;
     bool s2s = true;
     std::string tts_text = "Hello";
-    int tts_steps = 1;
+    int tts_steps = 8;  // enough decoder frames to build the fused runtime and codec graphs
 };
 
 struct EngineRegistryConfig {
@@ -53,8 +53,7 @@ class EngineRegistry {
 
 #if defined(NEMO_SPEECH_REGISTRY_DIAR)
     std::shared_ptr<asr::Diarizer> load_diarization(
-        int gpu, const std::string& model_path,
-        asr::DiarGeometry geometry = asr::DiarGeometry::preset("streaming"),
+        int gpu, const std::string& model_path, asr::DiarGeometry geometry = {},
         asr::BatchingConfig batching = {});
     std::shared_ptr<asr::Diarizer> diarization() const;
 #endif
@@ -72,6 +71,7 @@ class EngineRegistry {
 #endif
 #if defined(NEMO_SPEECH_REGISTRY_SPEECH)
     std::shared_ptr<speech::SpeechTranslator> speech_translation() const;
+    bool has_speech_translation() const;  // ASR and NMT are loaded
 #endif
 #if defined(NEMO_SPEECH_REGISTRY_S2S)
     std::shared_ptr<s2s::VoiceChat> load_voicechat(s2s::VoiceChatConfig config);

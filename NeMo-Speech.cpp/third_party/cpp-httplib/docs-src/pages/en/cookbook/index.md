@@ -73,6 +73,9 @@ A collection of recipes that answer "How do I...?" questions. Each recipe is sel
 - [S21. Configure the thread pool](s21-thread-pool)
 - [S22. Talk over a Unix domain socket](s22-unix-socket)
 
+### Protocol Extensions
+- [S23. Handle custom HTTP methods](s23-custom-methods)
+
 ## TLS / Security
 
 - [T01. Choosing between OpenSSL, mbedTLS, and wolfSSL](t01-tls-backends)
@@ -94,3 +97,5 @@ A collection of recipes that answer "How do I...?" questions. Each recipe is sel
 - [W02. Set a WebSocket heartbeat](w02-websocket-ping)
 - [W03. Handle connection close](w03-websocket-close)
 - [W04. Send and receive binary frames](w04-websocket-binary)
+- [W05. Configure TLS for wss:// connections](w05-websocket-tls)
+- [W06. Set timeouts](w06-websocket-timeouts)

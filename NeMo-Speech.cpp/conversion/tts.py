@@ -15,6 +15,7 @@ here.
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -22,11 +23,33 @@ from typing import Any
 import gguf
 import numpy as np
 import torch
+from gguf.quants import quantize
 
-from .source import extract_archive, find_checkpoint_files, load_state_dict, read_checkpoint_config
+from .source import (
+    extract_archive,
+    find_checkpoint_files,
+    load_state_dict,
+    read_checkpoint_config,
+    read_nemo_config,
+)
+from .tts_tokenizer_profiles import tokenizer_profile
 
 SPECIAL_AUDIO_TOKENS = 8
-SPEAKER_NAMES = ["John", "Sofia", "Aria", "Jason", "Leo"]
+
+# 2-D projection weights stored as Q8_0 by ``--outtype q8_0``: the attention and feed-forward
+# projections (per-tap Conv1d slices) of the text encoder, the decoder and the local
+# transformer, the local-transformer output projections and the final projection. Norms and
+# biases stay f32; all other tensors keep the f16 layout. The CUDA runtime's fused decoder and
+# local-transformer kernels need these Q8_0 projections; other backends run them through
+# ggml's Q8_0 matrix multiplication.
+Q8_PROJECTION_WEIGHT = re.compile(
+    r"(self_attention\.(qkv_net|o_net)\.weight"
+    r"|cross_attention\.(q_net|kv_net|o_net)\.weight"
+    r"|pos_ff\.(proj|o_net)\.conv\.weight\.k\d+"
+    r"|local_transformer_out_projections\.\d+\.weight"
+    r"|final_proj\.weight)$"
+)
+Q8_BLOCK = 32
 
 
 def extract_nemo(path: Path) -> tuple[Path, tempfile.TemporaryDirectory[str] | None]:
@@ -35,7 +58,15 @@ def extract_nemo(path: Path) -> tuple[Path, tempfile.TemporaryDirectory[str] | N
 
     tmp = tempfile.TemporaryDirectory(prefix="magpietts-nemo-")
     out = Path(tmp.name)
-    extract_archive(path, out, basenames={"model_config.yaml", "model_weights.ckpt"})
+    try:
+        basenames = {"model_config.yaml", "config.yaml", "model_weights.ckpt"}
+        speaker_map = read_nemo_config(path).get("speaker_map")
+        if isinstance(speaker_map, str) and speaker_map:
+            basenames.add(Path(speaker_map.removeprefix("nemo:")).name)
+        extract_archive(path, out, basenames=basenames)
+    except Exception:
+        tmp.cleanup()
+        raise
     return out, tmp
 
 
@@ -48,6 +79,38 @@ def read_state_dict(root: Path) -> dict[str, torch.Tensor]:
     if checkpoint is None:
         raise RuntimeError(f"checkpoint contains no model_weights.ckpt: {root}")
     return load_state_dict(checkpoint, weights_only=True)
+
+
+def read_speaker_names(
+    cfg: dict[str, Any], speaker_count: int, root: Path | None = None
+) -> list[str]:
+    """Return checkpoint names in baked speaker ID order, never JSON key order."""
+    speaker_map = cfg.get("speaker_map")
+    if isinstance(speaker_map, str) and speaker_map:
+        if root is None:
+            raise ValueError("speaker_map requires the extracted checkpoint directory")
+        # NeMo packages artifacts under a generated basename and records a
+        # nemo: URI; original absolute paths may also survive in older configs.
+        basename = Path(speaker_map.removeprefix("nemo:")).name
+        candidates = sorted(root.rglob(basename))
+        if len(candidates) != 1:
+            raise ValueError(
+                f"speaker_map artifact {basename!r}: expected one file in {root}, "
+                f"found {len(candidates)}"
+            )
+        with candidates[0].open(encoding="utf-8") as stream:
+            speaker_map = json.load(stream)
+    if not isinstance(speaker_map, dict) or not speaker_map:
+        raise ValueError("checkpoint must provide a non-empty speaker_map; cannot infer voice IDs")
+    names: set[str] = set()
+    for name, index in speaker_map.items():
+        if not isinstance(name, str) or not name.strip() or name.casefold() in names:
+            raise ValueError("speaker_map names must be non-empty and unique ignoring case")
+        names.add(name.casefold())
+        if type(index) is not int:
+            raise ValueError(f"speaker_map ID for {name!r} must be an integer")
+    _require_contiguous_indices("speaker_map", list(speaker_map.values()), speaker_count)
+    return sorted(speaker_map, key=speaker_map.__getitem__)
 
 
 def cfg_get(cfg: dict[str, Any], path: str, default: Any = None) -> Any:
@@ -79,24 +142,76 @@ def add_i32_array(writer: gguf.GGUFWriter, key: str, value: Any) -> None:
         writer.add_array(key, items)
 
 
+def _indexed_weight_indices(sd: dict[str, torch.Tensor], prefix: str) -> list[int]:
+    suffix = ".weight"
+    indices: list[int] = []
+    for name in sd:
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            continue
+        raw_index = name[len(prefix) : -len(suffix)]
+        if not raw_index.isascii() or not raw_index.isdigit():
+            raise ValueError(f"{prefix} contains a non-numeric weight index: {name}")
+        indices.append(int(raw_index))
+    return indices
+
+
+def _require_contiguous_indices(label: str, indices: list[int], expected_count: int) -> None:
+    expected = list(range(expected_count))
+    actual = sorted(indices)
+    if actual != expected:
+        raise ValueError(
+            f"{label} indexes must be contiguous from 0 through {expected_count - 1}: "
+            f"found={actual}"
+        )
+
+
 def add_metadata(
-    writer: gguf.GGUFWriter, cfg: dict[str, Any], sd: dict[str, torch.Tensor]
+    writer: gguf.GGUFWriter,
+    cfg: dict[str, Any],
+    sd: dict[str, torch.Tensor],
+    checkpoint_root: Path | None = None,
 ) -> dict[str, Any]:
+    encoder = cfg["encoder"]
+    decoder = cfg["decoder"]
+    lt_hidden = int(cfg.get("local_transformer_hidden_dim", 256))
+    frame_stacking = int(cfg.get("frame_stacking_factor", 1))
+    audio_embedding_indices = _indexed_weight_indices(sd, "audio_embeddings.")
+    n_stacked_codebooks = len(audio_embedding_indices)
+    if frame_stacking < 1 or n_stacked_codebooks == 0 or n_stacked_codebooks % frame_stacking:
+        raise ValueError(
+            "audio embedding count must be a positive multiple of frame_stacking_factor: "
+            f"embeddings={n_stacked_codebooks} frame_stacking_factor={frame_stacking}"
+        )
+    _require_contiguous_indices("audio embedding", audio_embedding_indices, n_stacked_codebooks)
+
     audio_vocab = int(sd["audio_embeddings.0.weight"].shape[0])
     codebook_size = audio_vocab - SPECIAL_AUDIO_TOKENS
     text_vocab = int(sd["text_embedding.weight"].shape[0])
     baked_t = int(sd["_baked_embedding_T"].item())
     baked_d = int(sd["_baked_embedding_D"].item())
     baked_lens = [int(x) for x in sd["baked_context_embedding_len"].tolist()]
-
-    encoder = cfg["encoder"]
-    decoder = cfg["decoder"]
-    lt_hidden = int(cfg.get("local_transformer_hidden_dim", 256))
-    frame_stacking = int(cfg.get("frame_stacking_factor", 1))
-    n_codebooks = int(
-        len([k for k in sd if k.startswith("audio_embeddings.") and k.endswith(".weight")])
+    profile = tokenizer_profile(cfg, text_vocab, frame_stacking)
+    n_codebooks = n_stacked_codebooks // frame_stacking
+    expected_logits = n_stacked_codebooks * audio_vocab
+    if int(sd["final_proj.weight"].shape[0]) != expected_logits:
+        raise ValueError(
+            "final_proj rows do not match stacked audio layout: "
+            f"rows={sd['final_proj.weight'].shape[0]} expected={expected_logits}"
+        )
+    lt_head_indices = _indexed_weight_indices(sd, "local_transformer_out_projections.")
+    n_lt_heads = len(lt_head_indices)
+    if n_lt_heads != n_stacked_codebooks:
+        raise ValueError(
+            "local transformer output heads do not match audio embeddings: "
+            f"heads={n_lt_heads} embeddings={n_stacked_codebooks}"
+        )
+    _require_contiguous_indices(
+        "local transformer output projection", lt_head_indices, n_stacked_codebooks
     )
-    n_codebooks //= frame_stacking
+    speaker_count = int(sd["baked_context_embedding.weight"].shape[0])
+    speaker_names = read_speaker_names(cfg, speaker_count, checkpoint_root)
+    if len(baked_lens) != speaker_count:
+        raise ValueError("baked context length count does not match baked speaker count")
 
     inf = cfg.get("inference_parameters", {})
 
@@ -105,9 +220,11 @@ def add_metadata(
         "model_type": cfg.get("model_type"),
         "nemo_target": cfg.get("target"),
         "nemo_version": cfg.get("nemo_version"),
+        "tokenizer_profile": profile,
         "codec_model": cfg.get("codecmodel_path"),
         "text_vocab_size": text_vocab,
         "audio_codebooks": n_codebooks,
+        "stacked_audio_codebooks": n_stacked_codebooks,
         "audio_codebook_size": codebook_size,
         "audio_vocab_size": audio_vocab,
         "frame_stacking_factor": frame_stacking,
@@ -115,7 +232,7 @@ def add_metadata(
         "encoder_layers": int(encoder["n_layers"]),
         "decoder_layers": int(decoder["n_layers"]),
         "context_length": int(decoder["max_length_causal_mask"]),
-        "speaker_names": SPEAKER_NAMES,
+        "speaker_names": speaker_names,
         "baked_context_length": baked_t,
         "baked_context_dim": baked_d,
         "baked_context_lens": baked_lens,
@@ -127,14 +244,16 @@ def add_metadata(
     )
     writer.add_string("magpietts.nemo_target", str(cfg.get("target", "")))
     writer.add_string("magpietts.nemo_version", str(cfg.get("nemo_version", "")))
+    writer.add_string("magpietts.tokenizer_profile", profile)
     writer.add_string("magpietts.model_type", str(cfg.get("model_type", "")))
     writer.add_string("magpietts.codec_model", str(cfg.get("codecmodel_path", "")))
     writer.add_string("magpietts.config_json", json.dumps(cfg, ensure_ascii=False, sort_keys=True))
-    writer.add_array("magpietts.speaker_names", SPEAKER_NAMES)
+    writer.add_array("magpietts.speaker_names", speaker_names)
     writer.add_array("magpietts.baked_context_lens", baked_lens)
 
     add_i32(writer, "magpietts.text_vocab_size", text_vocab)
     add_i32(writer, "magpietts.audio_codebooks", n_codebooks)
+    add_i32(writer, "magpietts.stacked_audio_codebooks", n_stacked_codebooks)
     add_i32(writer, "magpietts.audio_codebook_size", codebook_size)
     add_i32(writer, "magpietts.audio_vocab_size", audio_vocab)
     add_i32(writer, "magpietts.audio_bos_id", codebook_size + 0)
@@ -168,7 +287,7 @@ def add_metadata(
     )
     add_i32(writer, "magpietts.baked_context_length", baked_t)
     add_i32(writer, "magpietts.baked_context_dim", baked_d)
-    add_i32(writer, "magpietts.baked_speakers", int(sd["baked_context_embedding.weight"].shape[0]))
+    add_i32(writer, "magpietts.baked_speakers", speaker_count)
     add_i32(writer, "magpietts.inference.max_decoder_steps", inf.get("max_decoder_steps", 500))
     add_i32(writer, "magpietts.inference.topk", inf.get("topk", 80))
     add_i32(writer, "magpietts.inference.min_generated_frames", inf.get("min_generated_frames", 4))
@@ -226,10 +345,19 @@ def should_store_f32(name: str, tensor: torch.Tensor) -> bool:
     return name.endswith(".bias")
 
 
+def is_q8_projection(name: str, tensor: torch.Tensor) -> bool:
+    return (
+        tensor.is_floating_point()
+        and tensor.ndim == 2
+        and int(tensor.shape[-1]) % Q8_BLOCK == 0
+        and Q8_PROJECTION_WEIGHT.search(name) is not None
+    )
+
+
 def tensor_to_numpy(name: str, tensor: torch.Tensor, outtype: str) -> np.ndarray:
     tensor = tensor.detach().cpu().contiguous()
     if tensor.is_floating_point():
-        if outtype == "f16" and not should_store_f32(name, tensor):
+        if outtype in ("f16", "q8_0") and not should_store_f32(name, tensor):
             tensor = tensor.to(torch.float16)
         else:
             tensor = tensor.to(torch.float32)
@@ -239,6 +367,11 @@ def tensor_to_numpy(name: str, tensor: torch.Tensor, outtype: str) -> np.ndarray
 
 
 def add_tensor(writer: gguf.GGUFWriter, name: str, tensor: torch.Tensor, outtype: str) -> None:
+    if outtype == "q8_0" and is_q8_projection(name, tensor):
+        f32 = tensor.detach().cpu().contiguous().to(torch.float32).numpy()
+        q8 = quantize(f32, gguf.GGMLQuantizationType.Q8_0)
+        writer.add_tensor(name, q8, raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+        return
     writer.add_tensor(name, tensor_to_numpy(name, tensor, outtype))
 
 
@@ -308,16 +441,16 @@ def convert(
 
         if cfg.get("target") != "nemo.collections.tts.models.magpietts.MagpieTTSModel":
             raise RuntimeError(f"unsupported target: {cfg.get('target')}")
-        if cfg.get("model_type") != "decoder_ce" or not cfg.get(
-            "has_baked_context_embedding", False
-        ):
+        # v2602 records this in the config while v2607 retains the baked
+        # tensor but omits the legacy config flag.
+        if cfg.get("model_type") != "decoder_ce" or "baked_context_embedding.weight" not in sd:
             raise RuntimeError(
                 "this GGML example expects MagpieTTS decoder_ce with baked context embeddings"
             )
 
         output.parent.mkdir(parents=True, exist_ok=True)
         writer = gguf.GGUFWriter(output, "magpietts")
-        summary = add_metadata(writer, cfg, sd)
+        summary = add_metadata(writer, cfg, sd, root)
         n_written, skipped = add_tensors(writer, sd, outtype, local_transformer_outtype)
 
         writer.write_header_to_file()
@@ -328,6 +461,7 @@ def convert(
         summary["tensors_written"] = n_written
         summary["tensors_skipped"] = skipped
         summary["output"] = str(output)
+        summary["outtype"] = outtype
         summary["local_transformer_outtype"] = local_transformer_outtype or outtype
         if metadata_json:
             metadata_json.parent.mkdir(parents=True, exist_ok=True)

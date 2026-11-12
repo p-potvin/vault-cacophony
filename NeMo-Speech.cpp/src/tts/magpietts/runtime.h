@@ -32,12 +32,12 @@ struct MagpieRuntimeConfig {
     std::string magpie_model;
     std::string codec_model;
     int speaker = 0;
-    int threads = 4;
-    int codec_threads = 0;
+    int threads = 0;        // 0 = min(8, hardware threads)
+    int codec_threads = 0;  // 0 = threads
     int seed = -1;
     int steps = -1;
     int top_k = -1;
-    int chunk_frames = 3;
+    int chunk_frames = 4;
     int codec_queue_depth = 4;
     int codec_history_frames = -1;
     int codec_future_frames = 1;
@@ -129,6 +129,8 @@ class MagpieTtsRuntime {
     int speaker_count() const;
     const std::vector<std::string>& speaker_names() const;
     const std::string& model_name() const;
+    const std::string& tokenizer_profile() const;
+    int text_vocab_size() const;
 
     MagpieSynthesisStats synthesize(
         const std::vector<int32_t>& tokens, const MagpieSynthesisOptions& options,

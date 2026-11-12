@@ -27,6 +27,15 @@ Start with:
 - [Feature matrix and customization](asr/customization.md) - which models
   support which features, and request-time vs startup customization.
 
+## SALM (speech-LLM)
+
+- [Guide](salm/README.md) - getting started, transcription, word timestamps and
+  speakers, your own instructions, speech translation, and streamed output.
+- [Models and platforms](salm/models.md) - the model names, files and conversion,
+  and which builds decode many requests together.
+- [Configuration](salm/configuration.md) - `asr.salm.*` keys, settings for smaller
+  and larger GPUs, concurrency and errors.
+
 ## TTS
 
 - [Models](tts/models.md) - ready-to-run MagpieTTS and NanoCodec GGUF downloads,
@@ -50,9 +59,10 @@ Start with:
 ## Developer guide
 
 - [Overview](development/README.md) - implementation and performance internals.
-- [Diagnostics](development/diagnostics.md) - `check_backend_coverage`.
+- [Diagnostics](development/diagnostics.md) - build switches, runtime knobs, and
+  `check_backend_coverage`.
 - [ASR batching](development/asr-batching.md) - neural microbatching and
   streaming-state arenas.
-- [ggml patches](development/ggml-patches.md) - the project-specific ggml changes.
+- [llama.cpp and ggml patches](../patches/README.md) - the project-specific changes.
 - [cuBLAS shim](development/cublas-shim.md) - the in-tree drop-in cuBLAS
   replacement.

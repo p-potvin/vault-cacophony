@@ -37,20 +37,13 @@ dir=$(basename $(pwd))
 # sanitize branch name for directory name (replace / with -)
 dir_suffix=$(echo "$BRANCH" | tr '/' '-')
 
-git worktree add -b "$BRANCH" "../$dir-$dir_suffix" HEAD
+git worktree add "../$dir-$dir_suffix" "$BRANCH" || git worktree add -b "$BRANCH" "../$dir-$dir_suffix" HEAD
 
-og_path=$(pwd)
 wt_path=$(cd "../$dir-$dir_suffix" && pwd)
 
 echo "git worktree created in $wt_path"
 
 cd "$wt_path"
-
-# pi agent setup in the worktree
-if [[ -f "$og_path/.pi/SYSTEM.md" && ! -f ".pi/SYSTEM.md" ]]; then
-    mkdir -p .pi
-    ln -sfn "$og_path/.pi/SYSTEM.md" .pi/SYSTEM.md
-fi
 
 if [[ $# -eq 2 ]]; then
     echo "executing: $2"

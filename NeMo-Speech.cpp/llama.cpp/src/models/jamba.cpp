@@ -8,11 +8,11 @@ void llama_model_jamba::load_arch_hparams(llama_model_loader & ml) {
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
-    for (uint32_t i = 0; i < hparams.n_layer; ++i) {
-        hparams.recurrent_layer_arr[i] = hparams.n_head_kv(i) == 0;
+    for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
+        hparams.is_recr_impl[i] = hparams.n_head_kv(i) == 0;
     }
 
-    switch (hparams.n_layer) {
+    switch (hparams.n_layer()) {
         // TODO: Jamba layers are a bit heterogeneous, so naming this is hard.
         case 12: // 900M  8x???M
         case 32: // 51B  16x?B
@@ -102,10 +102,10 @@ void llama_model_jamba::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_jamba::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
-llama_model_jamba::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_build_mamba_base(params) {
+llama_model_jamba::graph::graph(const llm_graph_params & params) : llm_build_mamba_base(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     ggml_tensor * cur;
@@ -125,7 +125,7 @@ llama_model_jamba::graph::graph(const llama_model & model, const llm_graph_param
         cb(cur, "attn_norm", il);
 
         if (n_head_kv == 0) {
-            cur = build_mamba_layer(inp_hybrid->get_recr(), cur, model, ubatch, il);
+            cur = build_mamba_layer(inp_hybrid->get_recr(), cur, ubatch, il);
         } else {
             // Attention
 
@@ -193,6 +193,4 @@ llama_model_jamba::graph::graph(const llama_model & model, const llm_graph_param
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }

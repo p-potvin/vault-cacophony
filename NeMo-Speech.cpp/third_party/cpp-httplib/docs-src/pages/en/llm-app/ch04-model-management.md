@@ -76,7 +76,7 @@ Defining `CPPHTTPLIB_OPENSSL_SUPPORT` enables `httplib::Client("https://...")` t
 
 ## 4.2 Defining the Model List
 
-Let's define the list of models that the app can handle. Here are four models we've verified for translation tasks.
+Let's define the list of models that the app can handle. Here are three models we've verified for translation tasks.
 
 ```cpp
 struct ModelInfo {
@@ -219,7 +219,6 @@ bool download_model(const ModelInfo &model,
                     std::function<bool(int)> progress_cb) {
   httplib::Client cli("https://huggingface.co");
   cli.set_follow_location(true);
-  cli.set_read_timeout(std::chrono::hours(1));
 
   auto url = "/" + model.repo + "/resolve/main/" + model.filename;
   auto path = get_models_dir() / model.filename;
@@ -469,7 +468,6 @@ bool download_model(const ModelInfo &model,
                     std::function<bool(int)> progress_cb) {
   httplib::Client cli("https://huggingface.co");
   cli.set_follow_location(true);  // Hugging Face redirects to a CDN
-  cli.set_read_timeout(std::chrono::hours(1)); // Set a long timeout for large models
 
   auto url = "/" + model.repo + "/resolve/main/" + model.filename;
   auto path = get_models_dir() / model.filename;
@@ -538,10 +536,6 @@ int main() {
   }
   auto llm = llamalib::Llama{path};
   std::mutex llm_mutex; // Protect access during model switching
-
-  // Set a long timeout since LLM inference takes time (default is 5 seconds)
-  svr.set_read_timeout(300);
-  svr.set_write_timeout(300);
 
   svr.set_logger([](const auto &req, const auto &res) {
     std::cout << req.method << " " << req.path << " -> " << res.status

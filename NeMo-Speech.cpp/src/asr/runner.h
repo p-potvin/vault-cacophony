@@ -61,8 +61,12 @@ struct StreamingUpdate {
     bool is_final = false;
     // Mean token posterior for greedy CTC; 1.0 when the decoder has no posterior.
     float confidence = 1.0f;
-    // Seconds of audio processed.
+    // Decoded progress in seconds: audio whose output this or an earlier call
+    // returned, excluding unconsumed lookahead. finalize() reports all audio fed.
     float audio_processed_sec = 0.0f;
+    // Punctuation for the previous final (Decoder::take_late_punctuation);
+    // not part of this update's text.
+    std::string late_punctuation;
 };
 
 // Runner methods are single-threaded. Independent runners may execute
@@ -127,6 +131,8 @@ class BufferedStreamRunner final : public AsrRunner {
 
    private:
     StreamingUpdate process_window(size_t win_start, size_t win_end, bool is_last);
+    // Encoder frames covering real audio; word spans are bounded to it.
+    int64_t real_frame_limit() const;
 
     // Poll the endpointer on the decode clock (now = emit cursor; last speech
     // = VAD bits over decoded frames, or the decoder's last_emit_frame).
@@ -210,8 +216,7 @@ class OfflineRunner final : public AsrRunner {
    public:
     OfflineRunner(
         AsrModel* model, const RecognizerConfig& cfg,
-        std::shared_ptr<const FlashlightResources> flashlight = nullptr,
-        std::shared_ptr<SileroVadModel> vad = nullptr);
+        std::shared_ptr<const FlashlightResources> flashlight = nullptr);
 
     void feed_audio(const float* samples, size_t n_samples) override;
     StreamingUpdate step() override { return {}; }
@@ -223,31 +228,13 @@ class OfflineRunner final : public AsrRunner {
     void force_eou() override {}
 
    private:
-    // One decode unit. `reset_before` marks a boundary the segmenter chose at
-    // real silence, where the decoder's language context is dropped before the
-    // segment runs. Boundaries forced by the positional-encoding budget can
-    // land mid-speech and leave it false, so they keep the old behaviour.
-    struct Segment {
-        size_t off = 0;
-        size_t len = 0;
-        bool reset_before = false;
-    };
-
     void pad_audio_to_bucket_();
     size_t max_offline_samples_() const;
     size_t snap_to_quiet_(size_t target, size_t search_span) const;
     std::vector<std::pair<size_t, size_t>> offline_segments_() const;
-    // Silence-aware partition of audio_. Falls back to offline_segments_()
-    // when the segmenter is disabled or no VAD model was supplied.
-    std::vector<Segment> segments_for_decode_() const;
-    // Per-512-sample-window speech bits from Silero, binarized with the
-    // configured hysteresis. Empty if no VAD model.
-    std::vector<bool> vad_speech_windows_(int& window_size) const;
 
     AsrModel* model_;
     DecoderConfig decoder_cfg_;
-    VadSegmenterCfg seg_cfg_;
-    std::shared_ptr<SileroVadModel> vad_;
     std::unique_ptr<Decoder> ctc_decoder_;
     AsrRequestOptions opts_;
     std::vector<float> audio_;
@@ -259,8 +246,8 @@ class OfflineRunner final : public AsrRunner {
 
 bool exceeds_offline_position_limit(const AsrModel& model, size_t n_samples, int input_sample_rate);
 
-// Drives a fixed-shape encoder graph (chunk_size_mel in, chunk_enc_frames
-// out) with per-layer K/V/conv caches threaded across chunks in a
+// Drives first/steady-state encoder shapes (each producing chunk_enc_frames)
+// with per-layer K/V/conv caches threaded across chunks in a
 // device-resident indexed cache row. Audio is buffered until at least one chunk's
 // worth of mel frames is ready; each step uploads mel + a small validity mask
 // and downloads only the joint-projected encoder output.
@@ -295,15 +282,17 @@ class CacheStreamRunner final : public AsrRunner {
     RnntDecodeStats rnnt_decode_stats() const;
 
    private:
-    void process_one_chunk(bool /*is_last*/);
-    void finish_endpoint(StreamingUpdate& update, bool preserve_buffered_future);
+    int next_chunk_mel_frames() const;
+    // Encoder frames covering real mel frames, excluding the EOS flush pad.
+    int64_t real_frame_limit() const;
+    void process_one_chunk();
     void upload_attn_mask();
     void zero_caches();
     // Poll the endpointer on the decode clock (now = encoder frames emitted;
     // last speech = VAD bits over decoded mel frames, or the decoder's
-    // last_emit_frame). Called after each processed chunk. On EOU it runs the
-    // normal EOS path, then starts the next utterance with fresh encoder and
-    // predictor state. The chunk loop breaks when this returns true.
+    // last_speech_frame). EOU publishes the utterance without changing acoustic
+    // or predictor state. A forced EOU waits for all currently decodable chunks.
+    // The chunk loop breaks when this returns true.
     bool poll_endpoint(StreamingUpdate& update, bool after_chunk);
     // Drop the audio prefix that FE and VAD have both consumed.
     void trim_buffers();
@@ -314,7 +303,8 @@ class CacheStreamRunner final : public AsrRunner {
     // GGUF-pinned cache-aware mel-frame geometry. These are NeMo's
     // CacheAwareStreamingConfig chunk_size / shift_size in mel frames
     // (setup_streaming_params, conformer_encoder.py):
-    //   chunk_size_mel = pre_encode_cache_size + subsampling_factor*(1 + R)
+    //   first_chunk_mel = 1 + subsampling_factor*R
+    //   subsequent_chunk_mel = pre_encode_cache_size + subsampling_factor*(1 + R)
     //   shift_size_mel = subsampling_factor*(1 + R - cache_drop_size)
     // These values are fixed by the model.
     int pre_encode_cache_size_ = 9;  // overlap, mel frames
@@ -342,8 +332,7 @@ class CacheStreamRunner final : public AsrRunner {
 
     // Always constructed so force_eou() works with threshold endpointing off. Polled
     // after each chunk; on fire the runner emits is_final and resets
-    // per-utterance state. Encoder and predictor state are reset at the
-    // boundary so delayed tokens cannot leak into the next utterance.
+    // per-utterance output state, preserving encoder and predictor context.
     std::unique_ptr<VadEndpointer> endpointer_;
     bool force_eou_pending_ = false;
     // VAD-driven EOU scan state: next global mel frame to scan, and the last
@@ -377,11 +366,9 @@ class CacheStreamRunner final : public AsrRunner {
     bool finalized_ = false;
     // True once finalize() begins, so its internal drain step() doesn't fire EOU.
     bool finalizing_ = false;
-    // Tracks whether we've prepended pre_encode_cache_size zero mel frames at
-    // start-of-stream. NeMo's CacheAwareStreamingAudioBuffer does this once
-    // per stream so the encoder's drop_extra_pre_encoded behaviour throws
-    // away zero-pad rather than the leading ~160 ms of real audio.
-    bool stream_zero_padded_ = false;
+    // Reset at an encoder-state boundary, independently of the absolute stream
+    // frame clock. The first chunk has no pre-encoder overlap to discard.
+    bool first_chunk_ = true;
 
     // Encoder output from most recent chunk (column-major (d_model, T_out)).
     std::vector<float> last_enc_out_;

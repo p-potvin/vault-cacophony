@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 #include "magpietts.h"
@@ -78,8 +79,8 @@ validate_config(const MagpieRuntimeConfig& config) {
     if (config.codec_model.empty()) {
         throw std::invalid_argument("NanoCodec model path is required");
     }
-    if (config.threads <= 0) {
-        throw std::invalid_argument("threads must be positive");
+    if (config.threads < 0) {
+        throw std::invalid_argument("threads must be non-negative");
     }
     if (config.codec_threads < 0) {
         throw std::invalid_argument("codec_threads must be non-negative");
@@ -113,6 +114,8 @@ class MagpieTtsRuntime::Impl {
                 config_.magpie_cpu, config_.codec_cpu, config_.verbose)) {
             throw std::runtime_error("failed to load MagpieTTS/NanoCodec GGUFs");
         }
+        tokenizer_profile_ = stream_->tokenizerProfile();
+        text_vocab_size_ = stream_->textVocabSize();
 
         speaker_names_ = stream_->speakerNames();
         if (speaker_names_.empty()) {
@@ -127,6 +130,8 @@ class MagpieTtsRuntime::Impl {
     int speaker_count() const { return stream_->speakerCount(); }
     const std::vector<std::string>& speaker_names() const { return speaker_names_; }
     const std::string& model_name() const { return model_name_; }
+    const std::string& tokenizer_profile() const { return tokenizer_profile_; }
+    int text_vocab_size() const { return text_vocab_size_; }
 
     MagpieSynthesisStats synthesize(
         const std::vector<int32_t>& tokens, const MagpieSynthesisOptions& options,
@@ -165,8 +170,14 @@ class MagpieTtsRuntime::Impl {
         params.warmup_tokens = tokens;
         params.warmup_token_chunks = token_chunks;
         params.speaker = options.speaker >= 0 ? options.speaker : config_.speaker;
-        params.threads = config_.threads;
-        params.codec_threads = config_.codec_threads > 0 ? config_.codec_threads : config_.threads;
+        if (config_.threads > 0) {
+            params.threads = config_.threads;
+        } else {
+            // More busy-waiting CPU workers than hardware threads slows the graphs down.
+            const unsigned hw = std::thread::hardware_concurrency();
+            params.threads = hw > 0 ? std::min(8, static_cast<int>(hw)) : 8;
+        }
+        params.codec_threads = config_.codec_threads > 0 ? config_.codec_threads : params.threads;
         params.seed = options.seed >= 0 ? options.seed : config_.seed;
         params.steps = options.steps > 0 ? options.steps : config_.steps;
         params.top_k = options.top_k > 0 ? options.top_k : config_.top_k;
@@ -257,6 +268,8 @@ class MagpieTtsRuntime::Impl {
     std::unique_ptr<MagpieStreamingRuntime> stream_;
     std::vector<std::string> speaker_names_;
     std::string model_name_;
+    std::string tokenizer_profile_;
+    int text_vocab_size_ = 0;
     std::mutex mutex_;
 };
 
@@ -283,6 +296,16 @@ MagpieTtsRuntime::speaker_names() const {
 const std::string&
 MagpieTtsRuntime::model_name() const {
     return impl_->model_name();
+}
+
+const std::string&
+MagpieTtsRuntime::tokenizer_profile() const {
+    return impl_->tokenizer_profile();
+}
+
+int
+MagpieTtsRuntime::text_vocab_size() const {
+    return impl_->text_vocab_size();
 }
 
 MagpieSynthesisStats

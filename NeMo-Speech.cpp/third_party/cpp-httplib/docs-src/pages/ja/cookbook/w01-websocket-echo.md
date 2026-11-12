@@ -1,6 +1,6 @@
 ---
 title: "W01. WebSocketエコーサーバー／クライアントを実装する"
-order: 51
+order: 52
 status: "draft"
 ---
 
@@ -21,7 +21,12 @@ int main() {
       if (result == httplib::ws::ReadResult::Fail) {
         break;
       }
-      ws.send(msg); // 受け取った内容をそのまま返す
+      // 受け取った内容を同じフレームタイプでそのまま返す
+      if (result == httplib::ws::ReadResult::Binary) {
+        ws.send(msg.data(), msg.size());
+      } else {
+        ws.send(msg);
+      }
     }
   });
 
@@ -29,13 +34,14 @@ int main() {
 }
 ```
 
-`svr.WebSocket()`でWebSocket用のハンドラを登録します。ハンドラが呼ばれた時点で、すでにWebSocketのハンドシェイクは完了しています。ループの中で`ws.read()`して`ws.send()`するだけで、エコー動作が完成します。
+`svr.WebSocket()`でWebSocket用のハンドラを登録します。ハンドラが呼ばれた時点で、すでにWebSocketのハンドシェイクは完了しています。ループの中で`ws.read()`して`ws.send()`するだけで、エコー動作が完成します。バイナリメッセージは`data()`と`size()`を渡すオーバーロードで返すので、バイナリのまま届きます（詳しくは後述）。
 
-`read()`の返り値は`ReadResult`列挙値で、次の3種類です。
+`read()`の返り値は`ReadResult`列挙値で、次の4種類です。
 
 - `ReadResult::Text`: テキストメッセージを受信
 - `ReadResult::Binary`: バイナリメッセージを受信
 - `ReadResult::Fail`: エラー、または接続が閉じた
+- `ReadResult::Timeout`: `set_read_timeout()`で自分が設定した読み取りタイムアウトが、何も受信しないまま経過した。接続は開いたまま。コンパイル時のデフォルトのタイムアウトは接続を閉じ、`Fail`として返る（[W06. タイムアウトを設定する](../w06-websocket-timeouts)を参照）
 
 ## クライアント: エコーを叩く
 
@@ -75,7 +81,7 @@ ws.send(binary_data, binary_data_size);  // バイナリフレーム
 
 ## スレッドとの関係
 
-WebSocket接続はハンドラが終わるまで生き続けるので、1接続につきワーカースレッドを1つ占有します。同時接続数が多い場合は、スレッドプールを動的スケーリングに設定しましょう。
+WebSocket接続はハンドラが終わるまで生き続けるので、1接続につきワーカースレッドを1つ占有します。デフォルトのスレッドプールも負荷に応じてベースの4倍まで増えますが、同時接続数が多い場合は、その最大スレッド数を引き上げましょう。
 
 ```cpp
 svr.new_task_queue = [] {
@@ -85,4 +91,4 @@ svr.new_task_queue = [] {
 
 詳細は[S21. マルチスレッド数を設定する](../s21-thread-pool)を参照してください。
 
-> **Note:** HTTPSサーバーの上でWebSocketを動かしたいときは、`httplib::Server`の代わりに`httplib::SSLServer`を使えば、同じ`WebSocket()`ハンドラがそのまま動きます。クライアント側は`wss://`スキームを指定するだけです。
+> **Note:** HTTPSサーバーの上でWebSocketを動かしたいときは、`httplib::Server`の代わりに`httplib::SSLServer`を使えば、同じ`WebSocket()`ハンドラがそのまま動きます。クライアント側は`wss://`スキームを指定するだけです。CA証明書やクライアント証明書の設定は[W05. wss接続でTLSを設定する](../w05-websocket-tls)を参照してください。

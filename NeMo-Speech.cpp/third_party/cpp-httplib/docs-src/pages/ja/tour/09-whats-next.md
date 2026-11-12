@@ -7,7 +7,7 @@ Tourお疲れさまでした！ cpp-httplibの基本はひと通り押さえま�
 
 ## Streaming API
 
-LLMのストリーミング応答や大きなファイルのダウンロードでは、レスポンス全体をメモリに載せたくないですよね。`stream::Get()` を使えば、データをチャンクごとに処理できます。
+LLMのストリーミング応答や大きなファイルのダウンロードでは、レスポンス全体をメモリに載せたくないですよね。`stream::Get()`を使えば、データをチャンクごとに処理できます。
 
 ```cpp
 httplib::Client cli("http://localhost:11434");
@@ -21,7 +21,9 @@ if (result) {
 }
 ```
 
-`Get()` に `content_receiver` コールバックを渡す方法もあります。こちらはKeep-Aliveと併用できます。
+なお、`stream::Get()`で読めるボディの大きさは、クライアントの`set_payload_max_length()`の上限（デフォルトは100MB）までです。もっと大きなファイルをダウンロードするなら、上限を引き上げるか、0を指定して無制限にしてください。
+
+`Get()`に`content_receiver`コールバックを渡す方法もあります。こちらはKeep-Aliveと併用でき、`set_payload_max_length()`で上限を設定しない限りサイズの制限もありません。
 
 ```cpp
 httplib::Client cli("http://localhost:8080");
@@ -32,7 +34,7 @@ cli.Get("/stream", [](const char *data, size_t len) {
 });
 ```
 
-サーバー側には `set_content_provider()` と `set_chunked_content_provider()` があります。サイズがわかっているなら前者、不明なら後者を使ってください。
+サーバー側には`set_content_provider()`と`set_chunked_content_provider()`があります。サイズがわかっているなら前者、不明なら後者を使ってください。
 
 ```cpp
 // サイズ指定あり（Content-Length が設定される）
@@ -50,12 +52,12 @@ svr.Get("/stream", [](const auto &, auto &res) {
     res.set_chunked_content_provider("text/plain",
         [](size_t offset, httplib::DataSink &sink) {
             sink.write("chunk\n", 6);
-            return true;  // falseを返すと終了
+            return true;  // 終了するときはsink.done()を呼ぶ
         });
 });
 ```
 
-大きなファイルのアップロードには `make_file_provider()` が便利です。ファイルを全部メモリに読み込まず、ストリーミングで送れます。
+大きなファイルのアップロードには`make_file_provider()`が便利です。ファイルを全部メモリに読み込まず、ストリーミングで送れます。
 
 ```cpp
 httplib::Client cli("http://localhost:8080");
@@ -67,7 +69,7 @@ auto res = cli.Post("/upload", {}, {}, {
 
 ## Server-Sent Events (SSE)
 
-SSEクライアントも用意しています。自動再接続や `Last-Event-ID` による再開にも対応しています。
+SSEクライアントも用意しています。自動再接続や`Last-Event-ID`による再開にも対応しています。
 
 ```cpp
 httplib::Client cli("http://localhost:8080");
@@ -155,12 +157,12 @@ svr.set_pre_routing_handler([](const auto &req, auto &res) {
 });
 
 svr.set_post_routing_handler([](const auto &req, auto &res) {
-    // レスポンスが返された後に実行される
+    // レスポンスを送信する直前に実行される
     res.set_header("X-Server", "cpp-httplib");
 });
 ```
 
-`res.user_data` を使うと、ミドルウェアからハンドラーにデータを渡せます。認証トークンのデコード結果を共有するときに便利です。
+`res.user_data`を使うと、ミドルウェアからハンドラーにデータを渡せます。認証トークンのデコード結果を共有するときに便利です。
 
 ```cpp
 svr.set_pre_routing_handler([](const auto &req, auto &res) {
@@ -168,7 +170,7 @@ svr.set_pre_routing_handler([](const auto &req, auto &res) {
     return httplib::Server::HandlerResponse::Unhandled;
 });
 
-svr.Get("/me", [](const auto &req, auto &res) {
+svr.Get("/me", [](const httplib::Request &req, httplib::Response &res) {
     auto *user = res.user_data.get<std::string>("auth_user");
     res.set_content("Hello, " + *user, "text/plain");
 });
@@ -205,14 +207,14 @@ TCP以外に、Unix Domain Socketでの通信にも対応しています。同�
 // サーバー
 httplib::Server svr;
 svr.set_address_family(AF_UNIX);
-svr.listen("/tmp/httplib.sock", 0);
+svr.listen("/tmp/httplib.sock", 80);  // ポート番号は使われない（0以外を渡す）
 ```
 
 ```cpp
 // クライアント
 httplib::Client cli("http://localhost");
 cli.set_address_family(AF_UNIX);
-cli.set_hostname_addr_map({{"localhost", "/tmp/httplib.sock"}});
+cli.set_direct_hostname_addr_map({{"localhost", "/tmp/httplib.sock"}});
 
 auto res = cli.Get("/");
 ```

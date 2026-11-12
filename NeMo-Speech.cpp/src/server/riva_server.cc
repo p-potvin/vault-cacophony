@@ -20,17 +20,21 @@
 #include <thread>
 #include <utility>
 
+#include "engine_registry.h"
 #include "grpc_asr.h"
 #include "model_logging.h"
 #include "parameter_parser.h"
 #include "recognizer.h"
+#include "runtime.h"
 #if defined(NEMO_SPEECH_BUILD_TTS)
 #include "grpc_tts.h"
 #include "tts/magpietts/config.h"
 #include "tts/synthesizer.h"
 #endif
-#if defined(NEMO_SPEECH_BUILD_NMT)
+#if defined(NEMO_SPEECH_GRPC_TRANSLATION)
 #include "grpc_nmt.h"
+#endif
+#if defined(NEMO_SPEECH_BUILD_NMT)
 #include "speech_translator.h"
 #include "translator.h"
 #endif
@@ -121,24 +125,12 @@ struct RivaServerConfig {
     }
 };
 
-#if defined(NEMO_SPEECH_BUILD_TTS)
-void
-configure_cuda_graph_cache_defaults() {
-    if (std::getenv("GGML_CUDA_GRAPH_EVICT_AFTER_MS") != nullptr) {
-        return;
-    }
-    // putenv (not setenv) so there is no _WIN32 branch; the string must outlive
-    // the call, hence static.
-    static char kv[] = "GGML_CUDA_GRAPH_EVICT_AFTER_MS=0";
-    putenv(kv);
-    std::cerr << "[riva_server] defaulting GGML_CUDA_GRAPH_EVICT_AFTER_MS=0"
-              << " to keep CUDA graphs resident across TTS requests\n";
-}
-#endif
 
+// A SALM encoder selects ASR on its own, so a missing LLM path reports the backend's error
+// instead of silently disabling ASR.
 bool
 asr_configured(const AsrServerConfig& cfg) {
-    return !cfg.recognizer.model.path.empty();
+    return !cfg.recognizer.model.path.empty() || !cfg.recognizer.salm.encoder_path.empty();
 }
 
 #if defined(NEMO_SPEECH_BUILD_TTS)
@@ -181,6 +173,11 @@ print_usage(const char* prog) {
               << "  --bind HOST:PORT   listen address (default 0.0.0.0:50051)\n"
               << "  --config FILE      YAML config file (applied before env and CLI)\n\n"
               << "Services are enabled automatically when their required model config is present.\n"
+              << "SALM: --asr.model.path DECODER.gguf (its encoder file next to it)\n"
+              << "      Concurrent Recognize requests are always batched continuously; of the\n"
+              << "      asr.batching.* keys only max_queue_depth applies. StreamingRecognize is\n"
+              << "      unavailable for SALM; StreamingTranslateSpeechTo* recognizes the complete\n"
+              << "      audio at the end of the stream.\n\n"
               << "Use each service's .enabled key to override automatic model detection.\n\n"
               << "Config keys (precedence: defaults < --config YAML < env < CLI):\n"
               << parser.Help() << "  Env: NEMO_SPEECH_<KEY> (dotted key uppercased, '.'->'_').\n";
@@ -347,28 +344,11 @@ main(int argc, char** argv) {
         return 1;
     }
 
-    // The skinny-q8 ggml kernel (see ggml-patches/0005) is an ASR-encoder
-    // optimization; its in-place repack is unsafe for the NMT decoder and its
-    // padded single-token decode is slower than the stock path. The flag is read
-    // once, on the first skinny repack, so set the right env process-wide before
-    // any service warms up:
-    //   * NMT alone: disable skinny (GGML_SKINNY_Q8=0). TTS is fp16 and does not
-    //     use skinny.
-    //   * NMT + ASR: keep skinny for the ASR encoder, force the safe non-in-place
-    //     repack (GGML_SKINNY_Q8_INPLACE=0); NMT then runs skinny.
-    if (enable_nmt) {
-        if (enable_asr) {
-            static char kv[] = "GGML_SKINNY_Q8_INPLACE=0";
-            putenv(kv);
-            std::cerr << "[riva_server] NMT+ASR: forcing GGML_SKINNY_Q8_INPLACE=0 "
-                         "(keep ASR skinny-q8, non-in-place)\n";
-        } else {
-            static char kv[] = "GGML_SKINNY_Q8=0";
-            putenv(kv);
-            std::cerr << "[riva_server] NMT without ASR: forcing GGML_SKINNY_Q8=0 "
-                         "(disable skinny-q8; faster decode)\n";
-        }
+    if (enable_nmt && enable_asr) {
+        ggml_runtime::keep_skinny_q8_weights_separate();
     }
+
+    nemo_speech::EngineRegistry engines;
 
     // Core capabilities outlive the protocol adapters.
     std::shared_ptr<nemo_speech::asr::Recognizer> recognizer;
@@ -383,15 +363,14 @@ main(int argc, char** argv) {
 #if defined(NEMO_SPEECH_BUILD_TTS)
     std::unique_ptr<nemo_speech::GrpcTtsService> tts_service;
 #endif
-#if defined(NEMO_SPEECH_BUILD_NMT)
+#if defined(NEMO_SPEECH_GRPC_TRANSLATION)
     std::unique_ptr<nemo_speech::GrpcNmtService> nmt_service;
 #endif
 
     if (enable_asr) {
         std::cerr << "[riva_server] loading ASR model: " << cfg.asr.recognizer.model.path << "\n";
         try {
-            recognizer =
-                std::make_shared<nemo_speech::asr::Recognizer>(std::move(cfg.asr.recognizer));
+            recognizer = engines.load_asr(std::move(cfg.asr.recognizer));
             // Force lazy graph/session setup before attaching any transport.
             std::cerr << "[riva_server] warming up ASR\n";
             recognizer->warmup();
@@ -405,7 +384,7 @@ main(int argc, char** argv) {
 
 #if defined(NEMO_SPEECH_BUILD_TTS)
     if (enable_tts) {
-        configure_cuda_graph_cache_defaults();
+        ggml_runtime::keep_cuda_graphs_resident();
         std::cerr << "[riva_server] loading MagpieTTS model: "
                   << cfg.tts.server.runtime.magpie_model << "\n";
         std::cerr << "[riva_server] loading NanoCodec model: " << cfg.tts.server.runtime.codec_model
@@ -464,9 +443,14 @@ main(int argc, char** argv) {
             std::make_unique<nemo_speech::GrpcTtsService>(synthesizer, cfg.tts.server.benchmark);
     }
 #endif
+#if defined(NEMO_SPEECH_GRPC_TRANSLATION)
 #if defined(NEMO_SPEECH_BUILD_NMT)
-    if (translator) {
+    if (translator)
         nmt_service = std::make_unique<nemo_speech::GrpcNmtService>(translator, speech_translator);
+#endif
+    if (!nmt_service && recognizer && recognizer->supports_translation()) {
+        nmt_service = std::make_unique<nemo_speech::GrpcNmtService>(nullptr, nullptr, recognizer);
+        std::cerr << "[riva_server] speech-to-text translation by the speech-LLM (no NMT model)\n";
     }
 #endif
     grpc::EnableDefaultHealthCheckService(true);
@@ -481,7 +465,7 @@ main(int argc, char** argv) {
         builder.RegisterService(tts_service.get());
     }
 #endif
-#if defined(NEMO_SPEECH_BUILD_NMT)
+#if defined(NEMO_SPEECH_GRPC_TRANSLATION)
     if (nmt_service) {
         builder.RegisterService(nmt_service.get());
     }
@@ -509,7 +493,7 @@ main(int argc, char** argv) {
     if (tts_service)
         add_service("TTS");
 #endif
-#if defined(NEMO_SPEECH_BUILD_NMT)
+#if defined(NEMO_SPEECH_GRPC_TRANSLATION)
     if (nmt_service)
         add_service("NMT");
 #endif

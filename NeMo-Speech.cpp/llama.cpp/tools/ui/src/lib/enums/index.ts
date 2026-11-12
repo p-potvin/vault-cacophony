@@ -1,23 +1,40 @@
 export {
+	AttachmentLabel,
 	AttachmentType,
 	AttachmentMenuItemId,
 	AttachmentItemEnabledWhen,
-	AttachmentAction,
-	AttachmentItemVisibleWhen
-} from './attachment';
+	AttachmentAction
+} from './attachment.enums';
 
-export { AgenticSectionType, ToolCallType } from './agentic';
+export {
+	AgenticSectionType,
+	ContinueIntentKind,
+	DiffLineKind,
+	ToolResultKind,
+	ToolCallType
+} from './agentic.enums';
 
 export {
 	ChatMessageStatsView,
+	ChatMessageStatisticsMode,
+	StreamConnectionState,
 	ContentPartType,
 	ConversationSelectionMode,
 	ErrorDialogType,
 	MessageRole,
 	MessageType,
 	PdfViewMode,
-	ReasoningFormat
-} from './chat';
+	ReasoningFormat,
+	ChatFormCommandAction,
+	FileMentionEntryType,
+	ChatFormInputRichTokenKind
+} from './chat.enums';
+
+export { SessionRecordType } from './conversation-import.enums';
+
+export { BooleanString } from './boolean-string.enums';
+
+export { ReasoningEffort } from './reasoning-effort.enums';
 
 export {
 	FileTypeCategory,
@@ -29,15 +46,18 @@ export {
 	FileExtensionAudio,
 	FileExtensionPdf,
 	FileExtensionText,
+	MimeTypeApplication,
+	MimeTypeAudio,
+	MimeTypeVideo,
+	MimeTypeImage,
 	MimeTypePrefix,
 	MimeTypeIncludes,
 	UriPattern,
-	MimeTypeApplication,
-	MimeTypeAudio,
-	MimeTypeImage,
 	MimeTypeText,
 	SpecialFileType
-} from './files';
+} from './files.enums';
+
+export { HfEntryType, HfModelSort, SidecarForm } from './huggingface.enums';
 
 export {
 	MCPConnectionPhase,
@@ -47,16 +67,54 @@ export {
 	MCPContentType,
 	MCPRefType,
 	JsonSchemaType
-} from './mcp';
+} from './mcp.enums';
 
-export { ModelModality } from './model';
+export {
+	ModelAuxSidecar,
+	ModelCapability,
+	ModelDraftSidecar,
+	ModelModality,
+	ModelSelectableFileKind
+} from './model.enums';
 
-export { ServerRole, ServerModelStatus } from './server';
+export {
+	ModelDownloadConfirmAction,
+	ModelDownloadStopRequest,
+	ModelGroupKind,
+	ModelRowDownloadState,
+	ModelsTableGroupKind,
+	ModelsTableSortKey
+} from './model.enums';
 
-export { ParameterSource, SyncableParameterType, SettingsFieldType } from './settings';
+export {
+	ServerRole,
+	ServerModelSource,
+	ServerModelStatus,
+	ServerModelsSseEventType
+} from './server.enums';
 
-export { ColorMode, HtmlInputType, McpPromptVariant, TooltipSide, UrlProtocol } from './ui';
+export { ParameterSource, SyncableParameterType, SettingsFieldType } from './settings.enums';
 
-export { KeyboardKey } from './keyboard';
+export {
+	ColorLevel,
+	ColorMode,
+	HtmlInputType,
+	McpPromptVariant,
+	MenuKind,
+	ScrollCarouselVariant,
+	SidebarAction,
+	TooltipSide,
+	UrlProtocol
+} from './ui.enums';
 
-export { ToolSource, ToolPermissionDecision, ToolResponseField } from './tools';
+export { KeyboardKey } from './keyboard.enums';
+
+export {
+	BuiltInTool,
+	GlobSearchType,
+	ToolSource,
+	ToolPermissionDecision,
+	ToolResponseField
+} from './tools.enums';
+
+export { SplashOrientation } from './splash.enums';

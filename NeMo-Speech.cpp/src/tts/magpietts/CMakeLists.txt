@@ -36,6 +36,7 @@ target_include_directories(nemo_speech_tts PUBLIC
 target_link_libraries(nemo_speech_tts PUBLIC
     ggml
     nemo_speech_common
+    nemo_speech_runtime_ggml
     nemo_speech_tts_nanocodec_obj
     nemo_speech_tts_preproc
     nemo_speech_tts_tokenizer_obj
@@ -71,7 +72,8 @@ foreach(target ${MAGPIETTS_TARGETS})
     )
 endforeach()
 
-if(GGML_CUDA)
+# The CUDA sampler runs on ggml's stream, which only the patched ggml exposes.
+if(GGML_CUDA AND NEMO_SPEECH_GGML_PATCHED)
     find_package(CUDAToolkit QUIET)
     if(CUDAToolkit_FOUND AND CUDAToolkit_INCLUDE_DIRS)
         foreach(target ${MAGPIETTS_TARGETS})
@@ -81,8 +83,8 @@ if(GGML_CUDA)
     if(CUDAToolkit_FOUND)
         enable_language(CUDA)
         foreach(target ${MAGPIETTS_TARGETS})
-            target_sources(${target} PRIVATE magpietts_cuda_sampling.cu)
-            target_compile_definitions(${target} PRIVATE GGML_USE_CUDA MAGPIETTS_CUDA_SAMPLING)
+            target_sources(${target} PRIVATE magpietts_cuda_sampling.cu magpietts_lt_fused.cu magpietts_decoder_fused.cu)
+            target_compile_definitions(${target} PRIVATE MAGPIETTS_CUDA_SAMPLING)
             target_link_libraries(${target} PRIVATE CUDA::cudart CUDA::cuda_driver)
             set_target_properties(${target} PROPERTIES
                 CUDA_STANDARD 17
@@ -101,10 +103,4 @@ if(GGML_CUDA)
             endforeach()
         endif()
     endif()
-endif()
-
-if(GGML_METAL)
-    foreach(target ${MAGPIETTS_TARGETS})
-        target_compile_definitions(${target} PRIVATE GGML_USE_METAL)
-    endforeach()
 endif()

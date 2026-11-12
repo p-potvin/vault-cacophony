@@ -2,35 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "engine_registry.h"
+#ifdef NEMO_SPEECH_REGISTRY_SPEECHLM
+#include "salm_recognizer.h"
+#endif
 
-#include <cstdlib>
 #include <stdexcept>
 #include <utility>
 
+#include "runtime.h"
+
 namespace nemo_speech {
-namespace {
-
-#if defined(NEMO_SPEECH_REGISTRY_TTS) || defined(NEMO_SPEECH_REGISTRY_NMT)
-void
-set_environment_default(const char* name, const char* value) {
-    if (std::getenv(name))
-        return;
-#if defined(_WIN32)
-    if (_putenv_s(name, value) != 0)
-        throw std::runtime_error(std::string("could not set process default ") + name);
-#else
-    if (setenv(name, value, 0) != 0)
-        throw std::runtime_error(std::string("could not set process default ") + name);
-#endif
-}
-#endif
-
-}  // namespace
 
 EngineRegistry::EngineRegistry(EngineRegistryConfig config) {
 #if defined(NEMO_SPEECH_REGISTRY_NMT)
-    if (config.nmt)
-        set_environment_default(config.asr ? "GGML_SKINNY_Q8_INPLACE" : "GGML_SKINNY_Q8", "0");
+    if (config.nmt && config.asr)
+        ggml_runtime::keep_skinny_q8_weights_separate();
 #else
     (void)config;
 #endif
@@ -60,7 +46,18 @@ EngineRegistry::diarization() const {
 #if defined(NEMO_SPEECH_REGISTRY_ASR)
 std::shared_ptr<asr::Recognizer>
 EngineRegistry::load_asr(asr::RecognizerConfig config) {
-    auto engine = std::make_shared<asr::Recognizer>(std::move(config));
+    asr::resolve_salm_encoder(config);
+    std::shared_ptr<asr::Recognizer> engine;
+    if (!config.salm.encoder_path.empty()) {
+#ifdef NEMO_SPEECH_REGISTRY_SPEECHLM
+        auto backend = speechlm::make_salm_backend(config);
+        engine = std::make_shared<asr::Recognizer>(std::move(config), std::move(backend));
+#else
+        throw std::invalid_argument("SALM requires NEMO_SPEECH_BUILD_SPEECHLM=ON");
+#endif
+    } else {
+        engine = std::make_shared<asr::Recognizer>(std::move(config));
+    }
     std::lock_guard<std::mutex> lock(mutex_);
 #if defined(NEMO_SPEECH_REGISTRY_DIAR)
     if (diar_from_asr_)
@@ -91,7 +88,7 @@ EngineRegistry::asr() const {
 #if defined(NEMO_SPEECH_REGISTRY_TTS)
 std::shared_ptr<tts::Synthesizer>
 EngineRegistry::load_tts(tts::SynthesizerConfig config) {
-    set_environment_default("GGML_CUDA_GRAPH_EVICT_AFTER_MS", "0");
+    ggml_runtime::keep_cuda_graphs_resident();
     auto engine = std::make_shared<tts::Synthesizer>(std::move(config));
     std::lock_guard<std::mutex> lock(mutex_);
     tts_ = engine;
@@ -111,17 +108,6 @@ EngineRegistry::tts() const {
 #if defined(NEMO_SPEECH_REGISTRY_NMT)
 std::shared_ptr<nmt::Translator>
 EngineRegistry::load_nmt(nmt::TranslatorConfig config) {
-#if defined(NEMO_SPEECH_REGISTRY_ASR)
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (asr_)
-            set_environment_default("GGML_SKINNY_Q8_INPLACE", "0");
-        else
-            set_environment_default("GGML_SKINNY_Q8", "0");
-    }
-#else
-    set_environment_default("GGML_SKINNY_Q8", "0");
-#endif
     auto engine = std::make_shared<nmt::Translator>(std::move(config));
     std::lock_guard<std::mutex> lock(mutex_);
     nmt_ = engine;
@@ -145,6 +131,12 @@ EngineRegistry::speech_translation() const {
     if (!speech_)
         throw std::runtime_error("speech translation requires loaded ASR and NMT engines");
     return speech_;
+}
+
+bool
+EngineRegistry::has_speech_translation() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return speech_ != nullptr;
 }
 #endif
 
@@ -238,6 +230,11 @@ EngineRegistry::capabilities() const {
 #if defined(NEMO_SPEECH_REGISTRY_DIAR)
     if (diar_)
         result.emplace_back("diarization");
+#if defined(NEMO_SPEECH_REGISTRY_ASR)
+    // A speech-LLM recognizer diarizes alone with its encoder's speaker branch.
+    else if (asr_ && asr_->supports_offline_diarization())
+        result.emplace_back("diarization");
+#endif
 #endif
 #if defined(NEMO_SPEECH_REGISTRY_TTS)
     if (tts_)
@@ -253,6 +250,16 @@ EngineRegistry::capabilities() const {
         if (speech_->can_synthesize())
             result.emplace_back("speech-to-speech");
     }
+#endif
+#if defined(NEMO_SPEECH_REGISTRY_ASR)
+    // Without the ASR + NMT composition, a speech-LLM recognizer translates speech itself
+    // (POST /v1/audio/translations).
+    bool composed = false;
+#if defined(NEMO_SPEECH_REGISTRY_SPEECH)
+    composed = speech_ != nullptr;
+#endif
+    if (!composed && asr_ && asr_->supports_translation())
+        result.emplace_back("speech-translation");
 #endif
 #if defined(NEMO_SPEECH_REGISTRY_S2S)
     if (voicechat_)

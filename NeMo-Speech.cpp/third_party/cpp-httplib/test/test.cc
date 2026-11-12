@@ -15,7 +15,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
+#include <clocale>
 #include <cstdio>
 #include <fstream>
 #include <future>
@@ -39,7 +41,10 @@ inline std::string u8_to_string(const char8_t *s) {
 #define SERVER_CERT_FILE "./cert.pem"
 #define SERVER_CERT2_FILE "./cert2.pem"
 #define SERVER_CERT_IP_CN_FILE "./cert_ip_cn.pem"
+#define SERVER_CERT_DNS_CN_FILE "./cert_dns_cn.pem"
 #define SERVER_CERT_IPV6_FILE "./cert_ipv6.pem"
+#define SERVER_CERT_SAN_TYPES_FILE "./cert_san_types.pem"
+#define SERVER_CERT_WILDCARD_SAN_FILE "./cert_wildcard_san.pem"
 #define SERVER_PRIVATE_KEY_FILE "./key.pem"
 #define CA_CERT_FILE "./ca-bundle.crt"
 #define CLIENT_CA_CERT_FILE "./rootCA.cert.pem"
@@ -47,7 +52,13 @@ inline std::string u8_to_string(const char8_t *s) {
 #define CLIENT_CERT_FILE "./client.cert.pem"
 #define CLIENT_PRIVATE_KEY_FILE "./client.key.pem"
 #define CLIENT_ENCRYPTED_CERT_FILE "./client_encrypted.cert.pem"
+// Mbed TLS < 3.6 (e.g. Ubuntu's 2.28) has no PBES2-AES and needs the PBES1-3DES
+// key; 3.6+/4.x (4.x dropped DES) and OpenSSL/wolfSSL use the PBES2 AES key.
+#if defined(CPPHTTPLIB_MBEDTLS_SUPPORT) && (MBEDTLS_VERSION_NUMBER < 0x03060000)
+#define CLIENT_ENCRYPTED_PRIVATE_KEY_FILE "./client_encrypted_pbes1.key.pem"
+#else
 #define CLIENT_ENCRYPTED_PRIVATE_KEY_FILE "./client_encrypted.key.pem"
+#endif
 #define CLIENT_ENCRYPTED_PRIVATE_KEY_PASS "test012!"
 #define SERVER_ENCRYPTED_CERT_FILE "./cert_encrypted.pem"
 #define SERVER_ENCRYPTED_PRIVATE_KEY_FILE "./key_encrypted.pem"
@@ -57,8 +68,27 @@ inline std::string u8_to_string(const char8_t *s) {
 namespace httplib {
 namespace tls {
 // Declared here for the split build, where the TLS abstraction declarations
-// live below the split border; the definition is linked from httplib.cc.
+// live below the split border; the definitions are linked from httplib.cc.
 ca_store_t create_ca_store(const char *pem, size_t len);
+bool set_verify_callback(ctx_t ctx, VerifyCallback callback);
+std::vector<std::string> get_ca_names(ctx_t ctx);
+ctx_t create_server_context();
+void free_context(ctx_t ctx);
+bool set_server_cert_file(ctx_t ctx, const char *cert_path,
+                          const char *key_path, const char *password);
+session_t create_session(ctx_t ctx, socket_t sock);
+void free_session(session_t session);
+bool accept_nonblocking(session_t session, socket_t sock, time_t timeout_sec,
+                        time_t timeout_usec, TlsError *err);
+ssize_t read(session_t session, void *buf, size_t len, TlsError &err);
+ssize_t write(session_t session, const void *buf, size_t len, TlsError &err);
+void shutdown(session_t session, bool graceful);
+#ifdef CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+namespace impl {
+SecTrustSettingsResult
+macos_ssl_trust_settings_result(CFArrayRef trust_settings);
+} // namespace impl
+#endif
 } // namespace tls
 } // namespace httplib
 #endif
@@ -162,6 +192,8 @@ TEST_F(UnixSocketTest, pathname) {
   ASSERT_TRUE(svr.is_running());
 
   client_GET(pathname_);
+  // ".//x.sock", which is not taken for a URL
+  client_GET("./" + pathname_.substr(1));
 }
 
 #if defined(__linux__) ||                                                      \
@@ -293,6 +325,12 @@ TEST(SocketStream, wait_writable_INET) {
   std::thread svr{[&] {
     const int s = socket(AF_INET, SOCK_STREAM, 0);
     ASSERT_LE(0, s);
+    // PORT + 1 is shared with the SSL redirect tests and with
+    // VulnerabilityTest.CRLFInjectionInHeaders, all of which set this. Without
+    // it, a TIME_WAIT one of them left behind makes bind() fail here, and
+    // because that happens on a worker thread the ASSERT does not stop the
+    // test: it runs on and fails at the disconnected_svr_sock check instead.
+    default_socket_options(s);
     ASSERT_EQ(0, ::bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
     ASSERT_EQ(0, listen(s, 1));
     ASSERT_LE(0, disconnected_svr_sock = accept(s, nullptr, nullptr));
@@ -341,6 +379,65 @@ TEST(SetSocketOptTest, TcpNoDelay) {
   detail::close_socket(sock);
 }
 
+TEST(AcceptErrorTest, RetryableFailuresAreClassifiedPerPlatform) {
+  // accept() reports failures through WSAGetLastError() on Windows and through
+  // errno everywhere else. Asking the wrong one is what made the accept loop
+  // treat every recoverable failure as fatal on Windows.
+  struct Classification {
+    bool resource;
+    bool transient;
+  };
+
+  auto classify = [](int err) {
+#ifdef _WIN32
+    WSASetLastError(err);
+#else
+    errno = err;
+#endif
+    // Read both before asserting: an assertion may clobber the error slot.
+    Classification c;
+    c.resource = detail::is_accept_resource_error();
+    c.transient = detail::is_accept_transient_error();
+    return c;
+  };
+
+#ifdef _WIN32
+  const std::vector<int> resource_errors = {WSAEMFILE, WSAENOBUFS};
+  const std::vector<int> transient_errors = {WSAEINTR, WSAEWOULDBLOCK,
+                                             WSAECONNRESET, WSAECONNABORTED};
+  const std::vector<int> fatal_errors = {WSAENOTSOCK, WSAEINVAL, WSAEOPNOTSUPP};
+#else
+  const std::vector<int> resource_errors = {EMFILE, ENFILE, ENOBUFS, ENOMEM};
+  const std::vector<int> transient_errors = {EINTR, EAGAIN, EWOULDBLOCK,
+                                             ECONNABORTED};
+  const std::vector<int> fatal_errors = {EBADF, EINVAL, ENOTSOCK};
+#endif
+
+  for (auto err : resource_errors) {
+    const auto c = classify(err);
+    EXPECT_TRUE(c.resource) << "error " << err;
+    EXPECT_FALSE(c.transient) << "error " << err;
+  }
+
+  for (auto err : transient_errors) {
+    const auto c = classify(err);
+    EXPECT_TRUE(c.transient) << "error " << err;
+    EXPECT_FALSE(c.resource) << "error " << err;
+  }
+
+  for (auto err : fatal_errors) {
+    const auto c = classify(err);
+    EXPECT_FALSE(c.resource) << "error " << err;
+    EXPECT_FALSE(c.transient) << "error " << err;
+  }
+
+#ifdef _WIN32
+  WSASetLastError(0);
+#else
+  errno = 0;
+#endif
+}
+
 TEST(ClientTest, MoveConstructible) {
   EXPECT_FALSE(std::is_copy_constructible<Client>::value);
   EXPECT_TRUE(std::is_nothrow_move_constructible<Client>::value);
@@ -384,8 +481,10 @@ TEST(DecodePathTest, UnicodeEncoding) {
   EXPECT_EQ(U8("あ"), decode_path_component("%u3042"));
   // %uFFFF = max 4-digit hex (3-byte UTF-8, must not overflow buff[4])
   EXPECT_FALSE(decode_path_component("%uFFFF").empty());
-  // %uD800 = surrogate (invalid, silently dropped)
-  EXPECT_EQ("", decode_path_component("%uD800"));
+  // %uD800 = surrogate (invalid, kept as it is rather than joining its
+  // neighbours)
+  EXPECT_EQ("%uD800", decode_path_component("%uD800"));
+  EXPECT_EQ("/ad%uD800min", decode_path_component("/ad%uD800min"));
 }
 
 TEST(DecodeQueryTest, RejectsNonHexEscapes) {
@@ -418,6 +517,264 @@ TEST(SanitizeFilenameTest, VariousPatterns) {
             httplib::sanitize_filename(std::string("safe\0.txt", 9)));
   // Whitespace-only rejected
   EXPECT_EQ("", httplib::sanitize_filename("   "));
+}
+
+// On Windows a ':' ends a drive prefix or names an NTFS stream, so what comes
+// before it is dropped; anywhere else it is an ordinary file name character.
+TEST(SanitizeFilenameTest, ColonEndsPrefixOnlyOnWindows) {
+#ifdef _WIN32
+  EXPECT_EQ("", httplib::sanitize_filename("C:.."));
+  EXPECT_EQ("evil.dll", httplib::sanitize_filename("C:evil.dll"));
+  EXPECT_EQ("stream", httplib::sanitize_filename("a.txt:stream"));
+#else
+  EXPECT_EQ("C:..", httplib::sanitize_filename("C:.."));
+  EXPECT_EQ("C:evil.dll", httplib::sanitize_filename("C:evil.dll"));
+  EXPECT_EQ("a.txt:stream", httplib::sanitize_filename("a.txt:stream"));
+#endif
+}
+
+// Forward declaration (see the base64_encode note below): split builds move the
+// definition into httplib.cc, so re-declaring it here lets the test link.
+namespace httplib {
+namespace detail {
+bool is_chunked_transfer_encoding(const Headers &headers);
+} // namespace detail
+} // namespace httplib
+
+TEST(ChunkedTransferEncodingTest, DetectsChunkedAsFinalCoding) {
+  // Build a Headers with the given Transfer-Encoding lines (nullptr = none).
+  auto make = [](std::initializer_list<const char *> lines) {
+    Headers h;
+    for (auto te : lines) {
+      if (te) { h.emplace("Transfer-Encoding", te); }
+    }
+    return h;
+  };
+
+  // Sole coding, matched case-insensitively.
+  EXPECT_TRUE(detail::is_chunked_transfer_encoding(make({"chunked"})));
+  EXPECT_TRUE(detail::is_chunked_transfer_encoding(make({"Chunked"})));
+  EXPECT_TRUE(detail::is_chunked_transfer_encoding(make({"CHUNKED"})));
+
+  // RFC 9112 6.1: chunked as the final coding of a list still frames the body.
+  EXPECT_TRUE(detail::is_chunked_transfer_encoding(make({"gzip, chunked"})));
+  EXPECT_TRUE(detail::is_chunked_transfer_encoding(make({"gzip,chunked"})));
+  EXPECT_TRUE(detail::is_chunked_transfer_encoding(make({"gzip, Chunked "})));
+
+  // Single line: chunked absent, or not the final coding -> not chunk-framed.
+  EXPECT_FALSE(detail::is_chunked_transfer_encoding(make({"gzip"})));
+  EXPECT_FALSE(detail::is_chunked_transfer_encoding(make({"chunked, gzip"})));
+  EXPECT_FALSE(detail::is_chunked_transfer_encoding(make({""})));
+  EXPECT_FALSE(detail::is_chunked_transfer_encoding(make({nullptr})));
+
+  // RFC 9110 5.3: multiple Transfer-Encoding lines combine, in the order they
+  // were received, into one list. Headers preserves that order, so the answer
+  // is decided by the last coding of the last line and the order the lines
+  // arrived in is significant.
+  EXPECT_TRUE(detail::is_chunked_transfer_encoding(make({"gzip", "chunked"})));
+  EXPECT_FALSE(detail::is_chunked_transfer_encoding(make({"chunked", "gzip"})));
+  EXPECT_FALSE(detail::is_chunked_transfer_encoding(make({"gzip", "deflate"})));
+
+  // The split can fall anywhere in the list.
+  EXPECT_TRUE(
+      detail::is_chunked_transfer_encoding(make({"deflate", "gzip, chunked"})));
+  EXPECT_FALSE(
+      detail::is_chunked_transfer_encoding(make({"gzip, chunked", "deflate"})));
+
+  // A trailing line naming no coding leaves the list ending in nothing, so it
+  // must not inherit the chunked from the line before it.
+  EXPECT_FALSE(detail::is_chunked_transfer_encoding(make({"chunked", ""})));
+}
+
+// Forward declarations (see the base64_encode note below).
+namespace httplib {
+namespace detail {
+bool parse_status_line(const char *line, std::string &version, int &status,
+                       std::string &reason);
+std::string file_extension(const std::string &path);
+std::string
+find_content_type(const std::string &path,
+                  const std::map<std::string, std::string> &user_data,
+                  const std::string &default_content_type);
+bool can_compress_content_type(const std::string &content_type);
+bool is_prohibited_header_name(const std::string &name);
+bool is_valid_path(const std::string &path);
+#ifdef CPPHTTPLIB_SSL_ENABLED
+bool match_hostname(const std::string &pattern, const std::string &hostname);
+#endif
+} // namespace detail
+} // namespace httplib
+
+TEST(ParseStatusLineTest, ParsesVersionStatusAndReason) {
+  struct {
+    const char *line;
+    const char *version;
+    int status;
+    const char *reason;
+  } cases[] = {
+      {"HTTP/1.1 200 OK\r\n", "HTTP/1.1", 200, "OK"},
+      {"HTTP/1.0 404 Not Found\r\n", "HTTP/1.0", 404, "Not Found"},
+      // The reason phrase may be empty, or left out along with its space.
+      {"HTTP/1.1 204 \r\n", "HTTP/1.1", 204, ""},
+      {"HTTP/1.1 304\r\n", "HTTP/1.1", 304, ""},
+  };
+
+  for (const auto &c : cases) {
+    std::string version;
+    int status = 0;
+    std::string reason = "unset";
+    EXPECT_TRUE(detail::parse_status_line(c.line, version, status, reason))
+        << c.line;
+    EXPECT_EQ(c.version, version);
+    EXPECT_EQ(c.status, status);
+    EXPECT_EQ(c.reason, reason);
+  }
+}
+
+TEST(ParseStatusLineTest, RejectsMalformedLines) {
+  const char *lines[] = {
+      "HTTP/2 200 OK\r\n",
+      "HTTP/1.2 200 OK\r\n",
+      "HTTP/1.1 20 OK\r\n",
+      "HTTP/1.1 2000 OK\r\n",
+      "HTTP/1.1 2x0 OK\r\n",
+      "HTTP/1.1  200 OK\r\n",
+      "HTTP/1.1 200OK\r\n",
+      "HTTP/1.1 200 O\rK\r\n",
+      "HTTP/1.1 200 OK",
+      "HTTP/1.1 200 OK\r\nX",
+      "",
+#ifndef CPPHTTPLIB_ALLOW_LF_AS_LINE_TERMINATOR
+      "HTTP/1.1 200 OK\n",
+#endif
+  };
+
+  for (auto line : lines) {
+    std::string version;
+    int status = 0;
+    std::string reason;
+    EXPECT_FALSE(detail::parse_status_line(line, version, status, reason))
+        << line;
+  }
+}
+
+TEST(ParseStatusLineTest, AcceptsAReasonPhraseAsLongAsALine) {
+  // Long enough to overflow the stack when matched with std::regex.
+  auto long_reason = std::string(CPPHTTPLIB_MAX_LINE_LENGTH - 15, 'A');
+  auto line = "HTTP/1.1 200 " + long_reason + "\r\n";
+
+  std::string version;
+  int status = 0;
+  std::string reason;
+  EXPECT_TRUE(detail::parse_status_line(line.c_str(), version, status, reason));
+  EXPECT_EQ(200, status);
+  EXPECT_EQ(long_reason, reason);
+}
+
+TEST(FileExtensionTest, TakesTheAlphanumericSuffix) {
+  EXPECT_EQ("txt", detail::file_extension("a.txt"));
+  EXPECT_EQ("gz", detail::file_extension("/dir/a.tar.gz"));
+  EXPECT_EQ("htaccess", detail::file_extension(".htaccess"));
+  EXPECT_EQ("", detail::file_extension("noext"));
+  EXPECT_EQ("", detail::file_extension("a."));
+  EXPECT_EQ("", detail::file_extension("dir.d/file"));
+  EXPECT_EQ("", detail::file_extension("a.b-c"));
+
+  // Long enough to overflow the stack when matched with std::regex.
+  auto long_ext = std::string(CPPHTTPLIB_MAX_LINE_LENGTH, 'a');
+  EXPECT_EQ(long_ext, detail::file_extension("a." + long_ext));
+}
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+TEST(MatchHostnameTest, FollowsX509CheckHost) {
+  EXPECT_TRUE(detail::match_hostname("*.example.com", "www.example.com"));
+  EXPECT_TRUE(detail::match_hostname("www*.example.com", "www1.example.com"));
+  EXPECT_TRUE(detail::match_hostname("www.example.com", "WWW.example.com."));
+
+  // A wildcard needs two labels after it, in the leftmost label only
+  EXPECT_FALSE(detail::match_hostname("*.com", "example.com"));
+  EXPECT_FALSE(detail::match_hostname("*", "localhost"));
+  EXPECT_FALSE(detail::match_hostname("vic*.test", "victim.test"));
+  EXPECT_FALSE(detail::match_hostname("www.*.com", "www.a.com"));
+  EXPECT_FALSE(
+      detail::match_hostname("xn--*.example.com", "xn--a.example.com"));
+
+  // No name may have an empty label
+  EXPECT_FALSE(detail::match_hostname("*.example.com", "a..example.com"));
+  EXPECT_FALSE(detail::match_hostname("a..example.com", "a.example.com"));
+}
+#endif
+
+TEST(CaseIgnoreHashTest, IgnoresCaseAndTakesLongKeys) {
+  detail::case_ignore::hash hash;
+  EXPECT_EQ(hash("Content-Type"), hash("content-TYPE"));
+  EXPECT_NE(hash("Content-Type"), hash("Content-Length"));
+
+  // Long enough to overflow the stack if hashed one call per character.
+  EXPECT_EQ(hash(std::string(1 << 20, 'A')), hash(std::string(1 << 20, 'a')));
+}
+
+TEST(FindContentTypeTest, ComparesWholeExtensions) {
+  EXPECT_EQ("text/html", detail::find_content_type("/a.html", {}, ""));
+  EXPECT_EQ("image/svg+xml", detail::find_content_type("/a.svg", {}, ""));
+  EXPECT_EQ("text/javascript", detail::find_content_type("/a.js", {}, ""));
+  EXPECT_EQ("text/html", detail::find_content_type("/INDEX.HTML", {}, ""));
+
+  // Same 26-bit hash as html, svg and js.
+  EXPECT_EQ("", detail::find_content_type("/a.qo2yh", {}, ""));
+  EXPECT_EQ("", detail::find_content_type("/a.q4g", {}, ""));
+  EXPECT_EQ("", detail::find_content_type("/a.l5", {}, ""));
+}
+
+TEST(IsValidPathTest, RejectsSegmentsEndingInDotOrSpace) {
+  for (auto path : {"/a.", "/a ", "/dir./a", "/dir /a", "/..."}) {
+    EXPECT_FALSE(detail::is_valid_path(path)) << path;
+  }
+}
+
+// ':' names an NTFS stream on Windows and is an ordinary character in a file
+// name anywhere else.
+TEST(IsValidPathTest, ColonIsRejectedOnlyOnWindows) {
+  for (auto path : {"/a.txt::$DATA", "/a.txt:Zone.Identifier", "/dir:x/a"}) {
+#ifdef _WIN32
+    EXPECT_FALSE(detail::is_valid_path(path)) << path;
+#else
+    EXPECT_TRUE(detail::is_valid_path(path)) << path;
+#endif
+  }
+}
+
+TEST(CanCompressContentTypeTest, ComparesWholeTypes) {
+  EXPECT_TRUE(detail::can_compress_content_type("application/json"));
+  EXPECT_TRUE(detail::can_compress_content_type("text/plain; charset=utf-8"));
+  EXPECT_FALSE(detail::can_compress_content_type("text/event-stream"));
+  EXPECT_FALSE(detail::can_compress_content_type("image/png"));
+  EXPECT_TRUE(detail::can_compress_content_type("Application/JSON"));
+  EXPECT_FALSE(detail::can_compress_content_type("Text/Event-Stream"));
+
+  // Same 26-bit hash as application/json.
+  EXPECT_FALSE(detail::can_compress_content_type("VY_LQ"));
+}
+
+TEST(MultipartFormDataTest, MediaTypeIgnoresCase) {
+  Request req;
+  req.set_header("Content-Type", "Multipart/Form-Data; Boundary=x");
+  EXPECT_TRUE(req.is_multipart_form_data());
+
+  std::string boundary;
+  EXPECT_TRUE(detail::parse_multipart_boundary(
+      req.get_header_value("Content-Type"), boundary));
+  EXPECT_EQ("x", boundary);
+}
+
+TEST(ProhibitedHeaderNameTest, ComparesWholeNames) {
+  EXPECT_TRUE(detail::is_prohibited_header_name("REMOTE_ADDR"));
+  EXPECT_TRUE(detail::is_prohibited_header_name("LOCAL_PORT"));
+  EXPECT_FALSE(detail::is_prohibited_header_name("Host"));
+  EXPECT_TRUE(detail::is_prohibited_header_name("remote_addr"));
+
+  // Same 26-bit hash as REMOTE_ADDR.
+  EXPECT_FALSE(detail::is_prohibited_header_name("IIJRp"));
 }
 
 // Forward declaration: in split builds split.py strips `inline` and moves the
@@ -484,7 +841,7 @@ TEST(ClientQueryOrder, PreserveOrder) {
 
   const std::string original = "/?z=1&y=2&x=3&c=7&b=8&a=9";
   auto res = cli.Get(original);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
 
   // Expect the echoed target to exactly match the original path (order
   // preserved)
@@ -650,6 +1007,22 @@ TEST(DecodeUriTest, TestRoundTripWithEncodeUri) {
   string decoded = httplib::decode_uri(encoded);
 
   EXPECT_EQ(decoded, original);
+}
+
+TEST(DecodeUriTest, KeepsReservedCharacterEscapes) {
+  // decode_uri is the inverse of encode_uri: an escaped reserved character
+  // stays encoded so it is not promoted into a real delimiter, while
+  // non-reserved escapes still decode (like JS decodeURI).
+  EXPECT_EQ(httplib::decode_uri("%2F"), "%2F");
+  EXPECT_EQ(httplib::decode_uri("%23"), "%23");
+  EXPECT_EQ(httplib::decode_uri("%3F%3A%40%26%3D%2B%24%2C%3B"),
+            "%3F%3A%40%26%3D%2B%24%2C%3B");
+  EXPECT_EQ(httplib::decode_uri("%2D"), "-");
+  EXPECT_EQ(httplib::decode_uri("%20"), " ");
+  EXPECT_EQ(httplib::decode_uri("http://example.com/a%2Fb"),
+            "http://example.com/a%2Fb");
+  // decode_uri_component still decodes the reserved character.
+  EXPECT_EQ(httplib::decode_uri_component("%2F"), "/");
 }
 
 TEST(DecodeUriComponentTest, TestRoundTripWithEncodeUriComponent) {
@@ -917,6 +1290,10 @@ TEST(ParseAcceptHeaderTest, InvalidCases) {
   EXPECT_FALSE(detail::parse_accept_header(
       "text/html;q=invalid,application/json", result));
 
+  // A valid numeric prefix does not make the entire quality value valid.
+  EXPECT_FALSE(detail::parse_accept_header(
+      "text/html;q=0.5junk,application/json", result));
+
   // Empty quality value
   EXPECT_FALSE(
       detail::parse_accept_header("text/html;q=,application/json", result));
@@ -924,14 +1301,6 @@ TEST(ParseAcceptHeaderTest, InvalidCases) {
   // Invalid media type format (no slash and not wildcard)
   EXPECT_FALSE(
       detail::parse_accept_header("invalidtype,application/json", result));
-
-  // Empty media type
-  result.clear();
-  EXPECT_FALSE(detail::parse_accept_header(",application/json", result));
-
-  // Only commas
-  result.clear();
-  EXPECT_FALSE(detail::parse_accept_header(",,,", result));
 
   // Valid cases should still work
   EXPECT_TRUE(detail::parse_accept_header("*/*", result));
@@ -945,6 +1314,71 @@ TEST(ParseAcceptHeaderTest, InvalidCases) {
   EXPECT_TRUE(detail::parse_accept_header("text/*", result));
   EXPECT_EQ(result.size(), 1U);
   EXPECT_EQ(result[0], "text/*");
+}
+
+// RFC 9110 Section 5.6.1.2: a recipient has to parse and ignore empty list
+// elements, so a leading, trailing or doubled comma is a legal Accept value
+// and must not be answered with 400 Bad Request.
+TEST(ParseAcceptHeaderTest, EmptyListElementsAreIgnored) {
+  struct {
+    const char *value;
+    std::vector<std::string> expected;
+  } cases[] = {
+      {",application/json", {"application/json"}},
+      {"text/html,", {"text/html"}},
+      {"text/html,,*/*", {"text/html", "*/*"}},
+      // An empty element may be spelled with whitespace in it
+      {"text/html, , application/json", {"text/html", "application/json"}},
+      // Nothing but empty elements is an empty list, which means the same
+      // thing as no Accept header at all
+      {",,,", {}},
+      // Quality values still apply across ignored empty elements
+      {",text/html;q=0.5,,application/json", {"application/json", "text/html"}},
+  };
+
+  for (const auto &c : cases) {
+    std::vector<std::string> result;
+    EXPECT_TRUE(detail::parse_accept_header(c.value, result))
+        << "value: " << c.value;
+    EXPECT_EQ(c.expected, result) << "value: " << c.value;
+  }
+
+  // An invalid entry is still rejected when empty elements surround it
+  std::vector<std::string> result;
+  EXPECT_FALSE(detail::parse_accept_header(",invalidtype,", result));
+}
+
+// RFC 9110 Section 5.6.6: a parameter value may be a quoted-string, and a ','
+// or ';' inside one does not end the list element or the parameter. Section
+// 5.6.4: nor does a '"' that a backslash escapes end the quoted-string.
+TEST(ParseAcceptHeaderTest, DelimitersInQuotedParameterValues) {
+  struct {
+    const char *value;
+    std::vector<std::string> expected;
+  } cases[] = {
+      {"text/html;profile=\"a,b\",application/json",
+       {"text/html", "application/json"}},
+      // A "q=" inside a quoted value is not the weight
+      {"text/html;profile=\"a;q=0.1\",application/json;q=0.5",
+       {"text/html", "application/json"}},
+      // The weight after a quoted value still applies
+      {"text/html;profile=\"a,b;q=0.1\";q=0.8,application/json;q=0.9",
+       {"application/json", "text/html"}},
+      {"text/html;profile=\"a\\\",b\";q=0.8,application/json;q=0.9",
+       {"application/json", "text/html"}},
+      {"text/html;profile=\"a\\\"b\",application/json",
+       {"text/html", "application/json"}},
+      // An escaped backslash does not escape the '"' after it
+      {"text/html;profile=\"a\\\\\",application/json",
+       {"text/html", "application/json"}},
+  };
+
+  for (const auto &c : cases) {
+    std::vector<std::string> result;
+    EXPECT_TRUE(detail::parse_accept_header(c.value, result))
+        << "value: " << c.value;
+    EXPECT_EQ(c.expected, result) << "value: " << c.value;
+  }
 }
 
 TEST(ParseAcceptHeaderTest, ContentTypesPopulatedAndInvalidHeaderHandling) {
@@ -978,14 +1412,14 @@ TEST(ParseAcceptHeaderTest, ContentTypesPopulatedAndInvalidHeaderHandling) {
     auto res = cli.Get(
         "/accept_ok",
         Headers{{"Accept", "application/json, text/html;q=0.8, */*;q=0.1"}});
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
 
   {
     auto res = cli.Get("/accept_bad_request",
                        Headers{{"Accept", "text/html;q=abc,application/json"}});
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::BadRequest_400, res->status);
   }
 }
@@ -1018,7 +1452,7 @@ TEST(ServerStartHandlerTest, CalledOnceWhenReady) {
   Client cli(HOST, port);
   cli.set_connection_timeout(std::chrono::seconds(5));
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 
   EXPECT_EQ(1, start_count.load());
@@ -1174,6 +1608,271 @@ TEST(ParamsToQueryTest, ConvertParamsToQuery) {
   EXPECT_EQ(detail::params_to_query_str(dic), "key1=val1&key2=val2&key3=val3");
 }
 
+TEST(AppendQueryParamsTest, JoinsAnExistingQuery) {
+  Params params;
+  params.emplace("a", "1");
+
+  EXPECT_EQ("/p?a=1", append_query_params("/p", params));
+  EXPECT_EQ("/p?x=0&a=1", append_query_params("/p?x=0", params));
+  EXPECT_EQ("/p?&a=1", append_query_params("/p?", params));
+  EXPECT_EQ("?x=0&a=1", append_query_params("?x=0", params));
+
+  // Long enough to overflow the stack when matched with std::regex.
+  auto long_query = std::string(CPPHTTPLIB_MAX_LINE_LENGTH, 'x');
+  EXPECT_EQ("/p?" + long_query + "&a=1",
+            append_query_params("/p?" + long_query, params));
+}
+
+// Joins every entry of a Headers or Params into "key=value " so a whole
+// traversal can be compared in one assertion. Both are instantiations of the
+// same insertion-ordered container, so one helper serves both.
+template <typename Map> static std::string entries_to_string(const Map &m) {
+  std::string s;
+  for (const auto &entry : m) {
+    s += entry.first + "=" + entry.second + " ";
+  }
+  return s;
+}
+
+TEST(ParamsOrderTest, QueryIsBuiltInInsertionOrderNotSorted) {
+  // Params used to be a std::multimap, which sorted by name and handed the
+  // caller's query back alphabetised. A client signing its query string could
+  // not reproduce the order it asked for.
+  Params dic;
+  dic.emplace("zulu", "1");
+  dic.emplace("alpha", "2");
+  dic.emplace("mike", "3");
+
+  EXPECT_EQ("zulu=1&alpha=2&mike=3", detail::params_to_query_str(dic));
+  EXPECT_EQ("/p?zulu=1&alpha=2&mike=3", append_query_params("/p", dic));
+}
+
+TEST(ParamsOrderTest, ParsingKeepsTheOrderReceived) {
+  Params dic;
+  detail::parse_query_text("zulu=1&alpha=2&mike=3", dic);
+
+  EXPECT_EQ("zulu=1 alpha=2 mike=3 ", entries_to_string(dic));
+}
+
+TEST(ParamsOrderTest, RepeatedNamesKeepTheirOrder) {
+  Request req;
+  detail::parse_query_text("tag=first&other=x&tag=second&tag=third",
+                           req.params);
+
+  EXPECT_EQ(3U, req.get_param_value_count("tag"));
+  EXPECT_EQ("first", req.get_param_value("tag"));
+  EXPECT_EQ("first", req.get_param_value("tag", 0));
+  EXPECT_EQ("second", req.get_param_value("tag", 1));
+  EXPECT_EQ("third", req.get_param_value("tag", 2));
+  EXPECT_EQ("", req.get_param_value("tag", 3));
+}
+
+TEST(ParamsOrderTest, LookupStaysCaseSensitive) {
+  // Params shares its container with Headers, which matches field names
+  // case-insensitively. Parameter names must not pick that up.
+  Params dic;
+  dic.emplace("Key", "upper");
+  dic.emplace("key", "lower");
+
+  EXPECT_EQ(2U, dic.size());
+  EXPECT_EQ(1U, dic.count("Key"));
+  EXPECT_EQ(1U, dic.count("key"));
+  EXPECT_EQ("upper", dic.find("Key")->second);
+  EXPECT_EQ("lower", dic.find("key")->second);
+  EXPECT_TRUE(dic.find("KEY") == dic.end());
+}
+
+TEST(ParamsOrderTest, ServerSeesTheOrderTheClientSent) {
+  Server svr;
+  std::string order;
+  svr.Get("/order", [&](const Request &req, Response &res) {
+    order = entries_to_string(req.params);
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/order?zulu=1&alpha=2&tag=x&mike=3&tag=y");
+  ASSERT_TRUE(res);
+  EXPECT_EQ("zulu=1 alpha=2 tag=x mike=3 tag=y ", order);
+}
+
+TEST(MultipartOrderTest, PartsKeepTheOrderSent) {
+  Server svr;
+  std::string field_order, file_order;
+  svr.Post("/order", [&](const Request &req, Response &res) {
+    for (const auto &field : req.form.fields) {
+      field_order += field.first + "=" + field.second.content + " ";
+    }
+    for (const auto &file : req.form.files) {
+      file_order += file.first + "=" + file.second.filename + " ";
+    }
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  UploadFormDataItems items = {
+      {"zulu", "1", "", ""},
+      {"alpha", "2", "", ""},
+      {"mike", "3", "", ""},
+      {"zebra", "z", "z.txt", "text/plain"},
+      {"apple", "a", "a.txt", "text/plain"},
+  };
+
+  Client cli(HOST, port);
+  auto res = cli.Post("/order", items);
+  ASSERT_TRUE(res);
+  EXPECT_EQ("zulu=1 alpha=2 mike=3 ", field_order);
+  EXPECT_EQ("zebra=z.txt apple=a.txt ", file_order);
+}
+
+TEST(MultipartOrderTest, RepeatedNamesKeepTheirOrder) {
+  Server svr;
+  std::vector<std::string> values;
+  std::string first, second, out_of_range, order;
+  svr.Post("/repeated", [&](const Request &req, Response &res) {
+    values = req.form.get_fields("tag");
+    first = req.form.get_field("tag", 0);
+    second = req.form.get_field("tag", 1);
+    out_of_range = req.form.get_field("tag", 2);
+    for (const auto &field : req.form.fields) {
+      order += field.first + "=" + field.second.content + " ";
+    }
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  // "other" sits between the two "tag" parts, so the entries sharing a name are
+  // not adjacent in the container.
+  UploadFormDataItems items = {
+      {"tag", "first", "", ""},
+      {"other", "x", "", ""},
+      {"tag", "second", "", ""},
+  };
+
+  Client cli(HOST, port);
+  auto res = cli.Post("/repeated", items);
+  ASSERT_TRUE(res);
+  ASSERT_EQ(2U, values.size());
+  EXPECT_EQ("first", values[0]);
+  EXPECT_EQ("second", values[1]);
+  EXPECT_EQ("first", first);
+  EXPECT_EQ("second", second);
+
+  // std::multimap already kept entries sharing a name in insertion order, so
+  // everything above passes without this change too. The whole traversal is
+  // what tells the two apart: sorting by name would hoist "other" to the front
+  // and the two "tag" parts would end up adjacent.
+  EXPECT_EQ("tag=first other=x tag=second ", order);
+
+  // Advancing past the last entry of a name used to run off the container;
+  // the container's saturating increment makes it return the default instead.
+  EXPECT_EQ("", out_of_range);
+}
+
+TEST(MultipartFormDataTest, BackslashesInNamesSurvive) {
+  Server svr;
+  std::string file_names;
+  svr.Post("/upload", [&](const Request &req, Response &res) {
+    for (const auto &file : req.form.files) {
+      file_names += file.first + "|" + file.second.filename + " ";
+    }
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  // A trailing backslash would otherwise escape the closing quote.
+  UploadFormDataItems items = {
+      {"dir\\", "x", "a.txt", "text/plain"},
+      {"b", "y", "a\\\\b.txt", "text/plain"},
+  };
+
+  Client cli(HOST, port);
+  auto res = cli.Post("/upload", items);
+  ASSERT_TRUE(res);
+  EXPECT_EQ("dir\\|a.txt b|a\\\\b.txt ", file_names);
+}
+
+TEST(MultipartOrderTest, ContentSurvivesContainerGrowth) {
+  // Server::read_content() keeps a FormFields::iterator alive across the
+  // content callbacks that fill the part it points at. The container is
+  // vector-backed, so a later emplace can reallocate and invalidate an older
+  // iterator; 64 parts grow the vector through seven reallocations, which
+  // checks that every part's content still lands in its own entry.
+  const size_t part_count = 64;
+
+  // One formula for both the parts sent and the values expected back, so the
+  // two cannot drift apart.
+  auto name_of = [](size_t i) { return "f" + std::to_string(i); };
+  auto content_of = [](size_t i) {
+    return std::string(64, static_cast<char>('a' + (i % 26)));
+  };
+
+  Server svr;
+  std::vector<std::pair<std::string, std::string>> received;
+  svr.Post("/many", [&](const Request &req, Response &res) {
+    for (const auto &field : req.form.fields) {
+      received.emplace_back(field.first, field.second.content);
+    }
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  UploadFormDataItems items;
+  for (size_t i = 0; i < part_count; i++) {
+    items.push_back({name_of(i), content_of(i), "", ""});
+  }
+
+  Client cli(HOST, port);
+  auto res = cli.Post("/many", items);
+  ASSERT_TRUE(res);
+  ASSERT_EQ(part_count, received.size());
+  for (size_t i = 0; i < part_count; i++) {
+    EXPECT_EQ(name_of(i), received[i].first) << "part " << i;
+    EXPECT_EQ(content_of(i), received[i].second) << "part " << i;
+  }
+}
+
 TEST(ParseMultipartBoundaryTest, DefaultValue) {
   string content_type = "multipart/form-data; boundary=something";
   string boundary;
@@ -1206,6 +1905,202 @@ TEST(ParseMultipartBoundaryTest, ValueWithQuotesAndCharset) {
   auto ret = detail::parse_multipart_boundary(content_type, boundary);
   EXPECT_TRUE(ret);
   EXPECT_EQ(boundary, "cpp-httplib-multipart-data");
+}
+
+TEST(ParseMultipartBoundaryTest, LongestAllowedValue) {
+  const string boundary(70, 'a');
+  string content_type = "multipart/form-data; boundary=" + boundary;
+  string parsed;
+  auto ret = detail::parse_multipart_boundary(content_type, parsed);
+  EXPECT_TRUE(ret);
+  EXPECT_EQ(parsed, boundary);
+}
+
+TEST(ParseMultipartBoundaryTest, ValueLongerThanRFCLimit) {
+  // RFC 2046 5.1.1 caps a boundary at 70 characters.
+  string content_type = "multipart/form-data; boundary=" + string(71, 'a');
+  string parsed;
+  auto ret = detail::parse_multipart_boundary(content_type, parsed);
+  EXPECT_FALSE(ret);
+}
+
+TEST(ParseMultipartBoundaryTest, QuotedValueIsMeasuredAfterUnquoting) {
+  // The limit applies to the unquoted value, so a quoted 70 character boundary
+  // is 72 characters on the wire and still valid.
+  const string boundary(70, 'a');
+  string content_type = "multipart/form-data; boundary=\"" + boundary + "\"";
+  string parsed;
+  EXPECT_TRUE(detail::parse_multipart_boundary(content_type, parsed));
+  EXPECT_EQ(parsed, boundary);
+
+  content_type = "multipart/form-data; boundary=\"" + string(71, 'a') + "\"";
+  parsed.clear();
+  EXPECT_FALSE(detail::parse_multipart_boundary(content_type, parsed));
+}
+
+TEST(ParseMultipartBoundaryTest, QuotedValueWithEqualsSign) {
+  // RFC 2046 5.1.1 allows '=' in a boundary, so a MIME sender has to quote it.
+  // The parameter parser must not treat that '=' as the key/value separator.
+  string content_type =
+      "multipart/mixed; boundary=\"----=_NextPart_000_0000_01D9\"; "
+      "charset=UTF-8";
+  string parsed;
+  EXPECT_TRUE(detail::parse_multipart_boundary(content_type, parsed));
+  EXPECT_EQ(parsed, "----=_NextPart_000_0000_01D9");
+}
+
+TEST(ParseMultipartBoundaryTest, QuotedValueWithSemicolon) {
+  // A ';' inside the quoted-string is part of the value, not a parameter
+  // separator, so it must not truncate the boundary.
+  string content_type = "multipart/mixed; boundary=\"a;b\"; charset=UTF-8";
+  string parsed;
+  EXPECT_TRUE(detail::parse_multipart_boundary(content_type, parsed));
+  EXPECT_EQ(parsed, "a;b");
+}
+
+TEST(ParseMultipartBoundaryTest, QuotedPairsAreUnescaped) {
+  string parsed;
+  EXPECT_TRUE(detail::parse_multipart_boundary(
+      "multipart/form-data; boundary=\"a\\\\b\"", parsed));
+  EXPECT_EQ("a\\b", parsed);
+  EXPECT_TRUE(detail::parse_multipart_boundary(
+      "multipart/form-data; boundary=\"a\\\"b\"", parsed));
+  EXPECT_EQ("a\"b", parsed);
+}
+
+TEST(ParseDispositionParamsTest, QuotedValues) {
+  // RFC 9110 Section 5.6.6: a parameter value may be a quoted-string, and
+  // ';' and '=' are ordinary characters inside one.
+  struct {
+    const char *value;
+    std::vector<std::pair<const char *, const char *>> expected;
+  } cases[] = {
+      {"name=\"file1\"; filename=\"a.txt\"",
+       {{"name", "file1"}, {"filename", "a.txt"}}},
+      // Whitespace around '=' and ';' is still trimmed
+      {"name=\"file2\" ;filename = \"a.html\"",
+       {{"name", "file2"}, {"filename", "a.html"}}},
+      // '=' inside the value used to leave only the text after the last one
+      {"name=\"file1\"; filename=\"report=v2.pdf\"",
+       {{"name", "file1"}, {"filename", "report=v2.pdf"}}},
+      {"name=\"x=y\"", {{"name", "x=y"}}},
+      // ';' inside the value used to truncate the pair and leave a bogus one
+      {"name=\"file3\"; filename=\"a;b.txt\"",
+       {{"name", "file3"}, {"filename", "a;b.txt"}}},
+      // An unquoted value keeps working, and so does filename*
+      {"filename*=UTF-8''%41.txt; filename=\"a.txt\"",
+       {{"filename*", "UTF-8''%41.txt"}, {"filename", "a.txt"}}},
+      // A parameter with no key is dropped rather than turned into one whose
+      // key is the value
+      {"=nokey; name=\"file5\"", {{"name", "file5"}}},
+      // An escaped quote does not end the value
+      {"name=\"a\\\"; filename=evil.php\"",
+       {{"name", "a\"; filename=evil.php"}}},
+      // Other backslashes, as in a Windows path, are kept
+      {"name=\"f\"; filename=\"C:\\dir\\a.txt\"",
+       {{"name", "f"}, {"filename", "C:\\dir\\a.txt"}}},
+  };
+
+  for (const auto &c : cases) {
+    Params params;
+    detail::parse_disposition_params(c.value, params);
+    for (const auto &kv : c.expected) {
+      auto it = params.find(kv.first);
+      ASSERT_NE(it, params.end())
+          << "value: " << c.value << ", key: " << kv.first;
+      EXPECT_EQ(kv.second, it->second) << "value: " << c.value;
+    }
+    EXPECT_EQ(c.expected.size(), params.size()) << "value: " << c.value;
+  }
+}
+
+TEST(MultipartFormDataTest, PartArrivingAByteAtATime) {
+  Server svr;
+  std::string filename;
+  std::string content;
+  svr.Post("/upload", [&](const Request &req, Response &) {
+    const auto &file = req.form.get_file("file");
+    filename = file.filename;
+    content = file.content;
+  });
+
+  auto thread = std::thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  std::string body = "--B\r\n"
+                     "Content-Disposition: form-data; name=\"file\"; "
+                     "filename=\"a.txt\"\r\n"
+                     "Content-Type: text/plain\r\n"
+                     "\r\n"
+                     "hello\r\n"
+                     "--B--\r\n";
+  Client cli(HOST, PORT);
+  auto res = cli.Post(
+      "/upload",
+      [&](size_t offset, DataSink &sink) {
+        if (offset < body.size()) {
+          sink.write(&body[offset], 1);
+        } else {
+          sink.done();
+        }
+        return true;
+      },
+      "multipart/form-data; boundary=B");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("a.txt", filename);
+  EXPECT_EQ("hello", content);
+}
+
+TEST(ParseDispositionParamsTest, QuotedValuesSurviveTheRoundTrip) {
+  // escape_multipart_field() only escapes '"', CR and LF, so a name or
+  // filename holding '=' or ';' reaches the server's parameter parser as is.
+  Server svr;
+  std::string field_value, file_name, file_filename;
+  bool has_field = false, has_file = false;
+
+  svr.Post("/quoted", [&](const Request &req, Response &res) {
+    has_field = req.form.has_field("x=y");
+    field_value = req.form.get_field("x=y");
+
+    has_file = req.form.has_file("file1");
+    const auto &file = req.form.get_file("file1");
+    file_name = file.name;
+    file_filename = file.filename;
+
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  UploadFormDataItems items = {
+      {"x=y", "field-value", "", ""},
+      {"file1", "pdf-bytes", "a;b=report.pdf", "application/pdf"},
+  };
+
+  Client cli(HOST, port);
+  auto res = cli.Post("/quoted", items);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  ASSERT_EQ(StatusCode::OK_200, res->status);
+
+  EXPECT_TRUE(has_field);
+  EXPECT_EQ("field-value", field_value);
+
+  EXPECT_TRUE(has_file);
+  EXPECT_EQ("file1", file_name);
+  EXPECT_EQ("a;b=report.pdf", file_filename);
 }
 
 TEST(GetHeaderValueTest, DefaultValue) {
@@ -1258,6 +2153,26 @@ TEST(GetHeaderValueTest, RegularInvalidValueInt) {
   EXPECT_TRUE(is_invalid_value);
 }
 
+TEST(GetHeaderValueTest, OutOfRangeValueInt) {
+  // An all-digit value that overflows size_t must be reported as invalid, not
+  // silently saturated/truncated: parsing at size_t width would otherwise wrap
+  // a large length to a small one on 32-bit builds, leaving the framing length
+  // wrong while is_invalid_value stayed false.
+  Headers headers = {{"Content-Length", "99999999999999999999999999"}};
+  auto is_invalid_value = false;
+  detail::get_header_value_u64(headers, "Content-Length", 0, 0,
+                               is_invalid_value);
+  EXPECT_TRUE(is_invalid_value);
+
+  // A well-formed length is unaffected.
+  Headers ok = {{"Content-Length", "1234"}};
+  is_invalid_value = false;
+  auto val = detail::get_header_value_u64(ok, "Content-Length", 0, 0,
+                                          is_invalid_value);
+  EXPECT_EQ(1234ull, val);
+  EXPECT_FALSE(is_invalid_value);
+}
+
 TEST(GetHeaderValueTest, Range) {
   {
     Headers headers = {make_range_header({{1, -1}})};
@@ -1296,32 +2211,145 @@ TEST(GetHeaderValueTest, Range) {
   }
 }
 
+TEST(BearerTokenAuthTest, SchemeValidation) {
+  // A value shorter than "Bearer " must not throw from the fixed-length
+  // substr, and a non-Bearer scheme must not be reported as a token.
+  struct {
+    const char *value;
+    const char *expected;
+  } cases[] = {
+      {"x", ""},
+      {"Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==", ""},
+      {"Bearer abc123", "abc123"},
+      {"bearer abc123", "abc123"}, // scheme match is case-insensitive
+  };
+
+  for (const auto &c : cases) {
+    Request req;
+    req.set_header("Authorization", c.value);
+    EXPECT_EQ(c.expected, get_bearer_token_auth(req)) << "value: " << c.value;
+  }
+}
+
+TEST(HeadersOrderTest, DuplicateFieldsKeepInsertionOrder) {
+  // RFC 9110 5.3: the order of fields sharing a name is significant. This used
+  // to depend on the standard library (libstdc++ handed back duplicates in
+  // reverse insertion order, libc++ in insertion order).
+  Request req;
+  req.set_header("Accept-Encoding", "gzip");
+  req.set_header("Accept-Encoding", "deflate");
+  req.set_header("Accept-Encoding", "br");
+
+  EXPECT_EQ(3U, req.get_header_value_count("Accept-Encoding"));
+  EXPECT_EQ("gzip", req.get_header_value("Accept-Encoding"));
+  EXPECT_EQ("gzip", req.get_header_value("Accept-Encoding", "", 0));
+  EXPECT_EQ("deflate", req.get_header_value("Accept-Encoding", "", 1));
+  EXPECT_EQ("br", req.get_header_value("Accept-Encoding", "", 2));
+}
+
+TEST(HeadersOrderTest, IdBeyondTheLastDuplicateYieldsDefault) {
+  Request req;
+  req.set_header("X-Test", "only");
+
+  EXPECT_EQ("only", req.get_header_value("X-Test", "def", 0));
+  EXPECT_EQ("def", req.get_header_value("X-Test", "def", 1));
+  EXPECT_EQ("def", req.get_header_value("X-Test", "def", 99));
+  EXPECT_EQ("def", req.get_header_value("X-Missing", "def", 3));
+}
+
+TEST(HeadersOrderTest, HugeIdYieldsDefault) {
+  Request req;
+  req.set_header("X-First", "1");
+  req.set_header("X-Test", "2");
+  req.params.emplace("first", "1");
+  req.params.emplace("test", "2");
+  req.form.fields.emplace("first", FormField{"first", "1", {}});
+  req.form.fields.emplace("test", FormField{"test", "2", {}});
+  req.form.files.emplace("first", FormData{"first", "1", "", "", {}});
+  req.form.files.emplace("test", FormData{"test", "2", "", "", {}});
+
+  // The second one is negative when read as a signed value
+  const auto max_id = (std::numeric_limits<size_t>::max)();
+  for (auto id : {max_id / 2, max_id}) {
+    EXPECT_EQ("def", req.get_header_value("X-Test", "def", id));
+    EXPECT_EQ(7U, req.get_header_value_u64("X-Test", 7, id));
+    EXPECT_EQ("", req.get_param_value("test", id));
+    EXPECT_EQ("", req.form.get_field("test", id));
+    EXPECT_EQ("", req.form.get_file("test", id).content);
+  }
+}
+
+TEST(HeadersOrderTest, TraversalFollowsInsertionOrder) {
+  Headers headers;
+  headers.emplace("Host", "example.com");
+  headers.emplace("Accept-Encoding", "gzip");
+  headers.emplace("User-Agent", "test");
+  headers.emplace("Accept-Encoding", "deflate");
+
+  EXPECT_EQ("Host=example.com Accept-Encoding=gzip User-Agent=test "
+            "Accept-Encoding=deflate ",
+            entries_to_string(headers));
+}
+
+TEST(HeadersOrderTest, LookupIsCaseInsensitiveAndPicksTheFirstField) {
+  Headers headers = {{"Content-Type", "text/html"},
+                     {"CONTENT-TYPE", "text/xml"}};
+
+  EXPECT_EQ(2U, headers.count("content-type"));
+  auto it = headers.find("content-type");
+  ASSERT_TRUE(it != headers.end());
+  EXPECT_EQ("text/html", it->second);
+}
+
+TEST(HeadersOrderTest, ErasingAnEqualRangeSparesInterleavedFields) {
+  // The fields sharing a name are not adjacent, so an equal_range() erase must
+  // drop only those fields and leave everything positioned between them.
+  Headers headers = {{"A", "1"}, {"X", "x"}, {"A", "2"},
+                     {"Y", "y"}, {"A", "3"}, {"Z", "z"}};
+
+  auto rng = headers.equal_range("a");
+  headers.erase(rng.first, rng.second);
+
+  EXPECT_EQ("X=x Y=y Z=z ", entries_to_string(headers));
+}
+
+TEST(HeadersOrderTest, ErasingByNameKeepsTheRemainingOrder) {
+  Headers headers = {
+      {"A", "1"}, {"B", "2"}, {"a", "3"}, {"C", "4"}, {"A", "5"}};
+
+  EXPECT_EQ(3U, headers.erase("A"));
+  EXPECT_EQ(0U, headers.count("A"));
+  EXPECT_EQ("B=2 C=4 ", entries_to_string(headers));
+}
+
+TEST(HeadersOrderTest, EmplaceFrontPrepends) {
+  Headers headers = {{"Accept", "*/*"}, {"User-Agent", "test"}};
+  headers.emplace_front("Host", "example.com");
+
+  EXPECT_EQ("Host=example.com Accept=*/* User-Agent=test ",
+            entries_to_string(headers));
+}
+
 TEST(ParseHeaderValueTest, Range) {
   {
     Ranges ranges;
     auto ret = detail::parse_range_header("bytes=1-", ranges);
     EXPECT_TRUE(ret);
-    EXPECT_EQ(1u, ranges.size());
-    EXPECT_EQ(1u, ranges[0].first);
-    EXPECT_EQ(-1, ranges[0].second);
+    EXPECT_EQ((Ranges{{1, -1}}), ranges);
   }
 
   {
     Ranges ranges;
     auto ret = detail::parse_range_header("bytes=-1", ranges);
     EXPECT_TRUE(ret);
-    EXPECT_EQ(1u, ranges.size());
-    EXPECT_EQ(-1, ranges[0].first);
-    EXPECT_EQ(1u, ranges[0].second);
+    EXPECT_EQ((Ranges{{-1, 1}}), ranges);
   }
 
   {
     Ranges ranges;
     auto ret = detail::parse_range_header("bytes=1-10", ranges);
     EXPECT_TRUE(ret);
-    EXPECT_EQ(1u, ranges.size());
-    EXPECT_EQ(1u, ranges[0].first);
-    EXPECT_EQ(10u, ranges[0].second);
+    EXPECT_EQ((Ranges{{1, 10}}), ranges);
   }
 
   {
@@ -1334,11 +2362,7 @@ TEST(ParseHeaderValueTest, Range) {
     Ranges ranges;
     auto ret = detail::parse_range_header("bytes=1-10, 100-", ranges);
     EXPECT_TRUE(ret);
-    EXPECT_EQ(2u, ranges.size());
-    EXPECT_EQ(1u, ranges[0].first);
-    EXPECT_EQ(10u, ranges[0].second);
-    EXPECT_EQ(100u, ranges[1].first);
-    EXPECT_EQ(-1, ranges[1].second);
+    EXPECT_EQ((Ranges{{1, 10}, {100, -1}}), ranges);
   }
 
   {
@@ -1346,13 +2370,7 @@ TEST(ParseHeaderValueTest, Range) {
     auto ret =
         detail::parse_range_header("bytes=1-10, 100-200, 300-400", ranges);
     EXPECT_TRUE(ret);
-    EXPECT_EQ(3u, ranges.size());
-    EXPECT_EQ(1u, ranges[0].first);
-    EXPECT_EQ(10u, ranges[0].second);
-    EXPECT_EQ(100u, ranges[1].first);
-    EXPECT_EQ(200u, ranges[1].second);
-    EXPECT_EQ(300u, ranges[2].first);
-    EXPECT_EQ(400u, ranges[2].second);
+    EXPECT_EQ((Ranges{{1, 10}, {100, 200}, {300, 400}}), ranges);
   }
 
   {
@@ -1371,7 +2389,29 @@ TEST(ParseHeaderValueTest, Range) {
     EXPECT_FALSE(detail::parse_range_header("bytes=0--1", ranges));
     EXPECT_FALSE(detail::parse_range_header("bytes=0- 1", ranges));
     EXPECT_FALSE(detail::parse_range_header("bytes=0 -1", ranges));
+    // Overflows ssize_t; must not be read as the suffix range "bytes=-100".
+    EXPECT_FALSE(
+        detail::parse_range_header("bytes=9223372036854775808-100", ranges));
     EXPECT_TRUE(ranges.empty());
+  }
+
+  {
+    // RFC 9110 14.1.2: a last-byte-pos greater than the content length is the
+    // remainder of the representation, so it stays accepted.
+    Ranges ranges;
+    auto ret =
+        detail::parse_range_header("bytes=0-99999999999999999999", ranges);
+    EXPECT_TRUE(ret);
+    ASSERT_EQ(1u, ranges.size());
+    EXPECT_EQ(0, ranges[0].first);
+    EXPECT_EQ(-1, ranges[0].second);
+  }
+
+  // RFC 9110 14.1: range unit names are case-insensitive.
+  for (const auto &s : {"Bytes=1-10", "BYTES=1-10", "bYtEs=1-10"}) {
+    Ranges ranges;
+    EXPECT_TRUE(detail::parse_range_header(s, ranges)) << s;
+    EXPECT_EQ((Ranges{{1, 10}}), ranges) << s;
   }
 }
 
@@ -1456,6 +2496,16 @@ TEST(ParseAcceptEncoding5, AcceptEncodingQZeroVariants) {
   auto ret = detail::encoding_type(req, res);
 
   EXPECT_TRUE(ret == detail::EncodingType::None);
+}
+
+TEST(ParseAcceptEncodingTest, RejectsTrailingQualityCharacters) {
+  Request req;
+  req.set_header("Accept-Encoding", "gzip;q=0.5junk");
+
+  Response res;
+  res.set_header("Content-Type", "text/plain");
+
+  EXPECT_EQ(detail::EncodingType::None, detail::encoding_type(req, res));
 }
 
 TEST(ParseAcceptEncoding6, AcceptEncodingXGzipQZero) {
@@ -1631,7 +2681,7 @@ protected:
 
 TEST_F(ChunkedEncodingTest, NormalGet) {
   auto res = cli_.Get("/chunked");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
 
   std::string out;
   read_file("./image.jpg", out);
@@ -1646,7 +2696,7 @@ TEST_F(ChunkedEncodingTest, WithContentReceiver) {
     body.append(data, data_length);
     return true;
   });
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
 
   std::string out;
   read_file("./image.jpg", out);
@@ -1667,7 +2717,7 @@ TEST_F(ChunkedEncodingTest, WithResponseHandlerAndContentReceiver) {
         body.append(data, data_length);
         return true;
       });
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
 
   std::string out;
   read_file("./image.jpg", out);
@@ -1691,7 +2741,7 @@ TEST(RangeTest, FromHTTPBin_Online) {
 
   {
     auto res = cli.Get(path);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ("abcdefghijklmnopqrstuvwxyzabcdef", res->body);
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
@@ -1699,7 +2749,7 @@ TEST(RangeTest, FromHTTPBin_Online) {
   {
     Headers headers = {make_range_header({{1, -1}})};
     auto res = cli.Get(path, headers);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ("bcdefghijklmnopqrstuvwxyzabcdef", res->body);
     EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   }
@@ -1707,7 +2757,7 @@ TEST(RangeTest, FromHTTPBin_Online) {
   {
     Headers headers = {make_range_header({{1, 10}})};
     auto res = cli.Get(path, headers);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ("bcdefghijk", res->body);
     EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   }
@@ -1718,7 +2768,7 @@ TEST(RangeTest, FromHTTPBin_Online) {
   {
     Headers headers = {make_range_header({{0, 31}})};
     auto res = cli.Get(path, headers);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ("abcdefghijklmnopqrstuvwxyzabcdef", res->body);
     EXPECT_TRUE(res->status == StatusCode::OK_200 ||
                 res->status == StatusCode::PartialContent_206);
@@ -1727,7 +2777,7 @@ TEST(RangeTest, FromHTTPBin_Online) {
   {
     Headers headers = {make_range_header({{0, -1}})};
     auto res = cli.Get(path, headers);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ("abcdefghijklmnopqrstuvwxyzabcdef", res->body);
     EXPECT_TRUE(res->status == StatusCode::OK_200 ||
                 res->status == StatusCode::PartialContent_206);
@@ -1739,8 +2789,62 @@ TEST(RangeTest, FromHTTPBin_Online) {
   {
     Headers headers = {make_range_header({{0, 32}})};
     auto res = cli.Get(path, headers);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   }
+}
+
+TEST(RangeTest, IgnoredForPost) {
+  Server svr;
+  svr.Post("/", [](const Request &, Response &res) {
+    res.set_content("abcdefg", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_GT(port, 0);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  for (auto range : {"bytes=1-2", "bytes=x"}) {
+    auto res = cli.Post("/", Headers{{"Range", range}});
+    ASSERT_TRUE(res) << range << ": " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status) << range;
+    EXPECT_EQ("abcdefg", res->body) << range;
+  }
+}
+
+TEST(RangeTest, IgnoredForUnknownUnit) {
+  Server svr;
+  svr.Get("/", [](const Request &, Response &res) {
+    res.set_content("abcdefg", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_GT(port, 0);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  for (auto range : {"items=1-2", "none=x"}) {
+    auto res = cli.Get("/", Headers{{"Range", range}});
+    ASSERT_TRUE(res) << range << ": " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status) << range;
+    EXPECT_EQ("abcdefg", res->body) << range;
+  }
+
+  auto res = cli.Get("/", Headers{{"Range", "bytes=x"}});
+  ASSERT_TRUE(res) << to_string(res.error());
+  EXPECT_EQ(StatusCode::RangeNotSatisfiable_416, res->status);
 }
 
 TEST(GetAddrInfoDanglingRefTest, LongTimeout) {
@@ -2000,7 +3104,7 @@ TEST(CancelTest, NoCancel_Online) {
   cli.set_connection_timeout(std::chrono::seconds(5));
 
   auto res = cli.Get(path, [](uint64_t, uint64_t) { return true; });
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("abcdefghijklmnopqrstuvwxyzabcdef", res->body);
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
@@ -2068,7 +3172,7 @@ TEST(CancelTest, NoCancelPost) {
   auto res =
       cli.Post("/", Headers(), JSON_DATA.data(), JSON_DATA.size(),
                "application/json", [](uint64_t, uint64_t) { return true; });
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("Hello World!", res->body);
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
@@ -2149,7 +3253,7 @@ TEST(CancelTest, NoCancelPut) {
   auto res =
       cli.Put("/", Headers(), JSON_DATA.data(), JSON_DATA.size(),
               "application/json", [](uint64_t, uint64_t) { return true; });
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("Hello World!", res->body);
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
@@ -2230,7 +3334,7 @@ TEST(CancelTest, NoCancelPatch) {
   auto res =
       cli.Patch("/", Headers(), JSON_DATA.data(), JSON_DATA.size(),
                 "application/json", [](uint64_t, uint64_t) { return true; });
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("Hello World!", res->body);
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
@@ -2311,7 +3415,7 @@ TEST(CancelTest, NoCancelDelete) {
   auto res =
       cli.Delete("/", Headers(), JSON_DATA.data(), JSON_DATA.size(),
                  "application/json", [](uint64_t, uint64_t) { return true; });
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("Hello World!", res->body);
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
@@ -2370,6 +3474,55 @@ TEST(CancelTest, WithCancelLargePayloadDelete) {
   EXPECT_EQ(Error::Canceled, res.error());
 }
 
+// One stop() from another thread ends a request that waits for the response
+TEST(ClientStopTest, StopEndsWaitForResponse) {
+  Server svr;
+  std::atomic<bool> received{false};
+  std::atomic<bool> done{false};
+
+  svr.Get("/wait", [&](const Request & /*req*/, Response &res) {
+    received.store(true);
+    while (!done.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    res.set_content("Hello World!", "text/plain");
+  });
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+
+  Client cli(HOST, port);
+  cli.set_read_timeout(std::chrono::seconds(30));
+  std::future<Result> request;
+
+  auto se = detail::scope_exit([&] {
+    done.store(true);
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  request = std::async(std::launch::async, [&]() { return cli.Get("/wait"); });
+
+  for (int i = 0; i < 500 && !received.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(received.load());
+  // Let the client block in the wait for the response
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+  auto start = std::chrono::steady_clock::now();
+  cli.stop();
+  ASSERT_EQ(std::future_status::ready,
+            request.wait_for(std::chrono::seconds(5)));
+  EXPECT_LT(std::chrono::steady_clock::now() - start, std::chrono::seconds(2));
+
+  auto res = request.get();
+  ASSERT_TRUE(!res);
+  EXPECT_EQ(Error::Read, res.error());
+}
+
 static std::string remove_whitespace(const std::string &input) {
   std::string output;
   output.reserve(input.size());
@@ -2392,14 +3545,14 @@ TEST(BaseAuthTest, FromHTTPWatch_Online) {
 
   {
     auto res = cli.Get(path);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
   }
 
   {
     auto res = cli.Get(
         path, Headers{make_basic_authentication_header("hello", "world")});
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     auto body = remove_whitespace(res->body);
     EXPECT_TRUE(body.find("\"authenticated\":true") != std::string::npos);
     EXPECT_TRUE(body.find("\"user\":\"hello\"") != std::string::npos);
@@ -2409,7 +3562,7 @@ TEST(BaseAuthTest, FromHTTPWatch_Online) {
   {
     cli.set_basic_auth("hello", "world");
     auto res = cli.Get(path);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     auto body = remove_whitespace(res->body);
     EXPECT_TRUE(body.find("\"authenticated\":true") != std::string::npos);
     EXPECT_TRUE(body.find("\"user\":\"hello\"") != std::string::npos);
@@ -2419,14 +3572,14 @@ TEST(BaseAuthTest, FromHTTPWatch_Online) {
   {
     cli.set_basic_auth("hello", "bad");
     auto res = cli.Get(path);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
   }
 
   {
     cli.set_basic_auth("bad", "world");
     auto res = cli.Get(path);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
   }
 }
@@ -2445,7 +3598,7 @@ TEST(DigestAuthTest, FromHTTPWatch_Online) {
 
   {
     auto res = cli.Get(unauth_path);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
   }
 
@@ -2454,7 +3607,7 @@ TEST(DigestAuthTest, FromHTTPWatch_Online) {
     cli.set_digest_auth("hello", "world");
     for (const auto &path : paths) {
       auto res = cli.Get(path.c_str());
-      ASSERT_TRUE(res);
+      ASSERT_TRUE(res) << "Error: " << to_string(res.error());
       auto body = remove_whitespace(res->body);
       EXPECT_TRUE(body.find("\"authenticated\":true") != std::string::npos);
       EXPECT_TRUE(body.find("\"user\":\"hello\"") != std::string::npos);
@@ -2464,10 +3617,200 @@ TEST(DigestAuthTest, FromHTTPWatch_Online) {
     cli.set_digest_auth("hello", "bad");
     for (const auto &path : paths) {
       auto res = cli.Get(path.c_str());
-      ASSERT_TRUE(res);
+      ASSERT_TRUE(res) << "Error: " << to_string(res.error());
       EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
     }
   }
+}
+
+// RFC 9110 Section 11.6.1: a WWW-Authenticate field value is a
+// comma-separated list of challenges, and each challenge may itself carry a
+// comma-separated auth-param list, so a server can legally offer Basic
+// before Digest, either as two field lines or packed into one. Runs one 401
+// -> Digest-retry round trip with the given field lines (get_combined_header_
+// value() joins them in receipt order) and checks that the retry carries a
+// well-formed Digest Authorization header naming expected_realm.
+static void
+run_digest_challenge_list_test(const std::vector<std::string> &challenges,
+                               const std::string &expected_realm) {
+  std::atomic<int> hits{0};
+
+  Server svr;
+  svr.Get("/x", [&](const Request &req, Response &res) {
+    if (++hits == 1) {
+      res.status = StatusCode::Unauthorized_401;
+      for (const auto &challenge : challenges) {
+        res.set_header("WWW-Authenticate", challenge);
+      }
+    } else {
+      auto authorization = req.get_header_value("Authorization");
+      EXPECT_EQ(0u, authorization.rfind("Digest ", 0));
+      EXPECT_NE(std::string::npos,
+                authorization.find("realm=\"" + expected_realm + "\""));
+      EXPECT_EQ(std::string::npos, authorization.find("Basic"));
+      res.set_content("ok", "text/plain");
+    }
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_digest_auth("hello", "world");
+  auto res = cli.Get("/x");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+
+  EXPECT_EQ(2, hits.load());
+}
+
+static const char *kBasicChallenge = "Basic realm=\"decoy\"";
+static const char *kDigestChallenge =
+    "Digest realm=\"testrealm\", qop=\"auth\", nonce=\"abc123\", "
+    "algorithm=MD5";
+
+TEST(DigestAuthTest, BasicChallengeListedBeforeDigest) {
+  run_digest_challenge_list_test({kBasicChallenge, kDigestChallenge},
+                                 "testrealm");
+}
+
+// Same challenge list with the schemes in the opposite order, to make sure
+// the fix above didn't just special-case "Basic first".
+TEST(DigestAuthTest, DigestChallengeListedBeforeBasic) {
+  run_digest_challenge_list_test({kDigestChallenge, kBasicChallenge},
+                                 "testrealm");
+}
+
+// A comma inside a quoted auth-param value must not be mistaken for the
+// separator between two challenges (or two auth-params).
+TEST(DigestAuthTest, RealmContainingCommaIsNotSplit) {
+  run_digest_challenge_list_test(
+      {"Digest realm=\"test,realm\", qop=\"auth\", nonce=\"abc123\", "
+       "algorithm=MD5"},
+      "test,realm");
+}
+
+// RFC 7616 3.4: uri is the request-target as sent, which is encoded, carries
+// the params and leaves out the fragment.
+TEST(DigestAuthTest, UriIsTheRequestTargetSent) {
+  Server svr;
+  std::string uri, target;
+  svr.Get("/a b", [&](const Request &req, Response &res) {
+    auto auth = req.get_header_value("Authorization");
+    if (auth.empty()) {
+      res.status = StatusCode::Unauthorized_401;
+      res.set_header("WWW-Authenticate",
+                     "Digest realm=\"r\", qop=\"auth\", nonce=\"n\"");
+      return;
+    }
+    auto b = auth.find("uri=\"") + 5;
+    uri = auth.substr(b, auth.find('"', b) - b);
+    target = req.target;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_digest_auth("hello", "world");
+  auto res = cli.Get("/a b#f", Params{{"x", "1"}}, Headers{});
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("/a%20b?x=1", target);
+  EXPECT_EQ(target, uri);
+}
+
+// RFC 7616 Section 3.3 requires realm and nonce on every Digest challenge.
+// make_digest_authentication_header() dereferences both unconditionally, so
+// a server sending a challenge missing either one must not be treated as
+// usable -- doing so used to crash the client with std::out_of_range.
+static void run_digest_challenge_missing_field_test(const char *challenge) {
+  Server svr;
+  svr.Get("/x", [&](const Request & /*req*/, Response &res) {
+    res.status = StatusCode::Unauthorized_401;
+    res.set_header("WWW-Authenticate", challenge);
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_digest_auth("hello", "world");
+  auto res = cli.Get("/x");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
+}
+
+TEST(DigestAuthTest, ChallengeMissingRealmAndNonceDoesNotCrash) {
+  run_digest_challenge_missing_field_test("Digest qop=\"auth\"");
+}
+
+TEST(DigestAuthTest, ChallengeMissingNonceDoesNotCrash) {
+  run_digest_challenge_missing_field_test("Digest realm=\"r\", qop=\"auth\"");
+}
+
+TEST(DigestAuthTest, ChallengeMissingRealmDoesNotCrash) {
+  run_digest_challenge_missing_field_test("Digest nonce=\"n\", qop=\"auth\"");
+}
+
+// A hostile server can put a '"' in realm/nonce/opaque, or a non-token
+// algorithm, in its challenge. parse_www_authenticate() de-escapes quoted-pairs
+// when storing the values, so the header builder has to re-escape them (and
+// keep algorithm a bare token); otherwise the value breaks out of its
+// quoted-string and injects extra auth-params into the client's Authorization.
+TEST(DigestAuthTest, EscapesInjectedAuthParams) {
+  std::atomic<int> hits{0};
+  std::string authorization;
+
+  Server svr;
+  svr.Get("/x", [&](const Request &req, Response &res) {
+    if (++hits == 1) {
+      res.status = StatusCode::Unauthorized_401;
+      // On the wire the quotes embedded in the values are backslash-escaped.
+      res.set_header("WWW-Authenticate",
+                     "Digest realm=\"testrealm\", "
+                     "nonce=\"n\\\"; injected=\\\"x\", "
+                     "algorithm=\"MD5, injected2=\\\"y\\\"\", qop=\"auth\"");
+    } else {
+      authorization = req.get_header_value("Authorization");
+      res.set_content("ok", "text/plain");
+    }
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_digest_auth("hello", "world");
+  auto res = cli.Get("/x");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(2, hits.load());
+
+  EXPECT_EQ(0u, authorization.rfind("Digest ", 0));
+  // The nonce (de-escaped to  n"; injected="x ) must be re-escaped so it stays
+  // inside its quoted-string rather than starting an "injected" auth-param.
+  EXPECT_NE(std::string::npos,
+            authorization.find("nonce=\"n\\\"; injected=\\\"x\""));
+  // A non-token algorithm falls back to a bare MD5 token, dropping the payload.
+  EXPECT_EQ(std::string::npos, authorization.find("injected2"));
 }
 
 #endif
@@ -2483,9 +3826,9 @@ TEST(SpecifyServerIPAddressTest, AnotherHostname_Online) {
   Client cli(host);
 #endif
 
-  cli.set_hostname_addr_map({{another_host, wrong_ip}});
+  cli.set_direct_hostname_addr_map({{another_host, wrong_ip}});
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::MovedPermanently_301, res->status);
 }
 
@@ -2499,10 +3842,165 @@ TEST(SpecifyServerIPAddressTest, RealHostname_Online) {
   Client cli(host);
 #endif
 
-  cli.set_hostname_addr_map({{host, wrong_ip}});
+  cli.set_direct_hostname_addr_map({{host, wrong_ip}});
   auto res = cli.Get("/");
   ASSERT_TRUE(!res);
   EXPECT_EQ(Error::Connection, res.error());
+}
+
+TEST(SpecifyServerIPAddressTest, HostnameAsAddrMapValue) {
+  // A mapped value that is not an IP literal must be resolved. "localhost"
+  // resolves from the hosts file, so this test needs no external DNS.
+  // "target.invalid" (RFC 6761) is only a map key and the Host header value.
+  auto host = "target.invalid";
+
+  Server svr;
+  std::string received_host;
+  svr.Get("/hi", [&](const Request &req, Response &res) {
+    received_host = req.get_header_value("Host");
+    res.set_content("Hello World!", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(host, port);
+  cli.set_direct_hostname_addr_map({{host, HOST}});
+
+  auto res = cli.Get("/hi");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  // The mapping only redirects the connection; the identity stays host_.
+  EXPECT_EQ(std::string(host) + ":" + std::to_string(port), received_host);
+}
+
+TEST(SpecifyServerIPAddressTest, IPAddressAsAddrMapValue) {
+  // A mapped value that is an IP literal keeps the AI_NUMERICHOST path.
+  auto host = "target.invalid";
+
+  Server svr;
+  svr.Get("/hi", [](const Request & /*req*/, Response &res) {
+    res.set_content("Hello World!", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port("127.0.0.1");
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(host, port);
+  cli.set_direct_hostname_addr_map({{host, "127.0.0.1"}});
+
+  auto res = cli.Get("/hi");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+
+TEST(SpecifyServerIPAddressTest, EmptyAddrMapValueIsIgnored) {
+  // An empty mapped value must leave host_ as the connection target. Without
+  // that guard the empty value would become the host argument, getaddrinfo
+  // would be called with a null node, and (no AI_PASSIVE) it would resolve to
+  // loopback - silently connecting somewhere the caller never asked for.
+  // The server listens on loopback, so such a fallback would succeed and is
+  // therefore observable as a failure of this test.
+  auto blackhole = "192.0.2.1"; // TEST-NET-1, never routable
+
+  Server svr;
+  svr.Get("/hi", [](const Request & /*req*/, Response &res) {
+    res.set_content("Hello World!", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(blackhole, port);
+  cli.set_direct_hostname_addr_map({{blackhole, ""}});
+  cli.set_connection_timeout(1);
+
+  auto res = cli.Get("/hi");
+  EXPECT_FALSE(res) << "empty mapping must not redirect to loopback";
+}
+
+TEST(SpecifyServerIPAddressTest, DeprecatedSetHostnameAddrMapStillWorks) {
+  auto host = "target.invalid";
+
+  Server svr;
+  std::string received_host;
+  svr.Get("/hi", [&](const Request &req, Response &res) {
+    received_host = req.get_header_value("Host");
+    res.set_content("Hello World!", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port("127.0.0.1");
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(host, port);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+  cli.set_hostname_addr_map({{host, "127.0.0.1"}});
+#pragma GCC diagnostic pop
+
+  auto res = cli.Get("/hi");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ(std::string(host) + ":" + std::to_string(port), received_host);
+}
+
+TEST(TunnelHostnameAddrMapTest, IgnoredOnDirectConnection) {
+  // 192.0.2.1 is TEST-NET-1: applying the map would fail to connect.
+  Server svr;
+  svr.Get("/hi", [](const Request & /*req*/, Response &res) {
+    res.set_content("Hello World!", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port("127.0.0.1");
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli("127.0.0.1", port);
+  cli.set_tunnel_hostname_addr_map({{"127.0.0.1", "192.0.2.1"}});
+  cli.set_connection_timeout(1);
+
+  auto res = cli.Get("/hi");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
 TEST(AbsoluteRedirectTest, Redirect_Online) {
@@ -2517,7 +4015,7 @@ TEST(AbsoluteRedirectTest, Redirect_Online) {
 
   cli.set_follow_location(true);
   auto res = cli.Get(path);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -2533,7 +4031,7 @@ TEST(RedirectTest, Redirect_Online) {
 
   cli.set_follow_location(true);
   auto res = cli.Get(path);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -2549,7 +4047,7 @@ TEST(RelativeRedirectTest, Redirect_Online) {
 
   cli.set_follow_location(true);
   auto res = cli.Get(path);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -2574,12 +4072,12 @@ TEST(YahooRedirectTest, Redirect_Online) {
   Client cli("yahoo.com");
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::MovedPermanently_301, res->status);
 
   cli.set_follow_location(true);
   res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("https://www.yahoo.com/", res->location);
 }
@@ -2593,7 +4091,7 @@ TEST(HttpsToHttpRedirectTest, Redirect_Online) {
   cli.set_follow_location(true);
   auto res =
       cli.Get(REDIR_PATH "?url=http%3A%2F%2Fexample.com&status_code=302");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -2606,7 +4104,7 @@ TEST(HttpsToHttpRedirectTest2, Redirect_Online) {
   params.emplace("status_code", "302");
 
   auto res = cli.Get(REDIR_PATH, params, Headers{});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -2618,7 +4116,7 @@ TEST(HttpsToHttpRedirectTest3, Redirect_Online) {
   params.emplace("url", "http://example.com");
 
   auto res = cli.Get(REDIR_PATH "?status_code=302", params, Headers{});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -2627,7 +4125,7 @@ TEST(UrlWithSpace, Redirect_Online) {
   cli.set_follow_location(true);
 
   auto res = cli.Get("/files/2595/310/Neat 1.4-17.jar");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(18527U, res->get_header_value_u64("Content-Length"));
 }
@@ -2709,56 +4207,64 @@ TEST(RedirectToDifferentPort, Redirect) {
   cli.set_follow_location(true);
 
   auto res = cli.Get("/2");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("Hello World!", res->body);
 }
 
-static void
-TestDoNotForwardCredentialsOnRedirect(std::function<void(Client &)> set_auth) {
-  Server svr1;
-  std::string captured_authorization;
-  svr1.Get("/target", [&](const Request &req, Response &res) {
-    captured_authorization = req.get_header_value("Authorization");
-    res.set_content("OK", "text/plain");
+// GET /redir on one server redirects to /target on another port, so the
+// client follows it with a new client.
+static Result
+GetThroughRedirectToDifferentPort(Server::Handler target,
+                                  const std::function<void(Client &)> &setup,
+                                  const Headers &headers = Headers()) {
+  Server target_svr;
+  target_svr.Get("/target", target);
+
+  int target_port = 0;
+  auto target_thread = std::thread([&]() {
+    target_port = target_svr.bind_to_any_port(HOST);
+    target_svr.listen_after_bind();
   });
 
-  int svr1_port = 0;
-  auto thread1 = std::thread([&]() {
-    svr1_port = svr1.bind_to_any_port(HOST);
-    svr1.listen_after_bind();
-  });
-
-  Server svr2;
-  svr2.Get("/redir", [&](const Request & /*req*/, Response &res) {
+  Server origin_svr;
+  origin_svr.Get("/redir", [&](const Request &, Response &res) {
     res.set_redirect(
-        "http://localhost:" + std::to_string(svr1_port) + "/target", 302);
+        "http://localhost:" + std::to_string(target_port) + "/target", 302);
   });
 
-  int svr2_port = 0;
-  auto thread2 = std::thread([&]() {
-    svr2_port = svr2.bind_to_any_port(HOST);
-    svr2.listen_after_bind();
+  int origin_port = 0;
+  auto origin_thread = std::thread([&]() {
+    origin_port = origin_svr.bind_to_any_port(HOST);
+    origin_svr.listen_after_bind();
   });
   auto se = detail::scope_exit([&] {
-    svr2.stop();
-    thread2.join();
-    svr1.stop();
-    thread1.join();
-    ASSERT_FALSE(svr2.is_running());
-    ASSERT_FALSE(svr1.is_running());
+    origin_svr.stop();
+    origin_thread.join();
+    target_svr.stop();
+    target_thread.join();
   });
 
-  svr1.wait_until_ready();
-  svr2.wait_until_ready();
+  target_svr.wait_until_ready();
+  origin_svr.wait_until_ready();
 
-  Client cli("localhost", svr2_port);
+  Client cli("localhost", origin_port);
   cli.set_follow_location(true);
-  set_auth(cli);
+  setup(cli);
+  return cli.Get("/redir", headers);
+}
 
-  auto res = cli.Get("/redir");
-  ASSERT_TRUE(res);
-  EXPECT_EQ(StatusCode::OK_200, res->status);
+static void
+TestDoNotForwardCredentialsOnRedirect(std::function<void(Client &)> set_auth) {
+  std::string captured_authorization;
+  auto result = GetThroughRedirectToDifferentPort(
+      [&](const Request &req, Response &res) {
+        captured_authorization = req.get_header_value("Authorization");
+        res.set_content("OK", "text/plain");
+      },
+      set_auth);
+  ASSERT_TRUE(result) << "Error: " << to_string(result.error());
+  EXPECT_EQ(StatusCode::OK_200, result->status);
   // RFC 9110: credentials MUST NOT be forwarded to a different host
   EXPECT_TRUE(captured_authorization.empty());
 }
@@ -2772,6 +4278,167 @@ TEST(RedirectToDifferentPort, DoNotForwardCredentialsBearerToken) {
   TestDoNotForwardCredentialsOnRedirect(
       [](Client &cli) { cli.set_bearer_token_auth("my-secret-token"); });
 }
+
+TEST(RedirectToDifferentPort, DoNotForwardCookie) {
+  std::string captured_cookie;
+  auto result = GetThroughRedirectToDifferentPort(
+      [&](const Request &req, Response &res) {
+        captured_cookie = req.get_header_value("Cookie");
+        res.set_content("OK", "text/plain");
+      },
+      [](Client &) {}, {{"Cookie", "session_id=SECRET; auth=PRIVATE"}});
+  ASSERT_TRUE(result) << "Error: " << to_string(result.error());
+  EXPECT_EQ(StatusCode::OK_200, result->status);
+  // Cookie MUST NOT be forwarded to a different host (GHSA-22mf-w2v3-r2jv)
+  EXPECT_TRUE(captured_cookie.empty());
+}
+
+TEST(RedirectToSamePort, ForwardCookie) {
+  // A same-origin redirect (same scheme/host/port) should preserve the Cookie
+  // header so that ordinary session flows keep working.
+  Server svr;
+  std::string captured_cookie;
+  svr.Get("/redir", [&](const Request & /*req*/, Response &res) {
+    res.set_redirect("/target", 302);
+  });
+  svr.Get("/target", [&](const Request &req, Response &res) {
+    captured_cookie = req.get_header_value("Cookie");
+    res.set_content("OK", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_follow_location(true);
+
+  Headers headers = {{"Cookie", "session_id=SECRET"}};
+  auto res = cli.Get("/redir", headers);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("session_id=SECRET", captured_cookie);
+}
+
+TEST(RedirectTest, DoNotCarryRequestParamsToLocation) {
+  // The Location alone names the next target, on any origin.
+  Server target_svr;
+  std::string cross_target;
+  target_svr.Get("/landing", [&](const Request &req, Response &res) {
+    cross_target = req.target;
+    res.set_content("OK", "text/plain");
+  });
+
+  auto target_port = target_svr.bind_to_any_port(HOST);
+  auto target_thread = std::thread([&]() { target_svr.listen_after_bind(); });
+
+  Server origin_svr;
+  std::string same_target;
+  origin_svr.Get("/cross", [&](const Request &, Response &res) {
+    res.set_redirect(
+        "http://localhost:" + std::to_string(target_port) + "/landing", 302);
+  });
+  origin_svr.Get("/same", [&](const Request &, Response &res) {
+    res.set_redirect("/landing", 302);
+  });
+  origin_svr.Get("/landing", [&](const Request &req, Response &res) {
+    same_target = req.target;
+    res.set_content("OK", "text/plain");
+  });
+
+  auto origin_port = origin_svr.bind_to_any_port(HOST);
+  auto origin_thread = std::thread([&]() { origin_svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    origin_svr.stop();
+    origin_thread.join();
+    target_svr.stop();
+    target_thread.join();
+  });
+
+  target_svr.wait_until_ready();
+  origin_svr.wait_until_ready();
+
+  Client cli("localhost", origin_port);
+  cli.set_follow_location(true);
+
+  Request req;
+  req.method = "GET";
+  req.params = {{"api_key", "SECRET"}};
+
+  req.path = "/cross";
+  auto res = cli.send(req);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("/landing", cross_target);
+
+  req.path = "/same";
+  res = cli.send(req);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("/landing", same_target);
+}
+
+TEST(RedirectToDifferentPort, ForwardDefaultHeadersButNotCredentials) {
+  std::string authorization;
+  std::string trace_id;
+  auto result = GetThroughRedirectToDifferentPort(
+      [&](const Request &req, Response &res) {
+        authorization = req.get_header_value("Authorization");
+        trace_id = req.get_header_value("X-Trace-Id");
+        res.set_content("OK", "text/plain");
+      },
+      [](Client &cli) {
+        cli.set_default_headers(
+            {{"Authorization", "Bearer SECRET"}, {"X-Trace-Id", "42"}});
+      });
+  ASSERT_TRUE(result) << "Error: " << to_string(result.error());
+  EXPECT_EQ(StatusCode::OK_200, result->status);
+  // Like a header given with the request, a default one goes along unless it
+  // carries credentials (RFC 9110 15.4).
+  EXPECT_TRUE(authorization.empty());
+  EXPECT_EQ("42", trace_id);
+}
+
+TEST(RedirectToDifferentPort, KeepPayloadMaxLength) {
+  auto result = GetThroughRedirectToDifferentPort(
+      [](const Request &, Response &res) {
+        res.set_content(std::string(2048, 'x'), "text/plain");
+      },
+      [](Client &cli) { cli.set_payload_max_length(1024); });
+  EXPECT_FALSE(result);
+}
+
+TEST(RedirectToDifferentPort, KeepMaxTimeout) {
+  auto result = GetThroughRedirectToDifferentPort(
+      [](const Request &req, Response &res) {
+        // Answer after a second, or once the client gives up.
+        for (auto i = 0; i < 100 && !req.is_connection_closed(); i++) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        res.set_content("late", "text/plain");
+      },
+      [](Client &cli) { cli.set_max_timeout(std::chrono::milliseconds(200)); });
+  ASSERT_FALSE(result);
+  EXPECT_EQ(Error::Read, result.error());
+}
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+TEST(RedirectToDifferentPort, DoNotAnswerChallengeFromRedirectTarget) {
+  auto result = GetThroughRedirectToDifferentPort(
+      [](const Request &, Response &res) {
+        res.status = StatusCode::Unauthorized_401;
+        res.set_header("WWW-Authenticate",
+                       "Digest realm=\"r\", nonce=\"n\", qop=\"auth\"");
+      },
+      [](Client &cli) { cli.set_digest_auth("user", "pass"); });
+  ASSERT_TRUE(result) << "Error: " << to_string(result.error());
+  EXPECT_EQ(StatusCode::Unauthorized_401, result->status);
+}
+#endif
 
 TEST(RedirectToDifferentPort, OverflowPortNumber) {
   Server svr;
@@ -2796,6 +4463,76 @@ TEST(RedirectToDifferentPort, OverflowPortNumber) {
   auto res = cli.Get("/redir");
   // Should fail gracefully, not crash (no valid response due to bad port)
   EXPECT_FALSE(res);
+}
+
+TEST(RedirectToDifferentPort, TrailingCharactersInPort) {
+  Server svr;
+  auto port = svr.bind_to_any_port(HOST);
+  svr.Get("/redir", [&](const Request & /*req*/, Response &res) {
+    // The server's own port followed by junk must not be followed
+    res.set_redirect("http://" + std::string(HOST) + ":" +
+                     std::to_string(port) + "junk/target");
+  });
+  svr.Get("/target", [&](const Request & /*req*/, Response &res) {
+    res.set_content("target", "text/plain");
+  });
+
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_follow_location(true);
+
+  auto res = cli.Get("/redir");
+  EXPECT_FALSE(res);
+}
+
+TEST(RedirectTest, OtherStatusesWithLocationAreNotFollowed) {
+  Server svr;
+  std::atomic<bool> followed{false};
+
+  svr.Get("/304", [](const Request & /*req*/, Response &res) {
+    res.status = StatusCode::NotModified_304;
+    res.set_header("Location", "/target");
+  });
+
+  svr.Get("/305", [](const Request & /*req*/, Response &res) {
+    res.status = StatusCode::UseProxy_305;
+    res.set_header("Location", "/target");
+  });
+
+  svr.Get("/target", [&](const Request & /*req*/, Response &res) {
+    followed = true;
+    res.set_content("target", "text/plain");
+  });
+
+  auto th = std::thread([&]() { svr.listen("localhost", PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    th.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli("localhost", PORT);
+  cli.set_follow_location(true);
+
+  auto res = cli.Get("/304");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::NotModified_304, res->status);
+
+  res = cli.Get("/305");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::UseProxy_305, res->status);
+
+  EXPECT_FALSE(followed);
 }
 
 TEST(RedirectFromPageWithContent, Redirect) {
@@ -2829,7 +4566,7 @@ TEST(RedirectFromPageWithContent, Redirect) {
       return true;
     });
 
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ("Hello World!", body);
   }
@@ -2843,10 +4580,79 @@ TEST(RedirectFromPageWithContent, Redirect) {
       return true;
     });
 
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::Found_302, res->status);
     EXPECT_EQ("___", body);
   }
+}
+
+// A server can close the connection after a request with "Connection: close"
+// without repeating the option in its response (RFC 9112 Section 9.6), so the
+// redirected request must go out on a new connection.
+TEST(RedirectTest, NewConnectionAfterConnectionClose) {
+#ifndef _WIN32
+  signal(SIGPIPE, SIG_IGN);
+#endif
+
+  auto srv = ::socket(AF_INET, SOCK_STREAM, 0);
+  default_socket_options(srv);
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(PORT + 2));
+  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  ASSERT_EQ(0, ::bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
+  ASSERT_EQ(0, ::listen(srv, 2));
+
+  auto send_text = [](socket_t sock, const std::string &text) {
+    ::send(sock,
+#ifdef _WIN32
+           static_cast<const char *>(text.c_str()),
+           static_cast<int>(text.size()),
+#else
+           text.c_str(), text.size(),
+#endif
+           0);
+  };
+
+  auto reused = false;
+  auto server_thread = std::thread([&] {
+    char buf[4096];
+    auto first = ::accept(srv, nullptr, nullptr);
+    if (first == INVALID_SOCKET) { return; }
+    detail::set_socket_opt_time(first, SOL_SOCKET, SO_RCVTIMEO, 5, 0);
+    ::recv(first, buf, sizeof(buf), 0);
+    send_text(
+        first,
+        "HTTP/1.1 302 Found\r\nLocation: /2\r\nContent-Length: 0\r\n\r\n");
+
+    auto next = first;
+    if (::recv(first, buf, sizeof(buf), 0) > 0) {
+      reused = true;
+    } else {
+      detail::close_socket(first);
+      next = ::accept(srv, nullptr, nullptr);
+      if (next == INVALID_SOCKET) { return; }
+      detail::set_socket_opt_time(next, SOL_SOCKET, SO_RCVTIMEO, 5, 0);
+      ::recv(next, buf, sizeof(buf), 0);
+    }
+    send_text(next, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                    "Connection: close\r\n\r\nok");
+    detail::close_socket(next);
+  });
+
+  Client cli("127.0.0.1", PORT + 2);
+  cli.set_follow_location(true);
+  cli.set_read_timeout(5, 0);
+  auto res = cli.Get("/1");
+
+  server_thread.join();
+  detail::close_socket(srv);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("ok", res->body);
+  EXPECT_FALSE(reused);
 }
 
 TEST(RedirectFromPageWithContentIP6, Redirect) {
@@ -2898,7 +4704,7 @@ TEST(RedirectFromPageWithContentIP6, Redirect) {
       return true;
     });
 
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ("Hello World!", body);
   }
@@ -2912,7 +4718,7 @@ TEST(RedirectFromPageWithContentIP6, Redirect) {
       return true;
     });
 
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::Found_302, res->status);
     EXPECT_EQ("___", body);
   }
@@ -2945,7 +4751,7 @@ TEST(PathUrlEncodeTest, PathUrlEncode) {
     cli.set_path_encode(false);
 
     auto res = cli.Get("/foo?a=explicitly+encoded");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     // This expects it back with a space, as the `+` won't have been
     // url-encoded, and server-side the params get decoded turning `+`
@@ -2983,8 +4789,244 @@ TEST(PathUrlEncodeTest, PreEncodedQueryNotReencoded) {
     cli.set_path_encode(false);
 
     auto res = cli.Get(expected_target.c_str());
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
+  }
+}
+
+TEST(PathUrlEncodeTest, StreamingMatchesBufferedTarget) {
+  // `open_stream()` used to skip the path encoding that the buffered send
+  // path applies, so the same `path` produced different bytes in the request
+  // line depending on which API was used. Assert the two agree.
+  Server svr;
+
+  std::string target;
+  svr.Get(".*", [&](const Request &req, Response &res) {
+    target = req.target;
+    res.status = StatusCode::OK_200;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  struct {
+    const char *path;
+    const char *expected;
+  } cases[] = {
+      {"/a b?x=1", "/a%20b?x=1"},
+      {"/\xE6\x97\xA5\xE6\x9C\xAC", "/%E6%97%A5%E6%9C%AC"},
+      {"/a,b;c+d", "/a%2Cb%3Bc%2Bd"},
+  };
+
+  for (const auto &c : cases) {
+    Client cli(HOST, port);
+
+    target.clear();
+    auto res = cli.Get(c.path);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(c.expected, target) << "buffered path: " << c.path;
+    auto buffered_target = target;
+
+    target.clear();
+    auto handle = cli.open_stream("GET", c.path);
+    EXPECT_TRUE(handle.is_valid())
+        << "streaming path: " << c.path << ", " << to_string(handle.error);
+    EXPECT_EQ(buffered_target, target) << "streaming path: " << c.path;
+  }
+}
+
+TEST(PathUrlEncodeTest, StreamingPreEncodedQueryNotReencoded) {
+  // The `set_path_encode(false)` contract — transmit the supplied target
+  // verbatim — must hold for the streaming API too.
+  Server svr;
+
+  const std::string expected_target = "/foo?q=a%20b%2Cc%24d%3Bx&a=%00%FF";
+
+  std::string target;
+  svr.Get("/foo", [&](const Request &req, Response &res) {
+    target = req.target;
+    res.status = StatusCode::OK_200;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, port);
+    cli.set_path_encode(false);
+
+    auto handle = cli.open_stream("GET", expected_target);
+    EXPECT_TRUE(handle.is_valid()) << to_string(handle.error);
+    EXPECT_EQ(expected_target, target);
+  }
+}
+
+TEST(PathUrlEncodeTest, StreamingCRLFInTargetIsEncoded) {
+  // With path encoding enabled a CR/LF in the target is percent-encoded
+  // rather than rejected, matching the buffered send path. The CR/LF guard in
+  // write_request_line still backstops `set_path_encode(false)`, which is
+  // covered by StreamingCRLFRejectedWhenPathEncodeDisabled.
+  Server svr;
+
+  // Captured before routing: the decoded path contains a newline, which a
+  // `.*` handler pattern would not match (`.` excludes `\n` in std::regex).
+  std::string target;
+  svr.set_pre_routing_handler([&](const Request &req, Response &res) {
+    target = req.target;
+    res.status = StatusCode::OK_200;
+    return Server::HandlerResponse::Handled;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, port);
+
+    auto handle = cli.open_stream("GET", "/a\r\nX-Injected: 1");
+    EXPECT_TRUE(handle.is_valid()) << to_string(handle.error);
+    EXPECT_EQ("/a%0D%0AX-Injected:%201", target);
+  }
+}
+
+TEST(PathUrlEncodeTest, ControlCharsInPathAreEncoded) {
+  // Every control character is percent-encoded, not just CR/LF, so the target
+  // passes the request-target check in write_request_line.
+  Server svr;
+
+  std::string target;
+  svr.set_pre_routing_handler([&](const Request &req, Response &res) {
+    target = req.target;
+    res.status = StatusCode::OK_200;
+    return Server::HandlerResponse::Handled;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, port);
+
+    auto res = cli.Get("/a\tb\x1b\x7f");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ("/a%09b%1B%7F", target);
+  }
+}
+
+TEST(PathUrlEncodeTest, StreamingCRLFRejectedWhenPathEncodeDisabled) {
+  // Nothing may reach the wire: a raw CR/LF target would split the request
+  // line and inject headers.
+  Server svr;
+
+  // Pre-routing so that "not called" means nothing reached the server at all,
+  // rather than merely failing to match a handler pattern.
+  auto handler_called = false;
+  svr.set_pre_routing_handler([&](const Request & /*req*/, Response &res) {
+    handler_called = true;
+    res.status = StatusCode::OK_200;
+    return Server::HandlerResponse::Handled;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, port);
+    cli.set_path_encode(false);
+
+    auto handle = cli.open_stream("GET", "/a\r\nX-Injected: 1");
+    EXPECT_FALSE(handle.is_valid());
+    EXPECT_EQ(Error::Write, handle.error);
+    EXPECT_FALSE(handler_called);
+  }
+}
+
+TEST(PathUrlEncodeTest, RequestParamsBranchSelection) {
+  // Which of the two branches runs is decided by whether the query component
+  // is empty, not by whether `req.path` contains a `?`: a trailing `?` yields
+  // an empty query and must still fall back to building one from
+  // `req.params`, while a non-empty query must win over `req.params`.
+  Server svr;
+
+  std::string target;
+  svr.Get("/foo", [&](const Request &req, Response &res) {
+    target = req.target;
+    res.status = StatusCode::OK_200;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    // Trailing `?` -> empty query component -> `req.params` is used.
+    Client cli(HOST, port);
+
+    Request req;
+    req.method = "GET";
+    req.path = "/foo?";
+    req.params.emplace("a", "1");
+
+    target.clear();
+    auto res = cli.send(req);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ("/foo?a=1", target);
+  }
+
+  {
+    // Non-empty query in `req.path` -> `req.params` is not appended.
+    Client cli(HOST, port);
+
+    Request req;
+    req.method = "GET";
+    req.path = "/foo?b=2";
+    req.params.emplace("a", "1");
+
+    target.clear();
+    auto res = cli.send(req);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ("/foo?b=2", target);
   }
 }
 
@@ -3009,7 +5051,7 @@ TEST(PathUrlEncodeTest, IncludePercentEncodingLF) {
     cli.set_path_encode(false);
 
     auto res = cli.Get("/?something=%0A");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
 }
@@ -3034,7 +5076,7 @@ TEST(BindServerTest, BindDualStack) {
     Client cli("127.0.0.1", PORT);
 
     auto res = cli.Get("/1");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ("Hello World!", res->body);
   }
@@ -3042,7 +5084,7 @@ TEST(BindServerTest, BindDualStack) {
     Client cli("::1", PORT);
 
     auto res = cli.Get("/1");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ("Hello World!", res->body);
   }
@@ -3056,6 +5098,47 @@ TEST(BindServerTest, BindAndListenSeparately) {
   svr.stop();
 }
 
+// Reports whether anything is still listening on a loopback port. A plain
+// connect() is used instead of a Client request because a socket left bound by
+// mistake accepts the connection into its backlog and never answers, which
+// would hang the test instead of failing it.
+static bool is_loopback_port_accepting(int port) {
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(port));
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  socket_t sock = ::socket(AF_INET, SOCK_STREAM, 0);
+  EXPECT_NE(sock, INVALID_SOCKET);
+  if (sock == INVALID_SOCKET) { return false; }
+
+  auto ret = ::connect(sock, reinterpret_cast<sockaddr *>(&addr),
+                       static_cast<socklen_t>(sizeof(addr)));
+  detail::close_socket(sock);
+  return ret == 0;
+}
+
+TEST(BindServerTest, StopClosesBoundSocketWithoutListen) {
+  Server svr;
+  auto port = svr.bind_to_any_port("127.0.0.1");
+  ASSERT_TRUE(port > 0);
+  svr.stop();
+
+  // bind_to_any_port() already called listen(2), so until stop() closed the
+  // descriptor the port kept accepting connections into the backlog. ASSERT
+  // rather than EXPECT: with the socket still open, the listen_after_bind()
+  // below blocks forever in the accept loop.
+  ASSERT_FALSE(is_loopback_port_accepting(port));
+
+  // Nothing is left to accept on, so listen_after_bind() must report failure
+  // instead of returning success without ever serving.
+  EXPECT_FALSE(svr.listen_after_bind());
+
+  // The failed listen marks the server decommissioned, so a waiter returns
+  // instead of spinning forever.
+  svr.wait_until_ready();
+}
+
 #ifdef CPPHTTPLIB_SSL_ENABLED
 TEST(BindServerTest, BindAndListenSeparatelySSL) {
   SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, CLIENT_CA_CERT_FILE,
@@ -3064,6 +5147,19 @@ TEST(BindServerTest, BindAndListenSeparatelySSL) {
   ASSERT_TRUE(svr.is_valid());
   ASSERT_TRUE(port > 0);
   svr.stop();
+}
+
+// SSLServer::is_valid() overrides the base version, so it has to chain to it
+// or a rejected CustomRoute() registration would not stop the server binding.
+TEST(BindServerTest, SSLServerIsInvalidAfterRejectedCustomRoute) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, CLIENT_CA_CERT_FILE,
+                CLIENT_CA_CERT_DIR);
+  ASSERT_TRUE(svr.is_valid());
+
+  svr.CustomRoute("GET", "/x", [](const Request &, Response &) {});
+
+  EXPECT_FALSE(svr.is_valid());
+  EXPECT_TRUE(svr.bind_to_any_port("0.0.0.0") < 0);
 }
 
 TEST(BindServerTest, BindAndListenSeparatelySSLEncryptedKey) {
@@ -3134,10 +5230,343 @@ TEST(SSLClientServerTest, UpdateCertsPemWithClientAuth) {
   cli.set_connection_timeout(30);
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_TRUE(handler_called);
   EXPECT_EQ("ok", res->body);
+}
+
+// Puts a CA that did not sign the client's certificate in the old one's place.
+static bool replace_client_ca(SSLServer &svr) {
+  std::string cert_pem, key_pem, ca_pem;
+  read_file(SERVER_CERT_FILE, cert_pem);
+  read_file(SERVER_PRIVATE_KEY_FILE, key_pem);
+  read_file(SERVER_CERT2_FILE, ca_pem);
+  return svr.update_certs_pem(cert_pem.c_str(), key_pem.c_str(),
+                              ca_pem.c_str());
+}
+
+TEST(SSLClientServerTest, UpdateCertsPemReplacesClientCA) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, CLIENT_CA_CERT_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  thread t = thread([&]() { ASSERT_TRUE(svr.listen(HOST, PORT)); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  auto get = [] {
+    SSLClient cli(HOST, PORT, CLIENT_CERT_FILE, CLIENT_PRIVATE_KEY_FILE);
+    cli.enable_server_certificate_verification(false);
+    return cli.Get("/test");
+  };
+  ASSERT_TRUE(get());
+
+  ASSERT_TRUE(replace_client_ca(svr));
+  EXPECT_FALSE(get());
+}
+
+#ifndef CPPHTTPLIB_NO_EXCEPTIONS
+TEST(SSLClientServerTest, ThrowingVerifyCallbackRejectsTheCertificate) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, CLIENT_CA_CERT_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  tls::set_verify_callback(svr.tls_context(),
+                           [](const tls::VerifyContext &) -> bool {
+                             throw std::runtime_error("verify");
+                           });
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  thread t = thread([&]() { ASSERT_TRUE(svr.listen(HOST, PORT)); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  auto get = [] {
+    SSLClient cli(HOST, PORT, CLIENT_CERT_FILE, CLIENT_PRIVATE_KEY_FILE);
+    cli.enable_server_certificate_verification(false);
+    return cli.Get("/test");
+  };
+  EXPECT_FALSE(get());
+
+  // The handshake is over, so an update does not wait for it.
+  std::string cert_pem, key_pem;
+  read_file(SERVER_CERT_FILE, cert_pem);
+  read_file(SERVER_PRIVATE_KEY_FILE, key_pem);
+  EXPECT_TRUE(svr.update_certs_pem(cert_pem.c_str(), key_pem.c_str()));
+
+  tls::set_verify_callback(svr.tls_context(), [](const tls::VerifyContext &v) {
+    return v.preverify_ok;
+  });
+  auto res = get();
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("ok", res->body);
+}
+#endif
+
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+// Sends each request over a new connection with a client certificate,
+// resuming the session of the one before when there is one.
+class ResumingClient {
+public:
+  ResumingClient() : ctx_(SSL_CTX_new(TLS_client_method())) {
+    SSL_CTX_use_certificate_file(ctx_, CLIENT_CERT_FILE, SSL_FILETYPE_PEM);
+    SSL_CTX_use_PrivateKey_file(ctx_, CLIENT_PRIVATE_KEY_FILE,
+                                SSL_FILETYPE_PEM);
+
+    // BoringSSL hands out a resumable TLS 1.3 session only through this
+    // callback, not through SSL_get1_session().
+    SSL_CTX_set_app_data(ctx_, this);
+    SSL_CTX_set_session_cache_mode(ctx_, SSL_SESS_CACHE_CLIENT |
+                                             SSL_SESS_CACHE_NO_INTERNAL_STORE);
+    SSL_CTX_sess_set_new_cb(ctx_, [](SSL *ssl, SSL_SESSION *session) {
+      auto self = static_cast<ResumingClient *>(
+          SSL_CTX_get_app_data(SSL_get_SSL_CTX(ssl)));
+      SSL_SESSION_free(self->session_);
+      self->session_ = session;
+      return 1; // Keeps the reference
+    });
+  }
+  ~ResumingClient() {
+    SSL_SESSION_free(session_);
+    SSL_CTX_free(ctx_);
+  }
+
+  // Tells whether the request was answered.
+  bool get() {
+    auto error = Error::Success;
+    auto sock = detail::create_client_socket(
+        HOST, "", PORT, AF_UNSPEC, false, false, nullptr,
+        /*connection_timeout_sec=*/5, 0,
+        /*read_timeout_sec=*/5, 0,
+        /*write_timeout_sec=*/5, 0, std::string(), error);
+    if (sock == INVALID_SOCKET) { return false; }
+    auto sock_se = detail::scope_exit([&] { detail::close_socket(sock); });
+
+    auto ssl = SSL_new(ctx_);
+    auto ssl_se = detail::scope_exit([&] { SSL_free(ssl); });
+    SSL_set_fd(ssl, static_cast<int>(sock));
+    if (session_) { SSL_set_session(ssl, session_); }
+    if (SSL_connect(ssl) != 1) { return false; }
+    reused_ = SSL_session_reused(ssl) == 1;
+
+    // Reading the response also takes in a TLS 1.3 session ticket.
+    std::string req = "GET /test HTTP/1.1\r\nHost: x\r\n"
+                      "Connection: close\r\n\r\n";
+    SSL_write(ssl, req.data(), static_cast<int>(req.size()));
+    std::string res;
+    char buf[256];
+    int n;
+    while ((n = SSL_read(ssl, buf, sizeof(buf))) > 0) {
+      res.append(buf, static_cast<size_t>(n));
+    }
+
+    // Without a proper shutdown, OpenSSL marks the session not resumable.
+    SSL_shutdown(ssl);
+    return res.find("200 OK") != std::string::npos;
+  }
+
+  // Whether the last connection resumed a session
+  bool reused() const { return reused_; }
+
+private:
+  SSL_CTX *ctx_;
+  SSL_SESSION *session_ = nullptr;
+  bool reused_ = false;
+};
+
+// A client that resumes its session gets through, but not once the client CA
+// has changed, as a resumed session does not show the certificate again.
+TEST(SSLClientServerTest, ClientResumesSessionUntilClientCAChanges) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, CLIENT_CA_CERT_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  thread t = thread([&]() { ASSERT_TRUE(svr.listen(HOST, PORT)); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  ResumingClient cli;
+  ASSERT_TRUE(cli.get());
+  ASSERT_TRUE(cli.get());
+  EXPECT_TRUE(cli.reused());
+
+  ASSERT_TRUE(replace_client_ca(svr));
+  EXPECT_FALSE(cli.get());
+}
+
+// A resumed session does not show the certificate again, so the server does
+// not resume one with a verify callback to run on it.
+TEST(SSLClientServerTest, NoSessionResumptionWithVerifyCallback) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, CLIENT_CA_CERT_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  tls::set_verify_callback(svr.tls_context(), [](const tls::VerifyContext &v) {
+    return v.preverify_ok;
+  });
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  thread t = thread([&]() { ASSERT_TRUE(svr.listen(HOST, PORT)); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  ResumingClient cli;
+  ASSERT_TRUE(cli.get());
+  ASSERT_TRUE(cli.get());
+  EXPECT_FALSE(cli.reused());
+}
+#endif
+
+#ifdef CPPHTTPLIB_WOLFSSL_SUPPORT
+// wolfSSL shares its session cache between contexts, so a resumed session
+// could carry a client certificate checked against another server's CA, or
+// against a client CA since replaced.
+TEST(SSLClientServerTest, ClientSessionIsNotResumedPastItsCA) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, CLIENT_CA_CERT_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  // Trusts a CA that did not sign the client's certificate.
+  SSLServer other(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, SERVER_CERT2_FILE);
+  ASSERT_TRUE(other.is_valid());
+  for (auto s : {&svr, &other}) {
+    s->Get("/test", [](const Request &, Response &res) {
+      res.set_content("ok", "text/plain");
+    });
+  }
+
+  thread t = thread([&]() { ASSERT_TRUE(svr.listen(HOST, PORT)); });
+  thread t2 = thread([&]() { ASSERT_TRUE(other.listen(HOST, PORT + 1)); });
+  auto se = detail::scope_exit([&] {
+    other.stop();
+    svr.stop();
+    t2.join();
+    t.join();
+  });
+  svr.wait_until_ready();
+  other.wait_until_ready();
+
+  auto ctx = wolfSSL_CTX_new(wolfTLSv1_2_client_method());
+  auto ctx_se = detail::scope_exit([&] { wolfSSL_CTX_free(ctx); });
+  wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, nullptr);
+  ASSERT_EQ(WOLFSSL_SUCCESS, wolfSSL_CTX_use_certificate_file(
+                                 ctx, CLIENT_CERT_FILE, WOLFSSL_FILETYPE_PEM));
+  ASSERT_EQ(WOLFSSL_SUCCESS,
+            wolfSSL_CTX_use_PrivateKey_file(ctx, CLIENT_PRIVATE_KEY_FILE,
+                                            WOLFSSL_FILETYPE_PEM));
+
+  WOLFSSL_SESSION *session = nullptr;
+  auto session_se = detail::scope_exit([&] {
+    if (session) { wolfSSL_SESSION_free(session); }
+  });
+
+  // A request over a new connection, resuming `session` when there is one and
+  // keeping the connection's own in its place. Tells whether it was answered.
+  auto get = [&](int port) {
+    auto error = Error::Success;
+    auto sock = detail::create_client_socket(
+        HOST, "", port, AF_UNSPEC, false, false, nullptr,
+        /*connection_timeout_sec=*/5, 0,
+        /*read_timeout_sec=*/5, 0,
+        /*write_timeout_sec=*/5, 0, std::string(), error);
+    if (sock == INVALID_SOCKET) { return false; }
+    auto sock_se = detail::scope_exit([&] { detail::close_socket(sock); });
+
+    auto ssl = wolfSSL_new(ctx);
+    auto ssl_se = detail::scope_exit([&] { wolfSSL_free(ssl); });
+    wolfSSL_set_fd(ssl, static_cast<int>(sock));
+    if (session) { wolfSSL_set_session(ssl, session); }
+    if (wolfSSL_connect(ssl) != WOLFSSL_SUCCESS) { return false; }
+
+    std::string req = "GET /test HTTP/1.1\r\nHost: x\r\n"
+                      "Connection: close\r\n\r\n";
+    wolfSSL_write(ssl, req.data(), static_cast<int>(req.size()));
+    std::string res;
+    char buf[256];
+    int n;
+    while ((n = wolfSSL_read(ssl, buf, sizeof(buf))) > 0) {
+      res.append(buf, static_cast<size_t>(n));
+    }
+
+    wolfSSL_shutdown(ssl);
+    if (session) { wolfSSL_SESSION_free(session); }
+    session = wolfSSL_get1_session(ssl);
+    return res.find("200 OK") != std::string::npos;
+  };
+
+  ASSERT_TRUE(get(PORT));
+  EXPECT_FALSE(get(PORT + 1));
+
+  ASSERT_TRUE(get(PORT));
+  ASSERT_TRUE(replace_client_ca(svr));
+  EXPECT_FALSE(get(PORT));
+}
+#endif
+
+TEST(SSLClientServerTest, UpdateCertsPemWaitsForHandshakeInProgress) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  thread t = thread([&]() { ASSERT_TRUE(svr.listen(HOST, PORT)); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  // A connection that sends no ClientHello keeps its handshake in progress,
+  // once the server has had a moment to start it.
+  auto error = Error::Success;
+  auto sock = detail::create_client_socket(
+      HOST, "", PORT, AF_UNSPEC, false, false, nullptr,
+      /*connection_timeout_sec=*/5, 0,
+      /*read_timeout_sec=*/5, 0,
+      /*write_timeout_sec=*/5, 0, std::string(), error);
+  ASSERT_NE(INVALID_SOCKET, sock);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+  std::string cert_pem, key_pem;
+  read_file(SERVER_CERT_FILE, cert_pem);
+  read_file(SERVER_PRIVATE_KEY_FILE, key_pem);
+
+  auto update = std::async(std::launch::async, [&]() {
+    return svr.update_certs_pem(cert_pem.c_str(), key_pem.c_str());
+  });
+  EXPECT_EQ(std::future_status::timeout,
+            update.wait_for(std::chrono::milliseconds(200)));
+
+  detail::close_socket(sock);
+  EXPECT_TRUE(update.get());
+
+  SSLClient cli(HOST, PORT);
+  cli.enable_server_certificate_verification(false);
+  auto res = cli.Get("/test");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 #endif
 
@@ -3168,7 +5597,7 @@ TEST(ErrorHandlerTest, ContentLength) {
     Client cli(HOST, PORT);
 
     auto res = cli.Get("/hi", Headers{{"Accept-Encoding", ""}});
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
     EXPECT_EQ("26", res->get_header_value("Content-Length"));
@@ -3201,14 +5630,14 @@ TEST(ExceptionTest, WithoutExceptionHandler) {
 
   {
     auto res = cli.Get("/exception");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::InternalServerError_500, res->status);
     EXPECT_FALSE(res->has_header("EXCEPTION_WHAT"));
   }
 
   {
     auto res = cli.Get("/unknown");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::InternalServerError_500, res->status);
     EXPECT_FALSE(res->has_header("EXCEPTION_WHAT"));
   }
@@ -3249,7 +5678,7 @@ TEST(ExceptionTest, WithExceptionHandler) {
 
     for (size_t j = 0; j < 100; j++) {
       auto res = cli.Get("/hi", Headers{{"Accept-Encoding", ""}});
-      ASSERT_TRUE(res);
+      ASSERT_TRUE(res) << "Error: " << to_string(res.error());
       EXPECT_EQ(StatusCode::InternalServerError_500, res->status);
       EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
       EXPECT_EQ("26", res->get_header_value("Content-Length"));
@@ -3260,12 +5689,44 @@ TEST(ExceptionTest, WithExceptionHandler) {
 
     for (size_t j = 0; j < 100; j++) {
       auto res = cli.Get("/hi", Headers{{"Accept-Encoding", ""}});
-      ASSERT_TRUE(res);
+      ASSERT_TRUE(res) << "Error: " << to_string(res.error());
       EXPECT_EQ(StatusCode::InternalServerError_500, res->status);
       EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
       EXPECT_EQ("26", res->get_header_value("Content-Length"));
       EXPECT_EQ("abcdefghijklmnopqrstuvwxyz", res->body);
     }
+  }
+}
+
+TEST(ExceptionTest, StatusIs500UnlessExceptionHandlerSetsIt) {
+  Server svr;
+  svr.set_exception_handler(
+      [](const Request &, Response &res, std::exception_ptr) {
+        res.set_content("oops", "text/plain");
+      });
+  svr.Get("/throw", [](const Request &, Response &) {
+    throw std::runtime_error("throw");
+  });
+  svr.Get("/created-then-throw", [](const Request &, Response &res) {
+    res.status = StatusCode::Created_201;
+    throw std::runtime_error("created-then-throw");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_GT(port, 0);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  for (auto path : {"/throw", "/created-then-throw"}) {
+    auto res = cli.Get(path);
+    ASSERT_TRUE(res) << path << ": " << to_string(res.error());
+    EXPECT_EQ(StatusCode::InternalServerError_500, res->status) << path;
   }
 }
 
@@ -3309,25 +5770,297 @@ TEST(ExceptionTest, AndErrorHandler) {
 
   {
     auto res = cli.Get("/exception");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
     EXPECT_EQ("EXCEPTION", res->body);
   }
 
   {
     auto res = cli.Get("/error");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::InternalServerError_500, res->status);
     EXPECT_EQ("ERROR", res->body);
   }
 
   {
     auto res = cli.Get("/invalid");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::NotFound_404, res->status);
     EXPECT_EQ("NOT_FOUND", res->body);
   }
 }
+#endif
+
+#ifndef CPPHTTPLIB_NO_EXCEPTIONS
+// An exception from a user callback outside process_request()'s try/catch
+// used to unwind into the task queue - which does not catch - and terminate
+// the process. Each test below runs the server on a single worker thread: a
+// guard that catches the exception but still loses the thread would otherwise
+// be hidden by a spare worker serving the follow-up request. Note that a
+// regression here aborts the whole test binary rather than failing one test.
+TEST(ServerExceptionTest, ThrowingContentProviderDoesNotKillTheServer) {
+  Server svr;
+  svr.new_task_queue = [] { return new ThreadPool(1); };
+
+  std::atomic<int> reported{0};
+  svr.set_error_logger([&](const Error &err, const Request * /*req*/) {
+    if (err == Error::UserCallbackException) { reported++; }
+  });
+
+  svr.Get("/throw", [](const Request & /*req*/, Response &res) {
+    res.set_content_provider(
+        1024, "text/plain",
+        [](size_t /*offset*/, size_t /*length*/, DataSink &sink) -> bool {
+          sink.write("hello", 5);
+          throw std::runtime_error("from the content provider");
+        });
+  });
+
+  svr.Get("/ok", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, port);
+    cli.set_read_timeout(5, 0);
+    EXPECT_FALSE(cli.Get("/throw"));
+  }
+
+  EXPECT_TRUE(svr.is_running());
+  EXPECT_EQ(1, reported.load());
+
+  // A request on a fresh connection is still served.
+  {
+    Client cli(HOST, port);
+    auto res = cli.Get("/ok");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("ok", res->body);
+  }
+}
+
+TEST(ServerExceptionTest, ThrowingPostRoutingHandlerDoesNotKillTheServer) {
+  Server svr;
+  svr.new_task_queue = [] { return new ThreadPool(1); };
+
+  std::atomic<bool> should_throw{true};
+
+  svr.Get("/hi", [](const Request & /*req*/, Response &res) {
+    res.set_content("hi", "text/plain");
+  });
+
+  svr.set_post_routing_handler(
+      [&](const Request & /*req*/, Response & /*res*/) {
+        if (should_throw) {
+          throw std::runtime_error("from the post-routing handler");
+        }
+      });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, port);
+    cli.set_read_timeout(5, 0);
+    EXPECT_FALSE(cli.Get("/hi"));
+  }
+
+  EXPECT_TRUE(svr.is_running());
+
+  should_throw = false;
+
+  {
+    Client cli(HOST, port);
+    auto res = cli.Get("/hi");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("hi", res->body);
+  }
+}
+
+TEST(ServerExceptionTest, ThrowingErrorLoggerDoesNotReopenTheGuard) {
+  // The guard reports the caught exception through the error logger, which is
+  // a user callback too. A logger that throws has to be contained as well, or
+  // the process would terminate from inside the catch.
+  Server svr;
+  svr.new_task_queue = [] { return new ThreadPool(1); };
+
+  std::atomic<int> reported{0};
+  svr.set_error_logger([&](const Error &err, const Request * /*req*/) {
+    if (err == Error::UserCallbackException) {
+      reported++;
+      throw std::runtime_error("from the error logger");
+    }
+  });
+
+  svr.Get("/throw", [](const Request & /*req*/, Response &res) {
+    res.set_content_provider(
+        1024, "text/plain",
+        [](size_t /*offset*/, size_t /*length*/, DataSink &sink) -> bool {
+          sink.write("hello", 5);
+          throw std::runtime_error("from the content provider");
+        });
+  });
+
+  svr.Get("/ok", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, port);
+    cli.set_read_timeout(5, 0);
+    EXPECT_FALSE(cli.Get("/throw"));
+  }
+
+  EXPECT_TRUE(svr.is_running());
+  EXPECT_EQ(1, reported.load());
+
+  {
+    Client cli(HOST, port);
+    auto res = cli.Get("/ok");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("ok", res->body);
+  }
+}
+
+TEST(ServerExceptionTest, ThrowingWebSocketHandlerDoesNotKillTheServer) {
+  // A WebSocket handler runs on the upgrade path after the 101 has been sent,
+  // so the exception unwinds through the ws::WebSocket object on its way to
+  // the guard. None of the HTTP cases above cross that.
+  Server svr;
+  svr.new_task_queue = [] { return new ThreadPool(1); };
+
+  std::atomic<int> reported{0};
+  svr.set_error_logger([&](const Error &err, const Request * /*req*/) {
+    if (err == Error::UserCallbackException) { reported++; }
+  });
+
+  svr.WebSocket("/ws", [](const Request & /*req*/, ws::WebSocket & /*ws*/) {
+    throw std::runtime_error("from the WebSocket handler");
+  });
+
+  svr.Get("/ok", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    ws::WebSocketClient client("ws://localhost:" + std::to_string(port) +
+                               "/ws");
+    auto res = client.connect();
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+
+    // The server dropped the connection instead of dying.
+    std::string msg;
+    EXPECT_FALSE(client.read(msg));
+    client.close();
+  }
+
+  EXPECT_TRUE(svr.is_running());
+  EXPECT_EQ(1, reported.load());
+
+  {
+    Client cli(HOST, port);
+    auto res = cli.Get("/ok");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("ok", res->body);
+  }
+}
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+TEST(ServerExceptionTest, ThrowingContentProviderDoesNotKillTheSSLServer) {
+  // SSLServer::process_and_close_socket() is a separate overload with its own
+  // guard, so it is exercised on its own.
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.new_task_queue = [] { return new ThreadPool(1); };
+
+  std::atomic<int> reported{0};
+  svr.set_error_logger([&](const Error &err, const Request * /*req*/) {
+    if (err == Error::UserCallbackException) { reported++; }
+  });
+
+  svr.Get("/throw", [](const Request & /*req*/, Response &res) {
+    res.set_content_provider(
+        1024, "text/plain",
+        [](size_t /*offset*/, size_t /*length*/, DataSink &sink) -> bool {
+          sink.write("hello", 5);
+          throw std::runtime_error("from the content provider");
+        });
+  });
+
+  svr.Get("/ok", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    SSLClient cli(HOST, port);
+    cli.enable_server_certificate_verification(false);
+    cli.set_read_timeout(5, 0);
+    EXPECT_FALSE(cli.Get("/throw"));
+  }
+
+  EXPECT_TRUE(svr.is_running());
+  EXPECT_EQ(1, reported.load());
+
+  {
+    SSLClient cli(HOST, port);
+    cli.enable_server_certificate_verification(false);
+    auto res = cli.Get("/ok");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("ok", res->body);
+  }
+}
+#endif
 #endif
 
 TEST(NoContentTest, ContentLength) {
@@ -3349,10 +6082,136 @@ TEST(NoContentTest, ContentLength) {
     Client cli(HOST, PORT);
 
     auto res = cli.Get("/hi");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::NoContent_204, res->status);
-    EXPECT_EQ("0", res->get_header_value("Content-Length"));
+    // RFC 9110 8.6: none in a 204 response
+    EXPECT_FALSE(res->has_header("Content-Length"));
   }
+}
+
+TEST(ResponseFramingTest, HandlerFramingHeadersAreReplaced) {
+  Server svr;
+
+  svr.Get("/body", [](const Request & /*req*/, Response &res) {
+    res.set_header("Content-Length", "5");
+    res.set_content("hello world", "text/plain");
+  });
+  svr.Get("/chunked", [](const Request & /*req*/, Response &res) {
+    // A body that reads as the last chunk, were it taken as chunked
+    res.set_header("Transfer-Encoding", "chunked");
+    res.set_content("0\r\n\r\n", "text/plain");
+  });
+  svr.Get("/provider", [](const Request & /*req*/, Response &res) {
+    res.set_header("Content-Length", "2");
+    res.set_content_provider(5, "text/plain",
+                             [](size_t offset, size_t length, DataSink &sink) {
+                               sink.write(&"hello"[offset], length);
+                               return true;
+                             });
+  });
+  svr.Get("/empty", [](const Request & /*req*/, Response &res) {
+    res.set_header("Content-Length", "1234");
+  });
+
+  thread t = thread([&] { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, PORT);
+  cli.set_read_timeout(1, 0);
+
+  auto expect_body = [&](const Result &res, const std::string &body) {
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(body, res->body);
+    EXPECT_EQ(1u, res->get_header_value_count("Content-Length"));
+    EXPECT_FALSE(res->has_header("Transfer-Encoding"));
+  };
+
+  Headers identity{{"Accept-Encoding", ""}};
+  expect_body(cli.Get("/body", identity), "hello world");
+  expect_body(cli.Get("/chunked", identity), "0\r\n\r\n");
+  expect_body(cli.Get("/body",
+                      Headers{{"Accept-Encoding", ""}, {"Range", "bytes=0-1"}}),
+              "he");
+  expect_body(cli.Get("/provider", identity), "hello");
+  expect_body(cli.Get("/empty", identity), "");
+
+  // A HEAD response may give the length of the body a GET would get.
+  auto res = cli.Head("/empty");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("1234", res->get_header_value("Content-Length"));
+}
+
+TEST(ResponseFramingTest, PostRoutingHandlerChangesAreFramed) {
+  Server svr;
+
+  svr.Get("/", [](const Request & /*req*/, Response &res) {
+    res.set_content("short", "text/plain");
+  });
+  svr.set_post_routing_handler([](const Request & /*req*/, Response &res) {
+    res.body += " with a footer";
+    res.set_header("Transfer-Encoding", "chunked");
+  });
+
+  thread t = thread([&] { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, PORT);
+  cli.set_read_timeout(1, 0);
+
+  auto res = cli.Get("/", Headers{{"Accept-Encoding", ""}});
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("short with a footer", res->body);
+  EXPECT_EQ("19", res->get_header_value("Content-Length"));
+  EXPECT_FALSE(res->has_header("Transfer-Encoding"));
+}
+
+TEST(ResponseFramingTest, BodyWithoutLengthEndsWithTheConnection) {
+  Server svr;
+
+  svr.Get("/", [](const Request & /*req*/, Response &res) {
+    res.set_header("Content-Length", "3");
+    res.set_content_provider("text/plain", [](size_t, DataSink &sink) {
+      sink.write("abc", 3);
+      sink.done();
+      return true;
+    });
+  });
+
+  thread t = thread([&] { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, PORT);
+  cli.set_keep_alive(true);
+
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("abc", res->body);
+  EXPECT_FALSE(res->has_header("Content-Length"));
+  EXPECT_EQ("close", res->get_header_value("Connection"));
+  EXPECT_FALSE(res->has_header("Keep-Alive"));
+
+  // No body to delimit
+  auto head = cli.Head("/");
+  ASSERT_TRUE(head) << "Error: " << to_string(head.error());
+  EXPECT_FALSE(head->has_header("Connection"));
 }
 
 TEST(RoutingHandlerTest, PreAndPostRoutingHandlers) {
@@ -3404,7 +6263,7 @@ TEST(RoutingHandlerTest, PreAndPostRoutingHandlers) {
 #endif
 
     auto res = cli.Get("/routing_handler");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ("Routing Handler", res->body);
     EXPECT_EQ(1U, res->get_header_value_count("PRE_ROUTING"));
@@ -3422,7 +6281,7 @@ TEST(RoutingHandlerTest, PreAndPostRoutingHandlers) {
 #endif
 
     auto res = cli.Get("/hi");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ("Hello World!\n", res->body);
     EXPECT_EQ(0U, res->get_header_value_count("PRE_ROUTING"));
@@ -3438,7 +6297,7 @@ TEST(RoutingHandlerTest, PreAndPostRoutingHandlers) {
 #endif
 
     auto res = cli.Get("/aaa");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::NotFound_404, res->status);
     EXPECT_EQ("Error", res->body);
     EXPECT_EQ(0U, res->get_header_value_count("PRE_ROUTING"));
@@ -3483,21 +6342,21 @@ TEST(RequestHandlerTest, PreRequestHandler) {
   Client cli(HOST, PORT);
   {
     auto res = cli.Get("/hi");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ("hi", res->body);
   }
 
   {
     auto res = cli.Get("/user/john");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ("john", res->body);
   }
 
   {
     auto res = cli.Get("/user/invalid-user");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::Forbidden_403, res->status);
     EXPECT_EQ("error", res->body);
   }
@@ -3547,7 +6406,7 @@ TEST(RequestHandlerTest, PreRequestHandlerRunsBeforeBodyIsRead) {
   // rejects with 403 before the body is read, so 413 is never reached.
   {
     auto res = cli.Post("/reject", "0123456789", "text/plain");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::Forbidden_403, res->status);
     EXPECT_EQ("denied", res->body);
     EXPECT_FALSE(handler_ran);
@@ -3556,7 +6415,7 @@ TEST(RequestHandlerTest, PreRequestHandlerRunsBeforeBodyIsRead) {
   // An approved route still reads the body and enforces the payload limit.
   {
     auto res = cli.Post("/accept", "0123456789", "text/plain");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::PayloadTooLarge_413, res->status);
   }
 }
@@ -3626,7 +6485,7 @@ TEST(RequestHandlerTest, ResponseUserDataInPreRouting) {
 
   Client cli(HOST, PORT);
   auto res = cli.Get("/me");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("Hello alice", res->body);
 }
@@ -3660,7 +6519,7 @@ TEST(RequestHandlerTest, ResponseUserDataInPreRequest) {
 
   Client cli(HOST, PORT);
   auto res = cli.Get("/role");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("admin", res->body);
 }
@@ -3717,6 +6576,44 @@ TEST(URLFragmentTest, WithFragment) {
     EXPECT_TRUE(res);
     EXPECT_EQ(StatusCode::NotFound_404, res->status);
   }
+}
+
+TEST(URLFragmentTest, ParamsGoBeforeTheFragment) {
+  EXPECT_EQ("/a?b=1#f", append_query_params("/a#f", {{"b", "1"}}));
+  EXPECT_EQ("/a?q=0&b=1#f", append_query_params("/a?q=0#f", {{"b", "1"}}));
+
+  Server svr;
+  std::vector<std::string> targets;
+  svr.Get("/hi", [&](const Request &req, Response & /*res*/) {
+    targets.push_back(req.target);
+  });
+
+  auto thread = std::thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, PORT);
+  EXPECT_TRUE(cli.Get("/hi#f", Params{{"a", "1"}}, Headers{}));
+  EXPECT_TRUE(cli.Get("/hi?q=0#f", Params{{"a", "1"}}, Headers{}));
+  EXPECT_TRUE(cli.open_stream("GET", "/hi#f", {{"a", "1"}}).is_valid());
+
+  // A '?' after the '#' belongs to the fragment, not to the query.
+  Request req;
+  req.method = "GET";
+  req.path = "/hi#f?x=1";
+  req.params.emplace("a", "1");
+  Response res;
+  auto error = Error::Success;
+  EXPECT_TRUE(cli.send(req, res, error));
+
+  EXPECT_EQ((std::vector<std::string>{"/hi?a=1", "/hi?q=0&a=1", "/hi?a=1",
+                                      "/hi?a=1"}),
+            targets);
 }
 
 TEST(HeaderWriter, SetHeaderWriter) {
@@ -4045,6 +6942,15 @@ protected:
         .Get("/streamed-with-range",
              [&](const Request &req, Response &res) {
                auto data = new std::string("abcdefg");
+               // An explicit status keeps the server from picking the 206 it
+               // would otherwise choose for a ranged request, so the response
+               // is not a partial representation.
+               auto status = req.get_param_value("status");
+               if (status == "200") {
+                 res.status = StatusCode::OK_200;
+               } else if (status == "403") {
+                 res.status = StatusCode::Forbidden_403;
+               }
                res.set_content_provider(
                    data->size(), "text/plain",
                    [data](size_t offset, size_t length, DataSink &sink) {
@@ -4282,6 +7188,38 @@ protected:
                  [&](const Request & /*req*/, Response &res) {
                    res.set_header("Allow", "GET, POST, HEAD, OPTIONS");
                  })
+        .CustomRoute("PROPFIND", "/dav/:id",
+                     [&](const Request &req, Response &res) {
+                       res.set_header("x-body-size",
+                                      std::to_string(req.body.size()));
+                       res.set_header("x-matched-route", req.matched_route);
+                       res.set_header("x-dav-id", req.path_params.at("id"));
+                       res.status = StatusCode::MultiStatus_207;
+                       res.set_content(req.body, "application/xml");
+                     })
+        .CustomRoute("PROPFIND", R"(/dav-re/(\d+))",
+                     [&](const Request &req, Response &res) {
+                       res.set_header("x-dav-match", req.matches[1]);
+                       res.status = StatusCode::MultiStatus_207;
+                     })
+        .CustomRoute("MKCOL", "/dav-mkcol",
+                     [&](const Request &req, Response &res) {
+                       EXPECT_TRUE(req.body.empty());
+                       res.status = StatusCode::Created_201;
+                     })
+        .CustomRoute(
+            "REPORT", "/dav-report",
+            [&](const Request & /*req*/, Response &res,
+                const ContentReader &content_reader) {
+              std::string body;
+              content_reader([&](const char *data, size_t data_length) {
+                body.append(data, data_length);
+                return true;
+              });
+              res.set_header("x-body-size", std::to_string(body.size()));
+              res.status = StatusCode::MultiStatus_207;
+              res.set_content(body, "application/xml");
+            })
         .Get("/request-target",
              [&](const Request &req, Response & /*res*/) {
                EXPECT_EQ("/request-target?aaa=bbb&ccc=ddd", req.target);
@@ -4534,7 +7472,7 @@ protected:
 
 TEST_F(ServerTest, GetMethod200) {
   auto res = cli_.Get("/hi");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("HTTP/1.1", res->version);
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("OK", res->reason);
@@ -4545,7 +7483,7 @@ TEST_F(ServerTest, GetMethod200) {
 
 TEST_F(ServerTest, GetEmptyFile) {
   auto res = cli_.Get("/empty_file");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("application/octet-stream", res->get_header_value("Content-Type"));
   EXPECT_EQ(0, std::stoi(res->get_header_value("Content-Length")));
@@ -4554,7 +7492,7 @@ TEST_F(ServerTest, GetEmptyFile) {
 
 TEST_F(ServerTest, GetFileContent) {
   auto res = cli_.Get("/file_content");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
   EXPECT_EQ(9, std::stoi(res->get_header_value("Content-Length")));
@@ -4563,7 +7501,7 @@ TEST_F(ServerTest, GetFileContent) {
 
 TEST_F(ServerTest, GetFileContentWithRange) {
   auto res = cli_.Get("/file_content", Headers{{make_range_header({{1, 3}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
   EXPECT_EQ("bytes 1-3/9", res->get_header_value("Content-Range"));
@@ -4573,7 +7511,7 @@ TEST_F(ServerTest, GetFileContentWithRange) {
 
 TEST_F(ServerTest, GetFileContentWithContentType) {
   auto res = cli_.Get("/file_content_with_content_type");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ(5, std::stoi(res->get_header_value("Content-Length")));
@@ -4582,13 +7520,13 @@ TEST_F(ServerTest, GetFileContentWithContentType) {
 
 TEST_F(ServerTest, GetInvalidFileContent) {
   auto res = cli_.Get("/invalid_file_content");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, GetMethod200withPercentEncoding) {
   auto res = cli_.Get("/%68%69"); // auto res = cli_.Get("/hi");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("HTTP/1.1", res->version);
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
@@ -4598,7 +7536,7 @@ TEST_F(ServerTest, GetMethod200withPercentEncoding) {
 
 TEST_F(ServerTest, GetMethod302) {
   auto res = cli_.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::Found_302, res->status);
   EXPECT_EQ("/hi", res->get_header_value("Location"));
 }
@@ -4606,7 +7544,7 @@ TEST_F(ServerTest, GetMethod302) {
 TEST_F(ServerTest, GetMethod302Redirect) {
   cli_.set_follow_location(true);
   auto res = cli_.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("Hello World!", res->body);
   EXPECT_EQ("/hi", res->location);
@@ -4614,13 +7552,13 @@ TEST_F(ServerTest, GetMethod302Redirect) {
 
 TEST_F(ServerTest, GetMethod404) {
   auto res = cli_.Get("/invalid");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, HeadMethod200) {
   auto res = cli_.Head("/hi");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_TRUE(res->body.empty());
@@ -4628,7 +7566,7 @@ TEST_F(ServerTest, HeadMethod200) {
 
 TEST_F(ServerTest, HeadMethod200Static) {
   auto res = cli_.Head("/mount/dir/index.html");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
   EXPECT_EQ(104, std::stoi(res->get_header_value("Content-Length")));
@@ -4637,14 +7575,14 @@ TEST_F(ServerTest, HeadMethod200Static) {
 
 TEST_F(ServerTest, HeadMethod404) {
   auto res = cli_.Head("/invalid");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
   EXPECT_TRUE(res->body.empty());
 }
 
 TEST_F(ServerTest, GetMethodPersonJohn) {
   auto res = cli_.Get("/person/john");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("programmer", res->body);
@@ -4652,16 +7590,16 @@ TEST_F(ServerTest, GetMethodPersonJohn) {
 
 TEST_F(ServerTest, PostMethod1) {
   auto res = cli_.Get("/person/john1");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::NotFound_404, res->status);
 
   res = cli_.Post("/person", "name=john1&note=coder",
                   "application/x-www-form-urlencoded");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 
   res = cli_.Get("/person/john1");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("text/plain", res->get_header_value("Content-Type"));
   ASSERT_EQ("coder", res->body);
@@ -4669,7 +7607,7 @@ TEST_F(ServerTest, PostMethod1) {
 
 TEST_F(ServerTest, PostMethod2) {
   auto res = cli_.Get("/person/john2");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::NotFound_404, res->status);
 
   Params params;
@@ -4677,11 +7615,11 @@ TEST_F(ServerTest, PostMethod2) {
   params.emplace("note", "coder");
 
   res = cli_.Post("/person", params);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 
   res = cli_.Get("/person/john2");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("text/plain", res->get_header_value("Content-Type"));
   ASSERT_EQ("coder", res->body);
@@ -4689,7 +7627,7 @@ TEST_F(ServerTest, PostMethod2) {
 
 TEST_F(ServerTest, PutMethod3) {
   auto res = cli_.Get("/person/john3");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::NotFound_404, res->status);
 
   Params params;
@@ -4697,11 +7635,11 @@ TEST_F(ServerTest, PutMethod3) {
   params.emplace("note", "coder");
 
   res = cli_.Put("/person", params);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 
   res = cli_.Get("/person/john3");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("text/plain", res->get_header_value("Content-Type"));
   ASSERT_EQ("coder", res->body);
@@ -4709,7 +7647,7 @@ TEST_F(ServerTest, PutMethod3) {
 
 TEST_F(ServerTest, DeleteMethod1) {
   auto res = cli_.Get("/person/john4");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::NotFound_404, res->status);
 
   Params params;
@@ -4717,11 +7655,11 @@ TEST_F(ServerTest, DeleteMethod1) {
   params.emplace("note", "coder");
 
   res = cli_.Post("/person", params);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 
   res = cli_.Get("/person/john4");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("text/plain", res->get_header_value("Content-Type"));
   ASSERT_EQ("coder", res->body);
@@ -4730,18 +7668,18 @@ TEST_F(ServerTest, DeleteMethod1) {
   delete_params.emplace("name", "john4");
 
   res = cli_.Delete("/person", delete_params);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("DELETED", res->body);
 
   res = cli_.Get("/person/john4");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, DeleteMethod2) {
   auto res = cli_.Get("/person/john5");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::NotFound_404, res->status);
 
   Params params;
@@ -4749,11 +7687,11 @@ TEST_F(ServerTest, DeleteMethod2) {
   params.emplace("note", "developer");
 
   res = cli_.Post("/person", params);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 
   res = cli_.Get("/person/john5");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("text/plain", res->get_header_value("Content-Type"));
   ASSERT_EQ("developer", res->body);
@@ -4765,18 +7703,18 @@ TEST_F(ServerTest, DeleteMethod2) {
   headers.emplace("Custom-Header", "test-value");
 
   res = cli_.Delete("/person", headers, delete_params);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("DELETED", res->body);
 
   res = cli_.Get("/person/john5");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, DeleteMethod3) {
   auto res = cli_.Get("/person/john6");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::NotFound_404, res->status);
 
   Params params;
@@ -4784,11 +7722,11 @@ TEST_F(ServerTest, DeleteMethod3) {
   params.emplace("note", "tester");
 
   res = cli_.Post("/person", params);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 
   res = cli_.Get("/person/john6");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("text/plain", res->get_header_value("Content-Type"));
   ASSERT_EQ("tester", res->body);
@@ -4800,12 +7738,12 @@ TEST_F(ServerTest, DeleteMethod3) {
   headers.emplace("Custom-Header", "test-value");
 
   res = cli_.Delete("/person", headers, delete_params, nullptr);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("DELETED", res->body);
 
   res = cli_.Get("/person/john6");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::NotFound_404, res->status);
 }
 
@@ -4815,28 +7753,28 @@ TEST_F(ServerTest, PostWwwFormUrlEncodedJson) {
 
   auto res = cli_.Post("/x-www-form-urlencoded-json", params);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ(JSON_DATA, res->body);
 }
 
 TEST_F(ServerTest, PostEmptyContent) {
   auto res = cli_.Post("/empty", "", "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("empty", res->body);
 }
 
 TEST_F(ServerTest, PostEmptyContentWithNoContentType) {
   auto res = cli_.Post("/empty-no-content-type");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("empty-no-content-type", res->body);
 }
 
 TEST_F(ServerTest, PostPathOnly) {
   auto res = cli_.Post("/path-only");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("path-only", res->body);
 }
@@ -4844,28 +7782,28 @@ TEST_F(ServerTest, PostPathOnly) {
 TEST_F(ServerTest, PostPathAndHeadersOnly) {
   auto res = cli_.Post("/path-headers-only",
                        Headers({{"hello", "world"}, {"hello2", "world2"}}));
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("path-headers-only", res->body);
 }
 
 TEST_F(ServerTest, PostLarge) {
   auto res = cli_.Post("/post-large", LARGE_DATA, "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(LARGE_DATA, res->body);
 }
 
 TEST_F(ServerTest, PutEmptyContentWithNoContentType) {
   auto res = cli_.Put("/empty-no-content-type");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("empty-no-content-type", res->body);
 }
 
 TEST_F(ServerTest, GetMethodDir) {
   auto res = cli_.Get("/dir/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
 
@@ -4883,7 +7821,7 @@ TEST_F(ServerTest, GetMethodDir) {
 
 TEST_F(ServerTest, GetMethodDirTest) {
   auto res = cli_.Get("/dir/test.html");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
   EXPECT_EQ("test.html", res->body);
@@ -4891,33 +7829,31 @@ TEST_F(ServerTest, GetMethodDirTest) {
 
 TEST_F(ServerTest, GetMethodDirTestWithDoubleDots) {
   auto res = cli_.Get("/dir/../dir/test.html");
-  ASSERT_TRUE(res);
-  EXPECT_EQ(StatusCode::OK_200, res->status);
-  EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
-  EXPECT_EQ("test.html", res->body);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, GetMethodInvalidPath) {
   auto res = cli_.Get("/dir/../test.html");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, GetMethodOutOfBaseDir) {
   auto res = cli_.Get("/../www/dir/test.html");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, GetMethodOutOfBaseDir2) {
   auto res = cli_.Get("/dir/../../www/dir/test.html");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, GetMethodDirMountTest) {
   auto res = cli_.Get("/mount/dir/test.html");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
   EXPECT_EQ("test.html", res->body);
@@ -4925,45 +7861,57 @@ TEST_F(ServerTest, GetMethodDirMountTest) {
 
 TEST_F(ServerTest, GetMethodDirMountTestWithDoubleDots) {
   auto res = cli_.Get("/mount/dir/../dir/test.html");
-  ASSERT_TRUE(res);
-  EXPECT_EQ(StatusCode::OK_200, res->status);
-  EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
-  EXPECT_EQ("test.html", res->body);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, GetMethodInvalidMountPath) {
   auto res = cli_.Get("/mount/dir/../test.html");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, GetMethodEmbeddedNUL) {
   auto res = cli_.Get("/mount/dir/test.html%00.js");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, GetMethodOutOfBaseDirMount) {
   auto res = cli_.Get("/mount/../www2/dir/test.html");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, GetMethodOutOfBaseDirMount2) {
   auto res = cli_.Get("/mount/dir/../../www2/dir/test.html");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, GetMethodOutOfBaseDirMountWithBackslash) {
   auto res = cli_.Get("/mount/%2e%2e%5c/www2/dir/test.html");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
+}
+
+TEST_F(ServerTest, GetMethodDirMountWithoutTrailingSlash) {
+  auto res = cli_.Get("/mount/dir");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::MovedPermanently_301, res->status);
+  EXPECT_EQ("./dir/", res->get_header_value("Location"));
+}
+
+TEST_F(ServerTest, GetMethodDirWithLeadingDoubleSlash) {
+  auto res = cli_.Get("//dir");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::NotFound_404, res->status);
+  EXPECT_FALSE(res->has_header("Location"));
 }
 
 TEST_F(ServerTest, PostMethod303) {
   auto res = cli_.Post("/1", "body", "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::SeeOther_303, res->status);
   EXPECT_EQ("/2", res->get_header_value("Location"));
 }
@@ -4971,7 +7919,7 @@ TEST_F(ServerTest, PostMethod303) {
 TEST_F(ServerTest, PostMethod303Redirect) {
   cli_.set_follow_location(true);
   auto res = cli_.Post("/1", "body", "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("redirected.", res->body);
   EXPECT_EQ("/2", res->location);
@@ -4979,7 +7927,7 @@ TEST_F(ServerTest, PostMethod303Redirect) {
 
 TEST_F(ServerTest, UserDefinedMIMETypeMapping) {
   auto res = cli_.Get("/dir/test.abcde");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/abcde", res->get_header_value("Content-Type"));
   EXPECT_EQ("abcde", res->body);
@@ -4988,7 +7936,7 @@ TEST_F(ServerTest, UserDefinedMIMETypeMapping) {
 TEST_F(ServerTest, StaticFileRange) {
   auto res =
       cli_.Get("/dir/test.abcde", Headers{{make_range_header({{2, 3}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("text/abcde", res->get_header_value("Content-Type"));
   EXPECT_EQ("2", res->get_header_value("Content-Length"));
@@ -5000,7 +7948,7 @@ TEST_F(ServerTest, StaticFileRange) {
 TEST_F(ServerTest, StaticFileRanges) {
   auto res = cli_.Get("/dir/test.abcde",
                       Headers{{make_range_header({{1, 2}, {4, -1}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_TRUE(
       res->get_header_value("Content-Type")
@@ -5012,7 +7960,7 @@ TEST_F(ServerTest, StaticFileRanges) {
 
 TEST_F(ServerTest, StaticFileRangeHead) {
   auto res = cli_.Head("/dir/test.abcde", {{make_range_header({{2, 3}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("text/abcde", res->get_header_value("Content-Type"));
   EXPECT_EQ("2", res->get_header_value("Content-Length"));
@@ -5022,7 +7970,7 @@ TEST_F(ServerTest, StaticFileRangeHead) {
 
 TEST_F(ServerTest, StaticFileRangeBigFile) {
   auto res = cli_.Get("/dir/1MB.txt", Headers{{make_range_header({{-1, 5}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("5", res->get_header_value("Content-Length"));
@@ -5035,7 +7983,7 @@ TEST_F(ServerTest, StaticFileRangeBigFile) {
 TEST_F(ServerTest, StaticFileRangeBigFile2) {
   auto res =
       cli_.Get("/dir/1MB.txt", Headers{{make_range_header({{1, 4097}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("4097", res->get_header_value("Content-Length"));
@@ -5045,7 +7993,7 @@ TEST_F(ServerTest, StaticFileRangeBigFile2) {
 
 TEST_F(ServerTest, StaticFileBigFile) {
   auto res = cli_.Get("/dir/1MB.txt");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("1048576", res->get_header_value("Content-Length"));
@@ -5060,25 +8008,25 @@ TEST_F(ServerTest, Binary) {
 
   auto res = cli_.Post("/binary", binary.data(), binary.size(),
                        "application/octet-stream");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ(4U, res->body.size());
 
   res = cli_.Put("/binary", binary.data(), binary.size(),
                  "application/octet-stream");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ(4U, res->body.size());
 
   res = cli_.Patch("/binary", binary.data(), binary.size(),
                    "application/octet-stream");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ(4U, res->body.size());
 
   res = cli_.Delete("/binary", binary.data(), binary.size(),
                     "application/octet-stream");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ(4U, res->body.size());
 }
@@ -5087,22 +8035,22 @@ TEST_F(ServerTest, BinaryString) {
   auto binary = std::string("\x00\x01\x02\x03", 4);
 
   auto res = cli_.Post("/binary", binary, "application/octet-stream");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ(4U, res->body.size());
 
   res = cli_.Put("/binary", binary, "application/octet-stream");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ(4U, res->body.size());
 
   res = cli_.Patch("/binary", binary, "application/octet-stream");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ(4U, res->body.size());
 
   res = cli_.Delete("/binary", binary, "application/octet-stream");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ(4U, res->body.size());
 }
@@ -5122,7 +8070,7 @@ TEST_F(ServerTest, LongRequest) {
 
   auto res = cli_.Get(request.c_str());
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
@@ -5143,7 +8091,7 @@ TEST_F(ServerTest, TooLongRequest) {
       std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
           .count();
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::UriTooLong_414, res->status);
   EXPECT_LE(elapsed, 1000);
   EXPECT_EQ("close", res->get_header_value("Connection"));
@@ -5228,7 +8176,7 @@ TEST_F(ServerTest, LongQueryValue) {
       std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
           .count();
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::UriTooLong_414, res->status);
   EXPECT_LE(elapsed, 1000);
   EXPECT_EQ("close", res->get_header_value("Connection"));
@@ -5330,7 +8278,7 @@ TEST_F(ServerTest, HeaderCountExceedsLimit) {
   auto res = cli_.Get("/hi", headers);
 
   // The server should respond with 400 Bad Request
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::BadRequest_400, res->status);
   EXPECT_EQ("close", res->get_header_value("Connection"));
   EXPECT_FALSE(cli_.is_socket_open());
@@ -5338,37 +8286,37 @@ TEST_F(ServerTest, HeaderCountExceedsLimit) {
 
 TEST_F(ServerTest, PercentEncoding) {
   auto res = cli_.Get("/e%6edwith%");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
 TEST_F(ServerTest, PercentEncodingUnicode) {
   auto res = cli_.Get("/e%u006edwith%");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
 TEST_F(ServerTest, InvalidPercentEncoding) {
   auto res = cli_.Get("/%endwith%");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, InvalidPercentEncodingUnicode) {
   auto res = cli_.Get("/%uendwith%");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, EndWithPercentCharacterInQuery) {
   auto res = cli_.Get("/hello?aaa=bbb%");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 }
 
 TEST_F(ServerTest, PlusSignEncoding) {
   auto res = cli_.Get("/a+%2Bb?a %2bb=a %2Bb");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("a +b", res->body);
 }
@@ -5412,7 +8360,7 @@ TEST_F(ServerTest, MultipartFormData) {
 
   auto res = cli_.Post("/multipart", items);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -5430,13 +8378,13 @@ TEST_F(ServerTest, MultipartFormDataMultiFileValues) {
 
   auto res = cli_.Post("/multipart/multi_file_values", items);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
 TEST_F(ServerTest, CaseInsensitiveHeaderName) {
   auto res = cli_.Get("/hi");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("content-type"));
   EXPECT_EQ("Hello World!", res->body);
@@ -5472,10 +8420,9 @@ TEST_F(ServerTest, CaseInsensitiveTransferEncoding) {
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
-// GHSA-h6wq-j5mv-f3q8: the server must reject malformed chunk-size lines
-// rather than treat them as valid lengths.
 template <typename ClientT>
-static void expect_chunked_body_rejected(ClientT &cli, const char *body) {
+static void expect_chunked_body_status(ClientT &cli, const char *body,
+                                       int expected_status) {
   Request req;
   req.method = "POST";
   req.path = "/chunked";
@@ -5493,7 +8440,14 @@ static void expect_chunked_body_rejected(ClientT &cli, const char *body) {
   auto res = std::make_shared<Response>();
   auto error = Error::Success;
   ASSERT_TRUE(cli.send(req, *res, error));
-  EXPECT_EQ(StatusCode::BadRequest_400, res->status);
+  EXPECT_EQ(expected_status, res->status);
+}
+
+// GHSA-h6wq-j5mv-f3q8: the server must reject malformed chunk-size lines
+// rather than treat them as valid lengths.
+template <typename ClientT>
+static void expect_chunked_body_rejected(ClientT &cli, const char *body) {
+  expect_chunked_body_status(cli, body, StatusCode::BadRequest_400);
 }
 
 TEST_F(ServerTest, RejectsNegativeChunkSize) {
@@ -5505,9 +8459,62 @@ TEST_F(ServerTest, RejectsChunkSizeWithLeadingPlus) {
       cli_, "+4\r\ndech\r\nf\r\nunked post body\r\n0\r\n\r\n");
 }
 
+// RFC 9112 §7.1.1: a chunk-ext is made of tokens and quoted-strings, so the
+// chunk-size line carries no CR, LF or other control character ahead of its
+// terminator. Such a line must be refused rather than read as extension text.
+TEST_F(ServerTest, RejectsBareLFInChunkExtension) {
+  expect_chunked_body_rejected(
+      cli_, "4;\nxx\r\ndech\r\nf\r\nunked post body\r\n0\r\n\r\n");
+}
+
+TEST_F(ServerTest, RejectsBareLFAfterChunkSize) {
+  expect_chunked_body_rejected(
+      cli_, "4\nxx\r\ndech\r\nf\r\nunked post body\r\n0\r\n\r\n");
+}
+
+TEST_F(ServerTest, RejectsBareCRInChunkExtension) {
+  expect_chunked_body_rejected(
+      cli_, "4;a\rb\r\ndech\r\nf\r\nunked post body\r\n0\r\n\r\n");
+}
+
+TEST_F(ServerTest, RejectsControlCharacterInChunkExtension) {
+  // The literal stays split: a hex escape consumes every hex digit that
+  // follows, so "\x01b" would be the single byte \x1b, not \x01 then 'b'.
+  expect_chunked_body_rejected(
+      cli_, "4;a\x01"
+            "b\r\ndech\r\nf\r\nunked post body\r\n0\r\n\r\n");
+}
+
+// The bytes around chunk data are no payload, so they cannot ride on the
+// payload limit
+TEST_F(ServerTest, RejectsChunkOverheadPastItsLimit) {
+  // Small enough that the whole request is sent before the server turns it
+  // down, yet past the limit by the last chunks
+  auto pad = std::string(CPPHTTPLIB_HEADER_MAX_LENGTH / 16, 'x');
+  auto zeros = std::string(CPPHTTPLIB_HEADER_MAX_LENGTH / 16, '0');
+  auto spaces = std::string(CPPHTTPLIB_HEADER_MAX_LENGTH / 16, ' ');
+  for (const auto &size_line : {"1;" + pad, zeros + "1", "1" + spaces}) {
+    SCOPED_TRACE(size_line.substr(0, 2));
+    std::string body;
+    for (auto c : std::string("dechunked post body")) {
+      body += size_line + "\r\n" + c + "\r\n";
+    }
+    body += "0\r\n\r\n";
+    expect_chunked_body_rejected(cli_, body.c_str());
+  }
+}
+
+TEST_F(ServerTest, AcceptsChunkExtension) {
+  expect_chunked_body_status(cli_,
+                             "4;name=value\r\ndech\r\n"
+                             "f ; note=\"a;b c\"\r\nunked post body\r\n"
+                             "0;last\r\n\r\n",
+                             StatusCode::OK_200);
+}
+
 TEST_F(ServerTest, GetStreamed2) {
   auto res = cli_.Get("/streamed", Headers{{make_range_header({{2, 3}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("2", res->get_header_value("Content-Length"));
   EXPECT_EQ(true, res->has_header("Content-Range"));
@@ -5517,7 +8524,7 @@ TEST_F(ServerTest, GetStreamed2) {
 
 TEST_F(ServerTest, GetStreamed) {
   auto res = cli_.Get("/streamed");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("6", res->get_header_value("Content-Length"));
   EXPECT_EQ(std::string("aaabbb"), res->body);
@@ -5526,7 +8533,7 @@ TEST_F(ServerTest, GetStreamed) {
 TEST_F(ServerTest, GetStreamedWithoutLengthWithRange) {
   auto res = cli_.Get("/streamed-without-length",
                       Headers{make_range_header({{0, -1}})});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(false, res->has_header("Content-Length"));
   EXPECT_EQ(false, res->has_header("Content-Range"));
@@ -5536,7 +8543,7 @@ TEST_F(ServerTest, GetStreamedWithoutLengthWithRange) {
 TEST_F(ServerTest, GetStreamedWithRange1) {
   auto res =
       cli_.Get("/streamed-with-range", Headers{{make_range_header({{3, 5}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("3", res->get_header_value("Content-Length"));
   EXPECT_EQ(true, res->has_header("Content-Range"));
@@ -5547,7 +8554,7 @@ TEST_F(ServerTest, GetStreamedWithRange1) {
 TEST_F(ServerTest, GetStreamedWithRange2) {
   auto res =
       cli_.Get("/streamed-with-range", Headers{{make_range_header({{1, -1}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("6", res->get_header_value("Content-Length"));
   EXPECT_EQ(true, res->has_header("Content-Range"));
@@ -5557,7 +8564,7 @@ TEST_F(ServerTest, GetStreamedWithRange2) {
 
 TEST_F(ServerTest, GetStreamedWithRangeSuffix1) {
   auto res = cli_.Get("/streamed-with-range", Headers{{"Range", "bytes=-3"}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("3", res->get_header_value("Content-Length"));
   EXPECT_EQ(true, res->has_header("Content-Range"));
@@ -5566,13 +8573,62 @@ TEST_F(ServerTest, GetStreamedWithRangeSuffix1) {
 }
 
 TEST_F(ServerTest, GetStreamedWithRangeSuffix2) {
+  // RFC 9110 14.1.2: a suffix-length longer than the representation selects
+  // the entire representation.
+  for (auto range : {"bytes=-8", "bytes=-9999"}) {
+    auto res = cli_.Get("/streamed-with-range", Headers{{"Range", range}});
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::PartialContent_206, res->status) << range;
+    EXPECT_EQ("7", res->get_header_value("Content-Length")) << range;
+    EXPECT_EQ("bytes 0-6/7", res->get_header_value("Content-Range")) << range;
+    EXPECT_EQ(std::string("abcdefg"), res->body) << range;
+  }
+}
+
+TEST_F(ServerTest, GetStreamedWithRangeSuffixZero) {
   auto res =
-      cli_.Get("/streamed-with-range?error", Headers{{"Range", "bytes=-9999"}});
-  ASSERT_TRUE(res);
+      cli_.Get("/streamed-with-range?error", Headers{{"Range", "bytes=-0"}});
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::RangeNotSatisfiable_416, res->status);
   EXPECT_EQ("0", res->get_header_value("Content-Length"));
   EXPECT_EQ(false, res->has_header("Content-Range"));
   EXPECT_EQ(0U, res->body.size());
+}
+
+TEST_F(ServerTest, GetStreamedWithRangeAndNonPartialStatus) {
+  // Only a 206 is served as a partial representation. Under any other status
+  // `apply_ranges()` reported the full content length, so the body must match
+  // that header, and the content provider must never be asked for an offset
+  // outside the representation.
+  auto check = [&](int status, const char *range) {
+    auto path =
+        std::string("/streamed-with-range?status=") + std::to_string(status);
+    auto ctx = path + " Range: " + range;
+
+    auto res = cli_.Get(path, Headers{{"Range", range}});
+    ASSERT_TRUE(res) << ctx << " Error: " << to_string(res.error());
+    EXPECT_EQ(status, res->status) << ctx;
+    EXPECT_EQ("7", res->get_header_value("Content-Length")) << ctx;
+    EXPECT_EQ("text/plain", res->get_header_value("Content-Type")) << ctx;
+    EXPECT_FALSE(res->has_header("Content-Range")) << ctx;
+    EXPECT_EQ(std::string("abcdefg"), res->body) << ctx;
+  };
+
+  // Non-2xx: `detail::range_error()` never validated these ranges at all.
+  check(403, "bytes=3-5");
+  // The offset is far past the representation.
+  check(403, "bytes=100000-100200");
+  // `first_pos` is still -1 here, and the bounds asserts in
+  // `get_range_offset_and_length()` are compiled out under NDEBUG.
+  check(403, "bytes=-3");
+  // `apply_ranges()` makes no boundary for a non-206 response, so the
+  // multipart branch would have written one that is empty.
+  check(403, "bytes=1-2, 4-5");
+
+  // 2xx but not 206: the ranges were validated, yet the Content-Length still
+  // covers the whole representation.
+  check(200, "bytes=3-5");
+  check(200, "bytes=1-2, 4-5");
 }
 
 TEST_F(ServerTest, GetStreamedWithRangeError) {
@@ -5580,7 +8636,7 @@ TEST_F(ServerTest, GetStreamedWithRangeError) {
       cli_.Get("/streamed-with-range",
                Headers{{"Range", "bytes=92233720368547758079223372036854775806-"
                                  "92233720368547758079223372036854775807"}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::RangeNotSatisfiable_416, res->status);
   EXPECT_EQ("0", res->get_header_value("Content-Length"));
   EXPECT_EQ(false, res->has_header("Content-Range"));
@@ -5593,7 +8649,7 @@ TEST_F(ServerTest, GetRangeWithMaxLongLength) {
       Headers{{"Range",
                "bytes=0-" + std::to_string(std::numeric_limits<long>::max())},
               {"Accept-Encoding", ""}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("7", res->get_header_value("Content-Length"));
   EXPECT_EQ(true, res->has_header("Content-Range"));
@@ -5606,7 +8662,7 @@ TEST_F(ServerTest, GetRangeWithZeroToInfinite) {
                                          {"Range", "bytes=0-"},
                                          {"Accept-Encoding", ""},
                                      });
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("7", res->get_header_value("Content-Length"));
   EXPECT_EQ(true, res->has_header("Content-Range"));
@@ -5617,7 +8673,7 @@ TEST_F(ServerTest, GetRangeWithZeroToInfinite) {
 TEST_F(ServerTest, GetStreamedWithRangeMultipart) {
   auto res = cli_.Get("/streamed-with-range",
                       Headers{{make_range_header({{1, 2}, {4, 5}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("267", res->get_header_value("Content-Length"));
   EXPECT_EQ(false, res->has_header("Content-Range"));
@@ -5642,7 +8698,7 @@ TEST_F(ServerTest, GetStreamedWithTooManyRanges) {
 
   auto res = cli_.Get("/streamed-with-range?error",
                       Headers{{make_range_header(ranges)}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::RangeNotSatisfiable_416, res->status);
   EXPECT_EQ("0", res->get_header_value("Content-Length"));
   EXPECT_EQ(false, res->has_header("Content-Range"));
@@ -5652,7 +8708,7 @@ TEST_F(ServerTest, GetStreamedWithTooManyRanges) {
 TEST_F(ServerTest, GetStreamedWithOverwrapping) {
   auto res = cli_.Get("/streamed-with-range",
                       Headers{{make_range_header({{1, 4}, {2, 5}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ(5U, res->body.size());
 
@@ -5668,7 +8724,7 @@ TEST_F(ServerTest, GetStreamedWithOverwrapping) {
 TEST_F(ServerTest, GetStreamedWithNonAscendingRanges) {
   auto res = cli_.Get("/streamed-with-range",
                       Headers{{make_range_header({{4, 5}, {0, 2}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ(268U, res->body.size());
 
@@ -5686,7 +8742,7 @@ TEST_F(ServerTest, GetStreamedWithNonAscendingRanges) {
 TEST_F(ServerTest, GetStreamedWithDuplicateRanges) {
   auto res = cli_.Get("/streamed-with-range",
                       Headers{{make_range_header({{0, 2}, {0, 2}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ(269U, res->body.size());
 
@@ -5708,7 +8764,7 @@ TEST_F(ServerTest, GetStreamedWithRangesMoreThanTwoOverwrapping) {
   auto res =
       cli_.Get("/streamed-with-range?error",
                Headers{{make_range_header({{0, 1}, {1, 2}, {2, 3}, {3, 4}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::RangeNotSatisfiable_416, res->status);
   EXPECT_EQ("0", res->get_header_value("Content-Length"));
   EXPECT_EQ(false, res->has_header("Content-Range"));
@@ -5824,14 +8880,14 @@ TEST_F(ServerTest, GetWithRange5) {
 TEST_F(ServerTest, GetWithRangeOffsetGreaterThanContent) {
   auto res =
       cli_.Get("/with-range", Headers{{make_range_header({{10000, 20000}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::RangeNotSatisfiable_416, res->status);
 }
 
 TEST_F(ServerTest, GetWithRangeMultipart) {
   auto res =
       cli_.Get("/with-range", Headers{{make_range_header({{1, 2}, {4, 5}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   EXPECT_EQ("267", res->get_header_value("Content-Length"));
   EXPECT_EQ(false, res->has_header("Content-Range"));
@@ -5841,14 +8897,14 @@ TEST_F(ServerTest, GetWithRangeMultipart) {
 TEST_F(ServerTest, GetWithRangeMultipartOffsetGreaterThanContent) {
   auto res = cli_.Get("/with-range",
                       Headers{{make_range_header({{-1, 2}, {10000, 30000}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::RangeNotSatisfiable_416, res->status);
 }
 
 TEST_F(ServerTest, GetWithRangeCustomizedResponse) {
   auto res = cli_.Get("/with-range-customized-response",
                       Headers{{make_range_header({{1, 2}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::BadRequest_400, res->status);
   EXPECT_EQ(true, res->has_header("Content-Length"));
   EXPECT_EQ(false, res->has_header("Content-Range"));
@@ -5858,7 +8914,7 @@ TEST_F(ServerTest, GetWithRangeCustomizedResponse) {
 TEST_F(ServerTest, GetWithRangeMultipartCustomizedResponseMultipleRange) {
   auto res = cli_.Get("/with-range-customized-response",
                       Headers{{make_range_header({{1, 2}, {4, 5}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::BadRequest_400, res->status);
   EXPECT_EQ(true, res->has_header("Content-Length"));
   EXPECT_EQ(false, res->has_header("Content-Range"));
@@ -5867,34 +8923,34 @@ TEST_F(ServerTest, GetWithRangeMultipartCustomizedResponseMultipleRange) {
 
 TEST_F(ServerTest, Issue1772) {
   auto res = cli_.Get("/issue1772", Headers{{make_range_header({{1000, -1}})}});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
 }
 
 TEST_F(ServerTest, Issue609) {
   auto res = cli_.Delete("/issue609");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(std::string("ok"), res->body);
 }
 
 TEST_F(ServerTest, GetStreamedChunked) {
   auto res = cli_.Get("/streamed-chunked");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(std::string("123456789"), res->body);
 }
 
 TEST_F(ServerTest, GetStreamedChunked2) {
   auto res = cli_.Get("/streamed-chunked2");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(std::string("123456789"), res->body);
 }
 
 TEST_F(ServerTest, GetStreamedChunkedWithTrailer) {
   auto res = cli_.Get("/streamed-chunked-with-trailer");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(std::string("123456789"), res->body);
 
@@ -5949,7 +9005,7 @@ TEST_F(ServerTest, LargeChunkedPost) {
 
 TEST_F(ServerTest, GetMethodRemoteAddr) {
   auto res = cli_.Get("/remote_addr");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_TRUE(res->body == "::1" || res->body == "127.0.0.1");
@@ -5957,7 +9013,7 @@ TEST_F(ServerTest, GetMethodRemoteAddr) {
 
 TEST_F(ServerTest, GetMethodLocalAddr) {
   auto res = cli_.Get("/local_addr");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_TRUE(res->body == std::string("::1:").append(to_string(PORT)) ||
@@ -5966,7 +9022,7 @@ TEST_F(ServerTest, GetMethodLocalAddr) {
 
 TEST_F(ServerTest, HTTPResponseSplitting) {
   auto res = cli_.Get("/http_response_splitting");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -5990,7 +9046,7 @@ TEST_F(ServerTest, SlowPost) {
       },
       "text/plain");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -6014,7 +9070,7 @@ TEST_F(ServerTest, SlowPostFail) {
 
 TEST_F(ServerTest, Put) {
   auto res = cli_.Put("/put", "PUT", "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("PUT", res->body);
 }
@@ -6028,7 +9084,7 @@ TEST_F(ServerTest, PutWithContentProvider) {
       },
       "text/plain");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("PUT", res->body);
 }
@@ -6055,7 +9111,7 @@ TEST_F(ServerTest, PutWithContentProviderWithoutLength) {
       },
       "text/plain");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("PUT", res->body);
 }
@@ -6086,7 +9142,7 @@ TEST_F(ServerTest, PostLoopBack) {
         return true;
       });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("123456789", body);
 }
@@ -6108,7 +9164,7 @@ TEST_F(ServerTest, PutLoopBack) {
         return true;
       });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("123456789", body);
 }
@@ -6130,7 +9186,7 @@ TEST_F(ServerTest, PatchLoopBack) {
         return true;
       });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("123456789", body);
 }
@@ -6152,7 +9208,7 @@ TEST_F(ServerTest, PostLoopBackWithoutRequestContentLength) {
         return true;
       });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("123456789", body);
 }
@@ -6168,7 +9224,7 @@ TEST_F(ServerTest, PutWithContentProviderWithGzip) {
       },
       "text/plain");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("PUT", res->body);
 }
@@ -6197,7 +9253,7 @@ TEST_F(ServerTest, PutWithContentProviderWithoutLengthWithGzip) {
       },
       "text/plain");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("PUT", res->body);
 }
@@ -6216,7 +9272,7 @@ TEST_F(ServerTest, PutLargeFileWithGzip) {
   cli_.set_compress(true);
   auto res = cli_.Put("/put-large", LARGE_DATA, "text/plain");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(LARGE_DATA, res->body);
 }
@@ -6234,7 +9290,7 @@ TEST_F(ServerTest, PutLargeFileWithGzip2) {
 
   auto res = cli.Put("/put-large", LARGE_DATA, "text/plain");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(LARGE_DATA, res->body);
   // The compressed size should be less than a 10th of the original. May vary
@@ -6258,7 +9314,7 @@ TEST_F(ServerTest, PutContentWithDeflate) {
   auto res = cli_.Put("/put", headers,
                       "\170\234\013\010\015\001\0\001\361\0\372", "text/plain");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("PUT", res->body);
 }
@@ -6268,7 +9324,7 @@ TEST_F(ServerTest, GetStreamedChunkedWithGzip) {
   headers.emplace("Accept-Encoding", "gzip, deflate");
 
   auto res = cli_.Get("/streamed-chunked", headers);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(std::string("123456789"), res->body);
 }
@@ -6278,14 +9334,14 @@ TEST_F(ServerTest, GetStreamedChunkedWithGzip2) {
   headers.emplace("Accept-Encoding", "gzip, deflate");
 
   auto res = cli_.Get("/streamed-chunked2", headers);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(std::string("123456789"), res->body);
 }
 
 TEST_F(ServerTest, SplitDelimiterInPathRegex) {
   auto res = cli_.Get("/regex-with-delimiter?key=^(?.*(value))");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -6396,7 +9452,7 @@ TEST_F(ServerTest, GetStreamedChunkedWithBrotli) {
   headers.emplace("Accept-Encoding", "br");
 
   auto res = cli_.Get("/streamed-chunked", headers);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(std::string("123456789"), res->body);
 }
@@ -6406,7 +9462,7 @@ TEST_F(ServerTest, GetStreamedChunkedWithBrotli2) {
   headers.emplace("Accept-Encoding", "br");
 
   auto res = cli_.Get("/streamed-chunked2", headers);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(std::string("123456789"), res->body);
 }
@@ -6421,7 +9477,7 @@ TEST_F(ServerTest, PutWithContentProviderWithBrotli) {
       },
       "text/plain");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("PUT", res->body);
 }
@@ -6437,7 +9493,7 @@ TEST_F(ServerTest, PutWithContentProviderWithoutLengthWithBrotli) {
       },
       "text/plain");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("PUT", res->body);
 }
@@ -6446,7 +9502,7 @@ TEST_F(ServerTest, PutLargeFileWithBrotli) {
   cli_.set_compress(true);
   auto res = cli_.Put("/put-large", LARGE_DATA, "text/plain");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(LARGE_DATA, res->body);
   EXPECT_EQ("br", res.get_request_header_value("Content-Encoding"));
@@ -6455,28 +9511,28 @@ TEST_F(ServerTest, PutLargeFileWithBrotli) {
 
 TEST_F(ServerTest, Patch) {
   auto res = cli_.Patch("/patch", "PATCH", "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("PATCH", res->body);
 }
 
 TEST_F(ServerTest, Delete) {
   auto res = cli_.Delete("/delete");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("DELETE", res->body);
 }
 
 TEST_F(ServerTest, DeleteContentReceiver) {
   auto res = cli_.Delete("/delete-body", "content", "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("content", res->body);
 }
 
 TEST_F(ServerTest, Options) {
   auto res = cli_.Options("*");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("GET, POST, HEAD, OPTIONS", res->get_header_value("Allow"));
   EXPECT_TRUE(res->body.empty());
@@ -6484,20 +9540,20 @@ TEST_F(ServerTest, Options) {
 
 TEST_F(ServerTest, URL) {
   auto res = cli_.Get("/request-target?aaa=bbb&ccc=ddd");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
 TEST_F(ServerTest, ArrayParam) {
   auto res = cli_.Get("/array-param?array=value1&array=value2&array=value3");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
 TEST_F(ServerTest, ArrayParamValues) {
   auto res =
       cli_.Get("/array-param-values?array=value1&array=value2&array=value3");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -6505,13 +9561,13 @@ TEST_F(ServerTest, NoMultipleHeaders) {
   Headers headers = {{"Content-Length", "5"}};
   auto res = cli_.Post("/validate-no-multiple-headers", headers, "hello",
                        "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
 TEST_F(ServerTest, PostContentReceiver) {
   auto res = cli_.Post("/content_receiver", "content", "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("content", res->body);
 }
@@ -6527,7 +9583,7 @@ TEST_F(ServerTest, PostMultipartFileContentReceiver) {
 
   auto res = cli_.Post("/content_receiver", items);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -6562,7 +9618,7 @@ TEST_F(ServerTest, PostMultipartPlusBoundary) {
   std::string content_type = "multipart/form-data; boundary=" + boundary;
   auto res = cli_.Post("/content_receiver", body, content_type.c_str());
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -6630,7 +9686,7 @@ TEST(MultipartFormDataTest, FieldEscaping) {
   };
 
   auto res = cli.Post("/post", items);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -6688,7 +9744,7 @@ TEST(MultipartFormDataTest, PublicWriterAPI) {
     EXPECT_EQ(body.size(), writer.content_length(items));
 
     auto res = cli.Post("/post", body, writer.content_type());
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
 
@@ -6716,7 +9772,7 @@ TEST(MultipartFormDataTest, PublicWriterAPI) {
           return true;
         },
         writer.content_type());
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
 }
@@ -6724,21 +9780,21 @@ TEST(MultipartFormDataTest, PublicWriterAPI) {
 TEST_F(ServerTest, PostContentReceiverGzip) {
   cli_.set_compress(true);
   auto res = cli_.Post("/content_receiver", "content", "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("content", res->body);
 }
 
 TEST_F(ServerTest, PutContentReceiver) {
   auto res = cli_.Put("/content_receiver", "content", "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("content", res->body);
 }
 
 TEST_F(ServerTest, PatchContentReceiver) {
   auto res = cli_.Patch("/content_receiver", "content", "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_EQ("content", res->body);
 }
@@ -6762,7 +9818,7 @@ void TestWithHeadersAndContentReceiver(
       },
       nullptr);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("content", received_body);
 }
@@ -6833,7 +9889,7 @@ void TestWithHeadersAndContentReceiverWithProgress(
         return true;
       });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("content", received_body);
   EXPECT_TRUE(progress_called);
@@ -6950,7 +10006,7 @@ TEST_F(ServerTest, PatchWithHeadersAndContentReceiverError) {
 TEST_F(ServerTest, PostQueryStringAndBody) {
   auto res =
       cli_.Post("/query-string-and-body?key=value", "content", "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -6970,29 +10026,29 @@ TEST_F(ServerTest, HTTP2Magic) {
 
 TEST_F(ServerTest, KeepAlive) {
   auto res = cli_.Get("/hi");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("Hello World!", res->body);
 
   res = cli_.Get("/hi");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("Hello World!", res->body);
 
   res = cli_.Get("/hi");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("Hello World!", res->body);
 
   res = cli_.Get("/not-exist");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 
   res = cli_.Post("/empty", "", "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("empty", res->body);
@@ -7001,14 +10057,14 @@ TEST_F(ServerTest, KeepAlive) {
   res = cli_.Post(
       "/empty", 0, [&](size_t, size_t, DataSink &) { return true; },
       "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("empty", res->body);
 
   cli_.set_keep_alive(false);
   res = cli_.Get("/last-request");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("close", res->get_header_value("Connection"));
 }
@@ -7028,10 +10084,180 @@ TEST_F(ServerTest, BadRequestLineCancelsKeepAlive) {
   cli_.set_keep_alive(true);
   auto res = cli_.send(req);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::BadRequest_400, res->status);
   EXPECT_EQ("close", res->get_header_value("Connection"));
   EXPECT_FALSE(cli_.is_socket_open());
+}
+
+TEST_F(ServerTest, CustomRouteReadsBody) {
+  const std::string xml =
+      R"(<?xml version="1.0"?><propfind><allprop/></propfind>)";
+
+  Request req;
+  req.method = "PROPFIND";
+  req.path = "/dav/dir";
+  req.set_header("Depth", "1");
+  req.body = xml;
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::MultiStatus_207, res->status);
+  EXPECT_EQ(xml, res->body);
+  EXPECT_EQ(std::to_string(xml.size()), res->get_header_value("x-body-size"));
+  EXPECT_EQ("application/xml", res->get_header_value("Content-Type"));
+}
+
+TEST_F(ServerTest, CustomRouteMatchedRouteAndPathParams) {
+  Request req;
+  req.method = "PROPFIND";
+  req.path = "/dav/42";
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::MultiStatus_207, res->status);
+  EXPECT_EQ("/dav/:id", res->get_header_value("x-matched-route"));
+  EXPECT_EQ("42", res->get_header_value("x-dav-id"));
+}
+
+TEST_F(ServerTest, CustomRouteRegexPattern) {
+  Request req;
+  req.method = "PROPFIND";
+  req.path = "/dav-re/123";
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::MultiStatus_207, res->status);
+  EXPECT_EQ("123", res->get_header_value("x-dav-match"));
+}
+
+TEST_F(ServerTest, CustomRouteWithoutBody) {
+  Request req;
+  req.method = "MKCOL";
+  req.path = "/dav-mkcol";
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::Created_201, res->status);
+}
+
+TEST_F(ServerTest, CustomRouteWithContentReader) {
+  const std::string xml = R"(<?xml version="1.0"?><sync-collection/>)";
+
+  Request req;
+  req.method = "REPORT";
+  req.path = "/dav-report";
+  req.body = xml;
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::MultiStatus_207, res->status);
+  EXPECT_EQ(xml, res->body);
+}
+
+// A content reader route must fire even when the request carries no body,
+// the way the built-in Delete(pattern, HandlerWithContentReader) does.
+// Without that, a body-less PROPFIND-style request would fall through to 404.
+TEST_F(ServerTest, CustomRouteWithContentReaderWithoutBody) {
+  Request req;
+  req.method = "REPORT";
+  req.path = "/dav-report";
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::MultiStatus_207, res->status);
+  EXPECT_EQ("0", res->get_header_value("x-body-size"));
+}
+
+TEST_F(ServerTest, CustomRouteUnmatchedPathReturns404) {
+  Request req;
+  req.method = "PROPFIND";
+  req.path = "/not-dav";
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::NotFound_404, res->status);
+}
+
+TEST_F(ServerTest, CustomRouteUnregisteredMethodIsRejected) {
+  Request req;
+  req.method = "UNLOCK";
+  req.path = "/dav/dir";
+
+  cli_.set_keep_alive(true);
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::BadRequest_400, res->status);
+  EXPECT_EQ("close", res->get_header_value("Connection"));
+  EXPECT_FALSE(cli_.is_socket_open());
+}
+
+TEST_F(ServerTest, CustomRouteDoesNotServeStaticFiles) {
+  // The mount point serves this path, but only for GET and HEAD.
+  auto get_res = cli_.Get("/dir/index.html");
+  ASSERT_TRUE(get_res) << "Error: " << to_string(get_res.error());
+  ASSERT_EQ(StatusCode::OK_200, get_res->status);
+
+  Request req;
+  req.method = "PROPFIND";
+  req.path = "/dir/index.html";
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::NotFound_404, res->status);
+}
+
+TEST_F(ServerTest, CustomRouteKeepAlive) {
+  const std::string xml = R"(<?xml version="1.0"?><propfind/>)";
+
+  cli_.set_keep_alive(true);
+
+  for (auto i = 0; i < 2; i++) {
+    Request req;
+    req.method = "PROPFIND";
+    req.path = "/dav/dir";
+    req.body = xml;
+
+    auto res = cli_.send(req);
+
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::MultiStatus_207, res->status);
+    EXPECT_EQ(xml, res->body);
+    EXPECT_TRUE(cli_.is_socket_open());
+  }
+
+  // A built-in method must still be served on the same connection.
+  cli_.set_keep_alive(false);
+
+  auto res = cli_.Get("/hi");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("close", res->get_header_value("Connection"));
+}
+
+TEST_F(ServerTest, CustomRouteExpect100Continue) {
+  const std::string xml = R"(<?xml version="1.0"?><propfind/>)";
+
+  Request req;
+  req.method = "PROPFIND";
+  req.path = "/dav/dir";
+  req.set_header("Expect", "100-continue");
+  req.body = xml;
+
+  auto res = cli_.send(req);
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::MultiStatus_207, res->status);
+  EXPECT_EQ(xml, res->body);
 }
 
 TEST_F(ServerTest, StartTime) { auto res = cli_.Get("/test-start-time"); }
@@ -7042,7 +10268,7 @@ TEST_F(ServerTest, Gzip) {
   headers.emplace("Accept-Encoding", "gzip, deflate");
   auto res = cli_.Get("/compress", headers);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("33", res->get_header_value("Content-Length"));
@@ -7057,7 +10283,7 @@ TEST_F(ServerTest, GzipWithContentTypeParameters) {
   headers.emplace("Accept-Encoding", "gzip, deflate");
   auto res = cli_.Get("/compress-with-charset", headers);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
   EXPECT_EQ("application/json; charset=utf-8",
             res->get_header_value("Content-Type"));
@@ -7072,7 +10298,7 @@ TEST_F(ServerTest, GzipWithoutAcceptEncoding) {
   headers.emplace("Accept-Encoding", "");
   auto res = cli_.Get("/compress", headers);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_TRUE(res->get_header_value("Content-Encoding").empty());
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("100", res->get_header_value("Content-Length"));
@@ -7086,14 +10312,14 @@ TEST_F(ServerTest, GzipWithContentReceiver) {
   Headers headers;
   headers.emplace("Accept-Encoding", "gzip, deflate");
   std::string body;
-  auto res = cli_.Get("/compress", headers,
-                      [&](const char *data, uint64_t data_length) {
-                        EXPECT_EQ(100U, data_length);
-                        body.append(data, data_length);
-                        return true;
-                      });
+  auto res =
+      cli_.Get("/compress", headers, [&](const char *data, size_t data_length) {
+        EXPECT_EQ(100U, data_length);
+        body.append(data, data_length);
+        return true;
+      });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("33", res->get_header_value("Content-Length"));
@@ -7110,7 +10336,7 @@ TEST_F(ServerTest, GzipWithoutDecompressing) {
   cli_.set_decompress(false);
   auto res = cli_.Get("/compress", headers);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("33", res->get_header_value("Content-Length"));
@@ -7123,14 +10349,14 @@ TEST_F(ServerTest, GzipWithContentReceiverWithoutAcceptEncoding) {
   headers.emplace("Accept-Encoding", "");
 
   std::string body;
-  auto res = cli_.Get("/compress", headers,
-                      [&](const char *data, uint64_t data_length) {
-                        EXPECT_EQ(100U, data_length);
-                        body.append(data, data_length);
-                        return true;
-                      });
+  auto res =
+      cli_.Get("/compress", headers, [&](const char *data, size_t data_length) {
+        EXPECT_EQ(100U, data_length);
+        body.append(data, data_length);
+        return true;
+      });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_TRUE(res->get_header_value("Content-Encoding").empty());
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("100", res->get_header_value("Content-Length"));
@@ -7145,7 +10371,7 @@ TEST_F(ServerTest, NoGzip) {
   headers.emplace("Accept-Encoding", "gzip, deflate");
   auto res = cli_.Get("/nocompress", headers);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(false, res->has_header("Content-Encoding"));
   EXPECT_EQ("application/octet-stream", res->get_header_value("Content-Type"));
   EXPECT_EQ("100", res->get_header_value("Content-Length"));
@@ -7160,13 +10386,13 @@ TEST_F(ServerTest, NoGzipWithContentReceiver) {
   headers.emplace("Accept-Encoding", "gzip, deflate");
   std::string body;
   auto res = cli_.Get("/nocompress", headers,
-                      [&](const char *data, uint64_t data_length) {
+                      [&](const char *data, size_t data_length) {
                         EXPECT_EQ(100U, data_length);
                         body.append(data, data_length);
                         return true;
                       });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(false, res->has_header("Content-Encoding"));
   EXPECT_EQ("application/octet-stream", res->get_header_value("Content-Type"));
   EXPECT_EQ("100", res->get_header_value("Content-Length"));
@@ -7185,8 +10411,382 @@ TEST_F(ServerTest, MultipartFormDataGzip) {
   cli_.set_compress(true);
   auto res = cli_.Post("/compress-multipart", items);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+#endif
+
+#ifdef CPPHTTPLIB_ZLIB_SUPPORT
+// Static file compression is opt-in, so these run their own server rather than
+// flipping it on for the shared ServerTest fixture, which would silently
+// rewrite what every other static file test is asserting.
+class StaticFileCompressionTest : public ::testing::Test {
+protected:
+  void TearDown() override {
+    if (t_.joinable()) {
+      svr_.stop();
+      t_.join();
+    }
+  }
+
+  int start(const std::function<void(Server &)> &configure = nullptr) {
+    // Serves the same tree as a directory of build-time compressed assets
+    // would be served: the mount point names the coding the files are already
+    // stored in. Registered before "/" so it is the one that matches.
+    svr_.set_mount_point("/pre-encoded", "./www",
+                         {{"Content-Encoding", "gzip"}});
+
+    svr_.set_mount_point("/", "./www");
+
+    svr_.Get("/file_content", [](const Request & /*req*/, Response &res) {
+      res.set_file_content("./www/dir/index.html", "text/html");
+    });
+
+    svr_.Get("/pre-encoded-file-content",
+             [](const Request & /*req*/, Response &res) {
+               res.set_header("Content-Encoding", "gzip");
+               res.set_file_content("./www/dir/index.html", "text/html");
+             });
+
+    svr_.Get("/streamed", [](const Request & /*req*/, Response &res) {
+      res.set_content_provider(
+          6, "text/plain",
+          [](size_t offset, size_t /*length*/, DataSink &sink) {
+            sink.write(offset < 3 ? "aaa" : "bbb", 3);
+            return true;
+          });
+    });
+
+    svr_.Get("/slow-stream", [](const Request & /*req*/, Response &res) {
+      res.set_content_provider(
+          1000, "text/plain",
+          [](size_t offset, size_t /*length*/, DataSink &sink) {
+            if (offset < 100) {
+              std::string data(100, 'A');
+              sink.write(data.data(), data.size());
+              return true;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            std::string data(900, 'B');
+            sink.write(data.data(), data.size());
+            return true;
+          });
+    });
+
+    if (configure) { configure(svr_); }
+
+    auto port = svr_.bind_to_any_port(HOST);
+    t_ = std::thread([&]() { svr_.listen_after_bind(); });
+    svr_.wait_until_ready();
+    return port;
+  }
+
+  static void enable(Server &svr) { svr.set_static_file_compression(true); }
+
+  // Every file under ./www except 1MB.txt is smaller than the default
+  // 1400-byte floor, so a test that needs a small file compressed has to lower
+  // it out of the way.
+  static void enable_without_floor(Server &svr) {
+    svr.set_static_file_compression(true);
+    svr.set_static_file_compression_min_length(0);
+  }
+
+  Server svr_;
+  std::thread t_;
+};
+
+TEST_F(StaticFileCompressionTest, DisabledByDefault) {
+  auto port = start();
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/dir/1MB.txt", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_FALSE(res->has_header("Content-Encoding"));
+  EXPECT_EQ("1048576", res->get_header_value("Content-Length"));
+  EXPECT_EQ(1048576U, res->body.size());
+}
+
+TEST_F(StaticFileCompressionTest, MountPoint) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  cli.set_decompress(false);
+  auto res = cli.Get("/dir/1MB.txt", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+  EXPECT_EQ("Accept-Encoding", res->get_header_value("Vary"));
+  // The response stays self-delimiting: a length, not a chunked body.
+  EXPECT_FALSE(res->has_header("Transfer-Encoding"));
+  EXPECT_EQ(std::to_string(res->body.size()),
+            res->get_header_value("Content-Length"));
+  EXPECT_LT(res->body.size(), 1048576U);
+  EXPECT_FALSE(res->body.empty());
+}
+
+TEST_F(StaticFileCompressionTest, MountPointDecompressed) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/dir/1MB.txt", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+  EXPECT_EQ(1048576U, res->body.size());
+}
+
+TEST_F(StaticFileCompressionTest, FileContent) {
+  auto port = start(enable_without_floor);
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/file_content", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+  EXPECT_EQ(104U, res->body.size());
+}
+
+// A handler that serves an already-encoded file names the coding itself. The
+// file-backed path decided its coding from Accept-Encoding and the content
+// type alone, so it compressed the stored bytes a second time and appended a
+// second Content-Encoding field line.
+TEST_F(StaticFileCompressionTest, PreEncodedFileContentIsNotCompressedAgain) {
+  auto port = start(enable_without_floor);
+
+  Client cli(HOST, port);
+  cli.set_decompress(false);
+  auto res = cli.Get("/pre-encoded-file-content",
+                     Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ(1U, res->get_header_value_count("Content-Encoding"));
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+  // Vary belongs to a coding the server chose, and it chose none here.
+  EXPECT_FALSE(res->has_header("Vary"));
+  // The file travels exactly as it is stored on disk.
+  EXPECT_EQ(104U, res->body.size());
+}
+
+// The 1MB file clears the default floor, so this one runs the configuration a
+// deployment would actually have.
+TEST_F(StaticFileCompressionTest, PreEncodedMountPointIsNotCompressedAgain) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  cli.set_decompress(false);
+  auto res =
+      cli.Get("/pre-encoded/dir/1MB.txt", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ(1U, res->get_header_value_count("Content-Encoding"));
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+  EXPECT_FALSE(res->has_header("Vary"));
+  EXPECT_EQ(1048576U, res->body.size());
+  EXPECT_EQ("1048576", res->get_header_value("Content-Length"));
+}
+
+TEST_F(StaticFileCompressionTest, Head) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  cli.set_decompress(false);
+  auto get = cli.Get("/dir/1MB.txt", Headers{{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(get) << "Error: " << to_string(get.error());
+
+  auto res = cli.Head("/dir/1MB.txt", Headers{{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+  EXPECT_FALSE(res->has_header("Transfer-Encoding"));
+  // HEAD still reports the size a GET would return.
+  EXPECT_EQ(get->get_header_value("Content-Length"),
+            res->get_header_value("Content-Length"));
+  EXPECT_TRUE(res->body.empty());
+}
+
+TEST_F(StaticFileCompressionTest, RangeStaysIdentity) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/dir/test.abcde", Headers{make_range_header({{2, 3}}),
+                                                {"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::PartialContent_206, res->status);
+  EXPECT_FALSE(res->has_header("Content-Encoding"));
+  EXPECT_EQ("2", res->get_header_value("Content-Length"));
+  EXPECT_EQ("bytes 2-3/5", res->get_header_value("Content-Range"));
+  EXPECT_EQ("cd", res->body);
+}
+
+TEST_F(StaticFileCompressionTest, NotCompressibleType) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/file", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("application/octet-stream", res->get_header_value("Content-Type"));
+  EXPECT_FALSE(res->has_header("Content-Encoding"));
+  EXPECT_EQ("5", res->get_header_value("Content-Length"));
+}
+
+TEST_F(StaticFileCompressionTest, EmptyFile) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/empty_file", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_FALSE(res->has_header("Content-Encoding"));
+  EXPECT_EQ("0", res->get_header_value("Content-Length"));
+  EXPECT_TRUE(res->body.empty());
+}
+
+TEST_F(StaticFileCompressionTest, MinLength) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+
+  // 104 bytes, well under the default floor. Compressing it would add the
+  // gzip header and trailer to a body that already fits in one packet.
+  auto res = cli.Get("/dir/index.html", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_FALSE(res->has_header("Content-Encoding"));
+  EXPECT_EQ("104", res->get_header_value("Content-Length"));
+}
+
+TEST_F(StaticFileCompressionTest, MinLengthLowered) {
+  auto port = start([](Server &svr) {
+    svr.set_static_file_compression(true);
+    svr.set_static_file_compression_min_length(1);
+  });
+
+  Client cli(HOST, port);
+  cli.set_decompress(false);
+
+  auto res = cli.Get("/dir/test.html", Headers{{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+
+  // A 9-byte file comes back larger than it went in, because gzip's header and
+  // trailer outweigh anything deflate can save. That is the end of the range
+  // the floor exists to keep out.
+  EXPECT_GT(res->body.size(), 9U);
+}
+
+TEST_F(StaticFileCompressionTest, MaxLength) {
+  auto port = start([](Server &svr) {
+    svr.set_static_file_compression(true);
+    svr.set_static_file_compression_min_length(0);
+    svr.set_static_file_compression_max_length(1024);
+  });
+
+  Client cli(HOST, port);
+
+  // Over the limit: served as is. Not named `big`/`small`: <rpcndr.h>
+  // defines `small` as a macro on Windows.
+  auto over = cli.Get("/dir/1MB.txt", Headers{{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(over) << "Error: " << to_string(over.error());
+  EXPECT_FALSE(over->has_header("Content-Encoding"));
+  EXPECT_EQ("1048576", over->get_header_value("Content-Length"));
+
+  // Under it: compressed.
+  auto under = cli.Get("/dir/index.html", Headers{{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(under) << "Error: " << to_string(under.error());
+  EXPECT_EQ("gzip", under->get_header_value("Content-Encoding"));
+}
+
+TEST_F(StaticFileCompressionTest, EtagPerEncoding) {
+  auto port = start(enable_without_floor);
+
+  Client cli(HOST, port);
+
+  auto identity = cli.Get("/dir/index.html", Headers{{"Accept-Encoding", ""}});
+  ASSERT_TRUE(identity) << "Error: " << to_string(identity.error());
+  EXPECT_FALSE(identity->has_header("Content-Encoding"));
+  auto identity_etag = identity->get_header_value("ETag");
+  ASSERT_FALSE(identity_etag.empty());
+
+  auto gzipped =
+      cli.Get("/dir/index.html", Headers{{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(gzipped) << "Error: " << to_string(gzipped.error());
+  EXPECT_EQ("gzip", gzipped->get_header_value("Content-Encoding"));
+  auto gzip_etag = gzipped->get_header_value("ETag");
+  ASSERT_FALSE(gzip_etag.empty());
+
+  // Two representations, two validators.
+  EXPECT_NE(identity_etag, gzip_etag);
+
+  // Each one revalidates against the request that would produce it...
+  auto fresh =
+      cli.Get("/dir/index.html", Headers{{"Accept-Encoding", "gzip"},
+                                         {"If-None-Match", gzip_etag}});
+  ASSERT_TRUE(fresh) << "Error: " << to_string(fresh.error());
+  EXPECT_EQ(StatusCode::NotModified_304, fresh->status);
+
+  auto fresh_identity =
+      cli.Get("/dir/index.html", Headers{{"Accept-Encoding", ""},
+                                         {"If-None-Match", identity_etag}});
+  ASSERT_TRUE(fresh_identity) << "Error: " << to_string(fresh_identity.error());
+  EXPECT_EQ(StatusCode::NotModified_304, fresh_identity->status);
+
+  // ...and not against the other representation.
+  auto crossed =
+      cli.Get("/dir/index.html",
+              Headers{{"Accept-Encoding", ""}, {"If-None-Match", gzip_etag}});
+  ASSERT_TRUE(crossed) << "Error: " << to_string(crossed.error());
+  EXPECT_EQ(StatusCode::OK_200, crossed->status);
+}
+
+// The opt-in covers responses the server reads off disk itself. A caller's own
+// known-length provider keeps its Content-Length and, more importantly, keeps
+// delivering incrementally: routing it through a compressor would hold every
+// write back until zlib's window filled.
+TEST_F(StaticFileCompressionTest, KnownLengthProviderUnaffected) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/streamed", Headers{{"Accept-Encoding", "gzip"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_FALSE(res->has_header("Content-Encoding"));
+  EXPECT_EQ("6", res->get_header_value("Content-Length"));
+  EXPECT_EQ("aaabbb", res->body);
+}
+
+TEST_F(StaticFileCompressionTest, IncrementalProviderUnaffected) {
+  auto port = start(enable);
+
+  Client cli(HOST, port);
+  cli.set_read_timeout(1, 0);
+
+  auto handle = cli.open_stream("GET", "/slow-stream", Params{},
+                                Headers{{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(handle.is_valid());
+
+  // The provider writes 100 bytes and then stalls for longer than the read
+  // timeout. Those first bytes have to arrive anyway: run the response through
+  // a compressor and zlib holds them until its window fills, so the read would
+  // come back empty instead.
+  char buf[256];
+  auto n = handle.read(buf, sizeof(buf));
+  ASSERT_GT(n, 0) << "first read should return the bytes already written";
+  EXPECT_EQ(std::string(100, 'A'), std::string(buf, static_cast<size_t>(n)));
 }
 #endif
 
@@ -7196,7 +10796,7 @@ TEST_F(ServerTest, Brotli) {
   headers.emplace("Accept-Encoding", "br");
   auto res = cli_.Get("/compress", headers);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("br", res->get_header_value("Content-Encoding"));
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("19", res->get_header_value("Content-Length"));
@@ -7213,7 +10813,7 @@ TEST_F(ServerTest, Zstd) {
   headers.emplace("Accept-Encoding", "zstd");
   auto res = cli_.Get("/compress", headers);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("zstd", res->get_header_value("Content-Encoding"));
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("26", res->get_header_value("Content-Length"));
@@ -7228,7 +10828,7 @@ TEST_F(ServerTest, ZstdWithoutAcceptEncoding) {
   headers.emplace("Accept-Encoding", "");
   auto res = cli_.Get("/compress", headers);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_TRUE(res->get_header_value("Content-Encoding").empty());
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("100", res->get_header_value("Content-Length"));
@@ -7242,14 +10842,14 @@ TEST_F(ServerTest, ZstdWithContentReceiver) {
   Headers headers;
   headers.emplace("Accept-Encoding", "zstd");
   std::string body;
-  auto res = cli_.Get("/compress", headers,
-                      [&](const char *data, uint64_t data_length) {
-                        EXPECT_EQ(100U, data_length);
-                        body.append(data, data_length);
-                        return true;
-                      });
+  auto res =
+      cli_.Get("/compress", headers, [&](const char *data, size_t data_length) {
+        EXPECT_EQ(100U, data_length);
+        body.append(data, data_length);
+        return true;
+      });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("zstd", res->get_header_value("Content-Encoding"));
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("26", res->get_header_value("Content-Length"));
@@ -7271,7 +10871,7 @@ TEST_F(ServerTest, ZstdWithoutDecompressing) {
                                   0x35, 0x36, 0x37, 0x38, 0x39, 0x30, 0x01,
                                   0x00, 0xd7, 0xa9, 0x20, 0x01};
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ("zstd", res->get_header_value("Content-Encoding"));
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("26", res->get_header_value("Content-Length"));
@@ -7286,14 +10886,14 @@ TEST_F(ServerTest, ZstdWithContentReceiverWithoutAcceptEncoding) {
   headers.emplace("Accept-Encoding", "");
 
   std::string body;
-  auto res = cli_.Get("/compress", headers,
-                      [&](const char *data, uint64_t data_length) {
-                        EXPECT_EQ(100U, data_length);
-                        body.append(data, data_length);
-                        return true;
-                      });
+  auto res =
+      cli_.Get("/compress", headers, [&](const char *data, size_t data_length) {
+        EXPECT_EQ(100U, data_length);
+        body.append(data, data_length);
+        return true;
+      });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_TRUE(res->get_header_value("Content-Encoding").empty());
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("100", res->get_header_value("Content-Length"));
@@ -7308,7 +10908,7 @@ TEST_F(ServerTest, NoZstd) {
   headers.emplace("Accept-Encoding", "zstd");
   auto res = cli_.Get("/nocompress", headers);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(false, res->has_header("Content-Encoding"));
   EXPECT_EQ("application/octet-stream", res->get_header_value("Content-Type"));
   EXPECT_EQ("100", res->get_header_value("Content-Length"));
@@ -7323,13 +10923,13 @@ TEST_F(ServerTest, NoZstdWithContentReceiver) {
   headers.emplace("Accept-Encoding", "zstd");
   std::string body;
   auto res = cli_.Get("/nocompress", headers,
-                      [&](const char *data, uint64_t data_length) {
+                      [&](const char *data, size_t data_length) {
                         EXPECT_EQ(100U, data_length);
                         body.append(data, data_length);
                         return true;
                       });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(false, res->has_header("Content-Encoding"));
   EXPECT_EQ("application/octet-stream", res->get_header_value("Content-Type"));
   EXPECT_EQ("100", res->get_header_value("Content-Length"));
@@ -7351,7 +10951,7 @@ TEST_F(ServerTest, MultipartFormDataZstd) {
   cli_.set_compress(true);
   auto res = cli_.Post("/compress-multipart", headers, items);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -7368,7 +10968,7 @@ TEST_F(ServerTest, PutWithContentProviderWithZstd) {
       },
       "text/plain");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("PUT", res->body);
 }
@@ -7412,7 +11012,7 @@ TEST_F(ServerTest, PreCompressionLogging) {
   auto res = cli_.Get("/compress", headers);
 
   // Verify response was compressed
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
 
@@ -7454,7 +11054,7 @@ TEST_F(ServerTest, PreCompressionLoggingWithBrotli) {
 
   auto res = cli_.Get("/compress", headers);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("br", res->get_header_value("Content-Encoding"));
 
@@ -7487,7 +11087,7 @@ TEST_F(ServerTest, PreCompressionLoggingWithoutCompression) {
   Headers headers;
   auto res = cli_.Get("/nocompress", headers);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_TRUE(res->get_header_value("Content-Encoding").empty());
 
@@ -7510,7 +11110,7 @@ TEST_F(ServerTest, LoggerSeesContentLength) {
 
   auto res = cli_.Get("/nocompress");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(res->body.size(), logged_content_length);
   EXPECT_EQ(std::to_string(logged_content_length),
@@ -7537,7 +11137,7 @@ TEST_F(ServerTest, PreCompressionLoggingOnlyPreLogger) {
 
   auto res = cli_.Get("/compress", headers);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
 
@@ -7610,7 +11210,7 @@ TEST_F(ServerTest, SendLargeBodyAfterRequestLineError) {
         std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
             .count();
 
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ("Hello World!", res->body);
     EXPECT_LE(elapsed, 500);
@@ -7690,13 +11290,17 @@ TEST(ZstdDecompressor, Decompress) {
 }
 #endif
 
-// Sends a raw request to a server listening at HOST:PORT.
-static bool send_request(time_t read_timeout_sec, const std::string &req,
-                         std::string *resp = nullptr) {
+// Sends a raw request to a server listening at HOST:PORT, writing it in
+// separate chunks so that the server sees each part in its own read(). Used to
+// place a read boundary at a specific offset of a request body.
+static bool send_request_in_parts(time_t read_timeout_sec,
+                                  const std::vector<std::string> &parts,
+                                  std::string *resp = nullptr,
+                                  int port = PORT) {
   auto error = Error::Success;
 
   auto client_sock = detail::create_client_socket(
-      HOST, "", PORT, AF_UNSPEC, false, false, nullptr,
+      HOST, "", port, AF_UNSPEC, false, false, nullptr,
       /*connection_timeout_sec=*/5, 0,
       /*read_timeout_sec=*/5, 0,
       /*write_timeout_sec=*/5, 0, std::string(), error);
@@ -7706,9 +11310,15 @@ static bool send_request(time_t read_timeout_sec, const std::string &req,
   auto ret = detail::process_client_socket(
       client_sock, read_timeout_sec, 0, 0, 0, 0,
       std::chrono::steady_clock::time_point::min(), [&](Stream &strm) {
-        if (req.size() !=
-            static_cast<size_t>(strm.write(req.data(), req.size()))) {
-          return false;
+        for (size_t i = 0; i < parts.size(); i++) {
+          const auto &part = parts[i];
+          if (part.size() !=
+              static_cast<size_t>(strm.write(part.data(), part.size()))) {
+            return false;
+          }
+          if (i + 1 < parts.size()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          }
         }
 
         char buf[512];
@@ -7724,6 +11334,135 @@ static bool send_request(time_t read_timeout_sec, const std::string &req,
 
   return ret;
 }
+
+// Sends a raw request to a server listening at HOST:PORT.
+static bool send_request(time_t read_timeout_sec, const std::string &req,
+                         std::string *resp = nullptr, int port = PORT) {
+  return send_request_in_parts(read_timeout_sec, {req}, resp, port);
+}
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+TEST(SSLClientServerTest, ReadTimeoutBoundsTheWholeHandshake) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.set_read_timeout(1, 0);
+
+  thread t = thread([&]() { ASSERT_TRUE(svr.listen(HOST, PORT)); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  // The start of a TLS record, then the rest of it a byte every 100 ms, which
+  // keeps each wait well within the read timeout. The server gives up a
+  // second in, so the bytes sent after that fail.
+  std::vector<std::string> parts{std::string("\x16\x03\x01\x00\xff", 5)};
+  parts.resize(26, std::string(1, '\0'));
+  EXPECT_FALSE(send_request_in_parts(5, parts));
+}
+#endif
+
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+// send_request_in_parts() over TLS, each part in a TLS record of its own.
+static bool send_ssl_request_in_parts(time_t read_timeout_sec,
+                                      const std::vector<std::string> &parts,
+                                      std::string *resp = nullptr,
+                                      int port = PORT) {
+  auto error = Error::Success;
+  auto sock = detail::create_client_socket(
+      HOST, "", port, AF_UNSPEC, false, false, nullptr,
+      /*connection_timeout_sec=*/5, 0, read_timeout_sec, 0,
+      /*write_timeout_sec=*/5, 0, std::string(), error);
+  if (sock == INVALID_SOCKET) { return false; }
+  auto sock_se = detail::scope_exit([&] { detail::close_socket(sock); });
+
+  auto ctx = SSL_CTX_new(TLS_client_method());
+  auto ssl = SSL_new(ctx);
+  auto ssl_se = detail::scope_exit([&] {
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+  });
+  SSL_set_fd(ssl, static_cast<int>(sock));
+  if (SSL_connect(ssl) != 1) { return false; }
+
+  for (size_t i = 0; i < parts.size(); i++) {
+    const auto &part = parts[i];
+    if (SSL_write(ssl, part.data(), static_cast<int>(part.size())) !=
+        static_cast<int>(part.size())) {
+      return false;
+    }
+    if (i + 1 < parts.size()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+
+  char buf[512];
+  int n;
+  while ((n = SSL_read(ssl, buf, sizeof(buf))) > 0) {
+    if (resp) { resp->append(buf, static_cast<size_t>(n)); }
+  }
+  return true;
+}
+#endif
+
+// The request line, then a header value a byte at a time.
+static std::vector<std::string> slow_request_head_parts() {
+  std::vector<std::string> parts{"GET / HTTP/1.1\r\nHost: x\r\nX-Slow: "};
+  parts.resize(26, "a");
+  parts.emplace_back("\r\n\r\n");
+  return parts;
+}
+
+// `send` takes 2.5 seconds over slow_request_head_parts(), each wait well
+// within the one-second read timeout. The server gives up a second in, before
+// the head is complete.
+static void
+expect_slow_request_head_dropped(Server &svr,
+                                 const std::function<std::string()> &send) {
+  std::atomic<bool> handled(false);
+  svr.Get("/", [&](const Request &, Response &res) {
+    handled = true;
+    res.set_content("ok", "text/plain");
+  });
+  svr.set_read_timeout(1, 0);
+
+  thread t = thread([&]() { ASSERT_TRUE(svr.listen(HOST, PORT)); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  auto resp = send();
+  EXPECT_FALSE(handled);
+  EXPECT_EQ(std::string::npos, resp.find("200 OK"));
+}
+
+TEST(ServerRequestParsingTest, ReadTimeoutBoundsTheWholeRequestHead) {
+  Server svr;
+  expect_slow_request_head_dropped(svr, [] {
+    std::string resp;
+    send_request_in_parts(5, slow_request_head_parts(), &resp);
+    return resp;
+  });
+}
+
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+TEST(SSLClientServerTest, ReadTimeoutBoundsTheWholeRequestHead) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  expect_slow_request_head_dropped(svr, [] {
+    std::string resp;
+    send_ssl_request_in_parts(5, slow_request_head_parts(), &resp);
+    return resp;
+  });
+}
+#endif
 
 TEST(ServerRequestParsingTest, TrimWhitespaceFromHeaderValues) {
   Server svr;
@@ -7753,6 +11492,99 @@ TEST(ServerRequestParsingTest, TrimWhitespaceFromHeaderValues) {
   ASSERT_TRUE(send_request(5, req, &res));
   EXPECT_EQ(header_value, "");
   EXPECT_EQ("HTTP/1.1 400 Bad Request", res.substr(0, 24));
+}
+
+TEST(HeadersOrderTest, ReceivedFieldsKeepTheirOrder) {
+  Server svr;
+  std::string received;
+  svr.Get("/order", [&](const Request &req, Response &res) {
+    received = entries_to_string(req.headers);
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  const std::string req = "GET /order HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "X-First: 1\r\n"
+                          "X-Dup: a\r\n"
+                          "X-Second: 2\r\n"
+                          "X-Dup: b\r\n"
+                          "Connection: close\r\n"
+                          "\r\n";
+
+  std::string res;
+  ASSERT_TRUE(send_request(5, req, &res, port));
+  EXPECT_EQ("HTTP/1.1 200 OK", res.substr(0, 15));
+  EXPECT_EQ(
+      "Host=localhost X-First=1 X-Dup=a X-Second=2 X-Dup=b Connection=close ",
+      received);
+}
+
+TEST(HeadersOrderTest, SentFieldsKeepTheirOrder) {
+  Server svr;
+  svr.Get("/cookies", [](const Request & /*req*/, Response &res) {
+    res.set_header("Set-Cookie", "first=1");
+    res.set_header("X-Between", "y");
+    res.set_header("Set-Cookie", "second=2");
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/cookies");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(2U, res->get_header_value_count("Set-Cookie"));
+  EXPECT_EQ("first=1", res->get_header_value("Set-Cookie", "", 0));
+  EXPECT_EQ("second=2", res->get_header_value("Set-Cookie", "", 1));
+}
+
+// A stream may send a byte at a time with a small extension on each chunk,
+// however long it runs
+TEST(ChunkOverheadTest, AcceptsSmallOverheadOnEveryChunk) {
+  Server svr;
+  svr.Post("/count", [](const Request &req, Response &res) {
+    res.set_content(std::to_string(req.body.size()), "text/plain");
+  });
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_LT(0, port);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  std::string req = std::string("POST /count HTTP/1.1\r\nHost: ") + HOST +
+                    "\r\nTransfer-Encoding: chunked\r\n"
+                    "Connection: close\r\n\r\n";
+  for (auto i = 0; i < 4096; i++) {
+    req += "1;a=b\r\nx\r\n";
+  }
+  req += "0\r\n\r\n";
+
+  std::string res;
+  ASSERT_TRUE(send_request(5, req, &res, port));
+  EXPECT_EQ(0u, res.find("HTTP/1.1 200 OK\r\n"));
+  EXPECT_EQ("4096", res.substr(res.size() - 4));
 }
 
 TEST(ServerResponseSplittingTest, ChunkedTrailerCRLFInjection) {
@@ -7812,6 +11644,229 @@ TEST(ServerResponseSplittingTest, ChunkedTrailerCRLFInjection) {
   EXPECT_NE(std::string::npos, res.find("X-Safe: safe"));
 }
 
+TEST(ServerResponseSplittingTest, ResponseHeaderCRLFInjection) {
+  // A custom header writer gets only the fields the default one writes
+  auto verbatim_writer = [](Stream &strm, Headers &hdrs) -> ssize_t {
+    std::string s;
+    for (const auto &h : hdrs) {
+      s += h.first + ": " + h.second + "\r\n";
+    }
+    s += "\r\n";
+    return strm.write(s.data(), s.size());
+  };
+
+  for (auto custom_writer : {false, true}) {
+    SCOPED_TRACE(custom_writer ? "custom header writer" : "default writer");
+    Server svr;
+    if (custom_writer) { svr.set_header_writer(verbatim_writer); }
+    svr.set_post_routing_handler([](const Request &, Response &res) {
+      res.headers.emplace("X-Late", "late\r\nInjected-Late: pwned");
+    });
+    svr.Get("/injected-header", [&](const Request & /*req*/, Response &res) {
+      // res.headers is a public field an application can populate directly,
+      // bypassing set_header()'s validation (e.g. reflecting a request value).
+      // A valid header that must survive.
+      res.headers.emplace("X-Safe", "safe");
+      // Attacker-controlled value carrying CR/LF (response splitting).
+      res.headers.emplace("X-Reflected",
+                          "legit\r\nInjected-Header: pwned\r\nX-Evil: also");
+      // Attacker-controlled name carrying CR/LF.
+      res.headers.emplace("X-Bad\r\nSet-Cookie: a=1", "x");
+      res.set_content("body", "text/plain");
+    });
+
+    thread t = thread([&] { svr.listen(HOST, PORT); });
+    auto se = detail::scope_exit([&] {
+      svr.stop();
+      t.join();
+      ASSERT_FALSE(svr.is_running());
+    });
+
+    svr.wait_until_ready();
+
+    const std::string req = std::string("GET /injected-header HTTP/1.1\r\n") +
+                            "Host: " + HOST +
+                            "\r\n"
+                            "Connection: close\r\n"
+                            "\r\n";
+
+    std::string res;
+    ASSERT_TRUE(send_request(5, req, &res));
+
+    // The injected fields must not appear anywhere in the raw response.
+    EXPECT_EQ(std::string::npos, res.find("Injected-Header"));
+    EXPECT_EQ(std::string::npos, res.find("X-Evil"));
+    EXPECT_EQ(std::string::npos, res.find("Set-Cookie"));
+    EXPECT_EQ(std::string::npos, res.find("Injected-Late"));
+
+    // Invalid headers are dropped entirely, matching set_header().
+    EXPECT_EQ(std::string::npos, res.find("X-Reflected:"));
+
+    // The valid header still passes through.
+    EXPECT_NE(std::string::npos, res.find("X-Safe: safe"));
+  }
+}
+
+// Forward declaration: in split builds split.py strips `inline` and moves the
+// definition into httplib.cc, so detail::write_request_line is not visible from
+// the public httplib.h. Re-declaring it here lets the tests link against the
+// symbol in both header-only and split builds.
+namespace httplib {
+namespace detail {
+ssize_t write_request_line(Stream &strm, const std::string &method,
+                           const std::string &path);
+} // namespace detail
+} // namespace httplib
+
+TEST(RequestLineInjectionTest, RejectsInvalidCharsInTarget) {
+  // A well-formed target is written verbatim.
+  {
+    detail::BufferStream strm;
+    auto n = detail::write_request_line(strm, "GET", "/path?a=b");
+    EXPECT_GT(n, 0);
+    EXPECT_EQ("GET /path?a=b HTTP/1.1\r\n", strm.get_buffer());
+  }
+
+  // A target carrying CR/LF, SP or other control octets must be rejected
+  // before anything reaches the wire, otherwise it splits the request line and
+  // injects a header or a whole request.
+  const std::string evil_targets[] = {
+      "/a\r\nInjected: pwned",
+      "/a\rInjected",
+      "/a\nInjected",
+      "/a\r\n\r\nGET /evil HTTP/1.1\r\nHost: victim\r\n\r\n",
+      "/a b",
+      "/a\tb",
+      "/a\x7f",
+  };
+  for (const auto &evil : evil_targets) {
+    detail::BufferStream strm;
+    auto n = detail::write_request_line(strm, "GET", evil);
+    EXPECT_LT(n, 0);
+    EXPECT_TRUE(strm.get_buffer().empty());
+  }
+}
+
+TEST(RequestLineInjectionTest, ClientRejectsCRLFTargetEndToEnd) {
+  // End-to-end counterpart to RejectsInvalidCharsInTarget. With path encoding
+  // disabled the client transmits the target verbatim, so a CR/LF-bearing
+  // target reaches write_request. The client must fail cleanly with
+  // Error::Write instead of putting a request-line-less, header-injecting
+  // request on the wire.
+  Server svr;
+
+  svr.Get("/a", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto thread = std::thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, PORT);
+    cli.set_path_encode(false);
+    // The request is rejected before anything is written, so the connection
+    // stays silent and the subsequent response read would otherwise block for
+    // the full default read timeout. Shorten it -- the assertion is on the
+    // error, not the timeout.
+    cli.set_read_timeout(1, 0);
+
+    auto res = cli.Get("/a\r\nInjected: pwned");
+    EXPECT_FALSE(res);
+    EXPECT_EQ(Error::Write, res.error());
+  }
+}
+
+TEST(RequestLineInjectionTest, RejectsNonTokenMethod) {
+  // Methods that are tokens (RFC 9110 Section 9.1) are written verbatim,
+  // including extension methods.
+  const std::string good_methods[] = {"GET", "PROPFIND", "M-SEARCH"};
+  for (const auto &method : good_methods) {
+    detail::BufferStream strm;
+    auto n = detail::write_request_line(strm, method, "/");
+    EXPECT_GT(n, 0);
+    EXPECT_EQ(method + " / HTTP/1.1\r\n", strm.get_buffer());
+  }
+
+  // A method carrying CR/LF would split the request line and smuggle a whole
+  // request ahead of the real one. A space or an empty method corrupts the
+  // request line. All must be rejected before anything reaches the wire.
+  const std::string evil_methods[] = {
+      "GET /smuggled HTTP/1.1\r\nHost: x\r\n\r\nGET",
+      "GET\r\nInjected: pwned",
+      "GET\r",
+      "GET\n",
+      "GE T",
+      "",
+  };
+  for (const auto &evil : evil_methods) {
+    detail::BufferStream strm;
+    auto n = detail::write_request_line(strm, evil, "/");
+    EXPECT_LT(n, 0);
+    EXPECT_TRUE(strm.get_buffer().empty());
+  }
+}
+
+TEST(RequestLineInjectionTest, ClientRejectsNonTokenMethodEndToEnd) {
+  // End-to-end counterpart to RejectsNonTokenMethod: a smuggling method passed
+  // through Client::send must fail with Error::Write and no request, neither
+  // the smuggled one nor the real one, may reach the server.
+  Server svr;
+
+  std::atomic<int> request_count(0);
+  svr.set_pre_routing_handler([&](const Request &, Response &res) {
+    request_count++;
+    res.status = StatusCode::OK_200;
+    return Server::HandlerResponse::Handled;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, port);
+
+    const std::string evil_methods[] = {
+        "GET /smuggled HTTP/1.1\r\nHost: x\r\n\r\nGET",
+        "GE T",
+        "",
+    };
+    for (const auto &evil : evil_methods) {
+      Request req;
+      req.method = evil;
+      req.path = "/";
+      auto res = cli.send(req);
+      EXPECT_FALSE(res);
+      EXPECT_EQ(Error::Write, res.error());
+    }
+
+    auto handle =
+        cli.open_stream("GET /smuggled HTTP/1.1\r\nHost: x\r\n\r\nGET", "/");
+    EXPECT_FALSE(handle.is_valid());
+    EXPECT_EQ(Error::Write, handle.error);
+
+    // A valid request on the same client still goes through.
+    auto res = cli.Get("/");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+  }
+
+  EXPECT_EQ(1, request_count.load());
+}
+
 // Sends a raw request and verifies that there isn't a crash or exception.
 static void test_raw_request(const std::string &req,
                              std::string *out = nullptr) {
@@ -7826,6 +11881,10 @@ static void test_raw_request(const std::string &req,
           [&](const Request & /*req*/, Response &res) {
             res.set_content("ok", "text/plain");
           });
+  svr.CustomRoute("PROPFIND", "/dav",
+                  [&](const Request & /*req*/, Response &res) {
+                    res.status = StatusCode::MultiStatus_207;
+                  });
 
   // Server read timeout must be longer than the client read timeout for the
   // bug to reproduce, probably to force the server to process a request
@@ -7908,6 +11967,53 @@ TEST(ServerRequestParsingTest, ExcessiveWhitespaceInUnparsableHeaderLine) {
                    "\r\n");
 }
 
+TEST(ServerRequestParsingTest, StrictRequestLine) {
+  const char *rejected[] = {
+      // RFC 9112 §3: one SP between the parts, and nothing else
+      "GET  /hi HTTP/1.1\r\nHost: localhost\r\n\r\n",
+      "GET\t/hi HTTP/1.1\r\nHost: localhost\r\n\r\n",
+      "GET /hi\tHTTP/1.1\r\nHost: localhost\r\n\r\n",
+      "GET /hi HTTP/1.1 \r\nHost: localhost\r\n\r\n",
+      // A request-target has no fragment
+      "GET /hi#x HTTP/1.1\r\nHost: localhost\r\n\r\n",
+      // An HTTP/1.1 request needs a Host
+      "GET /hi HTTP/1.1\r\n\r\n",
+  };
+  for (auto request : rejected) {
+    std::string out;
+    test_raw_request(request, &out);
+    EXPECT_EQ("HTTP/1.1 400 Bad Request", out.substr(0, 24)) << request;
+  }
+
+  std::string out;
+  test_raw_request("GET /hi HTTP/1.0\r\n\r\n", &out);
+  EXPECT_EQ("HTTP/1.1 200 OK", out.substr(0, 15));
+}
+
+TEST(ServerRequestParsingTest, AmbiguousTransferEncodingClosesConnection) {
+  // RFC 9112 §6.1
+  const char *requests[] = {
+      "PUT /put_hi HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Content-Length: 0\r\n"
+      "Transfer-Encoding: chunked\r\n"
+      "\r\n"
+      "0\r\n\r\n",
+      "PUT /put_hi HTTP/1.0\r\n"
+      "Connection: keep-alive\r\n"
+      "Transfer-Encoding: chunked\r\n"
+      "\r\n"
+      "0\r\n\r\n",
+  };
+
+  for (auto request : requests) {
+    std::string out;
+    test_raw_request(request, &out);
+    EXPECT_EQ("HTTP/1.1 200 OK", out.substr(0, 15)) << request;
+    EXPECT_NE(std::string::npos, out.find("Connection: close")) << request;
+  }
+}
+
 TEST(ServerRequestParsingTest, InvalidFirstChunkLengthInRequest) {
   std::string out;
 
@@ -7959,6 +12065,23 @@ TEST(ServerRequestParsingTest, InvalidSpaceInURL) {
   EXPECT_EQ("HTTP/1.1 400 Bad Request", out.substr(0, 24));
 }
 
+TEST(ServerRequestParsingTest, InvalidControlCharInURL) {
+  for (auto target : {"/h\ri", "/h\x7fi"}) {
+    std::string out;
+    test_raw_request(std::string("GET ") + target + " HTTP/1.1\r\n\r\n", &out);
+    EXPECT_EQ("HTTP/1.1 400 Bad Request", out.substr(0, 24)) << target;
+  }
+}
+
+TEST(ServerRequestParsingTest, NonAsciiInURLAccepted) {
+  std::string out;
+  test_raw_request("GET /hi?q=\xE3\x81\x82 HTTP/1.1\r\n"
+                   "Host: localhost\r\n"
+                   "Connection: close\r\n\r\n",
+                   &out);
+  EXPECT_EQ("HTTP/1.1 200 OK", out.substr(0, 15));
+}
+
 TEST(ServerRequestParsingTest, RemoteAddrSetOnBadRequest) {
   Server svr;
 
@@ -7980,6 +12103,81 @@ TEST(ServerRequestParsingTest, RemoteAddrSetOnBadRequest) {
   std::string out;
   ASSERT_TRUE(send_request(5, bad_req, &out));
   EXPECT_EQ("HTTP/1.1 400 Bad Request", out.substr(0, 24));
+}
+
+// A custom method with neither Content-Length nor Transfer-Encoding must be
+// answered right away rather than blocking on a read that waits for EOF.
+TEST(ServerRequestParsingTest, CustomMethodWithoutFraming) {
+  std::string out;
+  test_raw_request("PROPFIND /dav HTTP/1.1\r\nHost: localhost\r\n\r\n", &out);
+  EXPECT_EQ("HTTP/1.1 207 Multi-Status", out.substr(0, 25));
+}
+
+TEST(CustomRouteRegistrationTest, RejectsBuiltInMethods) {
+  const char *methods[] = {"GET",     "HEAD",    "POST",  "PUT",   "DELETE",
+                           "CONNECT", "OPTIONS", "TRACE", "PATCH", "PRI"};
+
+  for (const auto *method : methods) {
+    Server svr;
+    svr.CustomRoute(method, "/x", [](const Request &, Response &) {});
+
+    EXPECT_FALSE(svr.is_valid()) << method;
+    EXPECT_FALSE(svr.listen(HOST, PORT)) << method;
+  }
+}
+
+TEST(CustomRouteRegistrationTest, RejectsNonTokenMethods) {
+  const char *methods[] = {"",          "PRO PFIND", "PROP\tFIND", "PROP/FIND",
+                           "PROP,FIND", "PROP:FIND", "PROP(FIND)", "\x01FIND"};
+
+  for (const auto *method : methods) {
+    Server svr;
+    svr.CustomRoute(method, "/x", [](const Request &, Response &) {});
+
+    EXPECT_FALSE(svr.is_valid()) << method;
+  }
+}
+
+TEST(CustomRouteRegistrationTest, AcceptsWebDavAndUpnpMethods) {
+  const char *methods[] = {"PROPFIND", "PROPPATCH", "MKCOL",
+                           "COPY",     "MOVE",      "LOCK",
+                           "UNLOCK",   "REPORT",    "SUBSCRIBE"};
+
+  Server svr;
+  for (const auto *method : methods) {
+    svr.CustomRoute(method, "/x", [](const Request &, Response &) {});
+  }
+
+  EXPECT_TRUE(svr.is_valid());
+}
+
+TEST(CustomRouteRegistrationTest, ContentReaderOverloadRejectsBuiltInMethods) {
+  Server svr;
+  svr.CustomRoute("POST", "/x",
+                  [](const Request &, Response &, const ContentReader &) {});
+
+  EXPECT_FALSE(svr.is_valid());
+}
+
+TEST(CustomRouteRegistrationTest, RejectionIsSticky) {
+  Server svr;
+  svr.CustomRoute("PROPFIND", "/a", [](const Request &, Response &) {});
+  svr.CustomRoute("GET", "/b", [](const Request &, Response &) {});
+  svr.CustomRoute("MKCOL", "/c", [](const Request &, Response &) {});
+
+  EXPECT_FALSE(svr.is_valid());
+}
+
+TEST(CustomRouteRegistrationTest, ReportsRejectionToErrorLogger) {
+  Server svr;
+
+  auto captured = Error::Success;
+  svr.set_error_logger(
+      [&](const Error &err, const Request * /*req*/) { captured = err; });
+
+  svr.CustomRoute("POST", "/x", [](const Request &, Response &) {});
+
+  EXPECT_EQ(Error::InvalidHTTPMethod, captured);
 }
 
 TEST(ServerRequestParsingTest, InvalidFieldValueContains_CR_LF_NUL) {
@@ -8010,6 +12208,7 @@ TEST(ServerRequestParsingTest, EmptyFieldValue) {
   std::string out;
 
   test_raw_request("GET /header_field_value_check HTTP/1.1\r\n"
+                   "Host: localhost\r\n"
                    "Test: \r\n\r\n",
                    &out);
   EXPECT_EQ("HTTP/1.1 200 OK", out.substr(0, 15));
@@ -8184,7 +12383,7 @@ TEST(ServerStopTest, ClientAccessAfterServerDown) {
 
   auto res = cli.Post("/hi", "data", "text/plain");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 
   svr.stop();
@@ -8281,7 +12480,7 @@ void TestStringBodyUploadProgress(SetupHandler &&setup_handler,
         return true;
       });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(200, res->status);
   EXPECT_TRUE(progress_called);
 }
@@ -8348,7 +12547,7 @@ void TestContentProviderUploadProgress(SetupHandler &&setup_handler,
         return true;
       });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(200, res->status);
   EXPECT_FALSE(progress_values.empty());
 }
@@ -8362,7 +12561,7 @@ TEST(UploadProgressTest, PostContentProviderProgress) {
       },
       [](Client &cli, UploadProgress progress_callback) {
         return cli.Post(
-            "/test", 10,
+            "/test", 9,
             [](size_t /*offset*/, size_t /*length*/, DataSink &sink) -> bool {
               sink.os << "test data";
               return true;
@@ -8401,7 +12600,7 @@ void TestMultipartUploadProgress(SetupHandler &&setup_handler,
                            return true;
                          });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(200, res->status);
   EXPECT_FALSE(progress_values.empty());
 }
@@ -8445,7 +12644,7 @@ void TestBasicDownloadProgress(SetupHandler &&setup_handler,
                            return true;
                          });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(200, res->status);
   EXPECT_FALSE(progress_values.empty());
   EXPECT_EQ(expected_content_size, res->body.size());
@@ -8497,7 +12696,7 @@ void TestContentReceiverDownloadProgress(SetupHandler &&setup_handler,
         return true;
       });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(200, res->status);
   EXPECT_FALSE(progress_values.empty());
   EXPECT_EQ(expected_content_size, received_body.size());
@@ -8518,6 +12717,49 @@ TEST(DownloadProgressTest, GetWithContentReceiver) {
         return cli.Get(endpoint, content_receiver, progress_callback);
       },
       "/download-receiver", 2000u);
+}
+
+TEST(StreamingTest, ChunkedZeroLengthWriteDoesNotEndTheBody) {
+  // A provider reaching a pass with nothing to hand over - an empty buffer
+  // popped off a queue, say - must not be taken to mean the body is finished.
+  // It used to end the loop with the terminating chunk unwritten while the
+  // server still considered the response complete, so the peer waited for an
+  // end that never arrived.
+  Server svr;
+
+  svr.Get("/stream", [](const Request & /*req*/, Response &res) {
+    auto step = std::make_shared<int>(0);
+    res.set_chunked_content_provider("text/plain",
+                                     [step](size_t /*offset*/, DataSink &sink) {
+                                       switch ((*step)++) {
+                                       case 0: sink.write("", 0); break;
+                                       case 1: sink.write("hello", 5); break;
+                                       default: sink.done(); break;
+                                       }
+                                       return true;
+                                     });
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto listen_se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  // Without the fix the body is never terminated, so bound the wait rather
+  // than letting the test hang on the default read timeout.
+  cli.set_read_timeout(5, 0);
+
+  auto res = cli.Get("/stream");
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("hello", res->body);
 }
 
 TEST(StreamingTest, NoContentLengthStreaming) {
@@ -8553,7 +12795,7 @@ TEST(StreamingTest, NoContentLengthStreaming) {
           return true;
         });
 
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ("aaabbb", s);
   });
@@ -8580,28 +12822,87 @@ TEST(MountTest, Unmount) {
   svr.set_mount_point("/mount2", "./www2");
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 
   res = cli.Get("/mount2/dir/test.html");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 
   svr.set_mount_point("/", "./www");
 
   res = cli.Get("/dir/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 
   svr.remove_mount_point("/");
   res = cli.Get("/dir/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 
   svr.remove_mount_point("/mount2");
   res = cli.Get("/mount2/dir/test.html");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
+}
+
+TEST(MountTest, MissingFileFallsThroughToHandlers) {
+  Server svr;
+  ASSERT_TRUE(svr.set_mount_point("/", "./www"));
+  svr.Get("/api/hello", [](const Request &, Response &res) {
+    res.set_content("api", "text/plain");
+  });
+
+  auto listen_thread = std::thread([&svr]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, PORT);
+  auto res = cli.Get("/dir/test.html");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+
+  res = cli.Get("/api/hello");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("api", res->body);
+}
+
+TEST(MountTest, PathSegmentBoundary) {
+  Server svr;
+
+  svr.set_mount_point("/mount2", "./www2");
+  svr.set_mount_point("/", "./www");
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+
+  auto res = cli.Get("/mount2/dir/test.html");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+
+  // "/mount2" must not match part-way through a path segment.
+  res = cli.Get("/mount2dir/test.html");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::NotFound_404, res->status);
+
+  // A mount point ending in '/' keeps matching every path below it.
+  res = cli.Get("/dir/test.html");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
 TEST(MountTest, Redicect) {
@@ -8620,24 +12921,24 @@ TEST(MountTest, Redicect) {
   Client cli("localhost", PORT);
 
   auto res = cli.Get("/dir/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 
   res = cli.Get("/dir");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::MovedPermanently_301, res->status);
 
   res = cli.Get("/file");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 
   res = cli.Get("/file/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
 
   cli.set_follow_location(true);
   res = cli.Get("/dir");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -8657,9 +12958,72 @@ TEST(MountTest, MultibytesPathName) {
   Client cli("localhost", PORT);
 
   auto res = cli.Get(U8("/日本語Dir/日本語File.txt"));
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(U8("日本語コンテンツ"), res->body);
+}
+
+// A mount point serves no path with an empty segment or one ending in '.' or
+// a space, so a guard in the pre-routing handler sees the path of every file
+// that is served
+TEST(MountTest, AliasedPathDoesNotPassPreRoutingGuard) {
+  Server svr;
+  ASSERT_TRUE(svr.set_mount_point("/", "./www"));
+  svr.set_pre_routing_handler([](const Request &req, Response &res) {
+    if (req.path == "/dir/test.html") {
+      res.status = StatusCode::Unauthorized_401;
+      return Server::HandlerResponse::Handled;
+    }
+    return Server::HandlerResponse::Unhandled;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_LT(0, port);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  for (auto path :
+       {"/./dir/test.html", "/dir/./test.html", "//dir/test.html",
+        "/dir//test.html", "/dir/../dir/test.html", "/%2e/dir/test.html",
+        "/dir/test.html.", "/dir/test.html%20", "/dir/test.html::$DATA",
+        "/dir/test.html%3A%3A$DATA"}) {
+    SCOPED_TRACE(path);
+    auto res = cli.Get(path);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::NotFound_404, res->status);
+  }
+}
+
+TEST(UserDefinedMIMETypeMappingTest, IgnoresCaseAndLeadingDot) {
+  Server svr;
+  svr.set_mount_point("/", "./www");
+  svr.set_file_extension_and_mimetype_mapping(".abcde", "text/abcde");
+  svr.set_file_extension_and_mimetype_mapping("HTML", "text/x-html");
+
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_GT(port, 0);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/dir/test.abcde");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("text/abcde", res->get_header_value("Content-Type"));
+
+  res = cli.Get("/dir/test.html");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("text/x-html", res->get_header_value("Content-Type"));
 }
 
 #ifdef _WIN32
@@ -8683,7 +13047,60 @@ TEST(MmapTest, OpenWhileFileHeldForWriting) {
   detail::mmap m(path);
   ASSERT_TRUE(m.is_open());
   EXPECT_EQ(strlen(content), m.size());
-  EXPECT_EQ(0, std::memcmp(content, m.data(), strlen(content)));
+  char buf[8];
+  ASSERT_EQ(strlen(content), m.read(0, buf, sizeof(buf)));
+  EXPECT_EQ(0, std::memcmp(content, buf, strlen(content)));
+}
+#endif
+
+#ifndef _WIN32
+// A directory or a device has no size to serve.
+TEST(MmapTest, OnlyRegularFilesAreOpened) {
+  const char *path = "./mmap_not_regular_test_dir";
+  ASSERT_EQ(0, ::mkdir(path, 0755));
+  auto dir_cleanup = detail::scope_exit([&] { ::rmdir(path); });
+
+  for (auto p : {path, "/dev/null"}) {
+    detail::mmap m(p);
+    EXPECT_FALSE(m.is_open()) << p;
+    EXPECT_EQ(0U, m.size()) << p;
+  }
+
+  Server svr;
+  svr.Get("/null", [](const Request & /*req*/, Response &res) {
+    res.set_file_content("/dev/null");
+  });
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  auto res = Client(HOST, port).Get("/null");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::NotFound_404, res->status);
+}
+#endif
+
+#ifdef __linux__
+// Nothing of the file stays mapped, where a truncation would raise SIGBUS.
+TEST(MmapTest, FileIsNotMapped) {
+  const char *path = "mmap_not_mapped_test.txt";
+  {
+    std::ofstream f(path, std::ios::binary);
+    f << "hello";
+  }
+  auto file_cleanup = detail::scope_exit([&] { std::remove(path); });
+
+  detail::mmap m(path);
+  ASSERT_TRUE(m.is_open());
+
+  std::ifstream maps("/proc/self/maps");
+  std::string mappings((std::istreambuf_iterator<char>(maps)),
+                       std::istreambuf_iterator<char>());
+  EXPECT_EQ(std::string::npos, mappings.find(path));
 }
 #endif
 
@@ -8757,6 +13174,110 @@ TEST(KeepAliveTest, MaxCount) {
   }
 }
 
+// A client may pipeline its requests (RFC 9112 9.3.2), so reading one request
+// can pull the next one into the server's buffer. The server must serve it
+// without waiting for the socket to become readable again. The keep-alive
+// timeout outlasts the client's read timeout, so a request left waiting for it
+// shows up as a missing response.
+static void serve_pipelining_routes(Server &svr,
+                                    const std::function<void(int)> &client) {
+  svr.set_keep_alive_timeout(5);
+  svr.Get("/hi/(\\d+)", [](const Request &req, Response &res) {
+    res.set_content("hi " + req.matches[1].str(), "text/plain");
+  });
+  svr.Post("/echo", [](const Request &req, Response &res) {
+    res.set_content("echo " + req.body, "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  client(port);
+}
+
+static std::string
+send_pipelined_requests(const std::vector<std::string> &parts) {
+  Server svr;
+  std::string res;
+  serve_pipelining_routes(svr, [&](int port) {
+    EXPECT_TRUE(send_request_in_parts(2, parts, &res, port));
+  });
+  return res;
+}
+
+static void expect_in_order(const std::string &res,
+                            const std::vector<std::string> &bodies) {
+  size_t pos = 0;
+  for (const auto &body : bodies) {
+    pos = res.find(body, pos);
+    ASSERT_NE(std::string::npos, pos) << "missing or out of order: " << body;
+    pos += body.size();
+  }
+}
+
+TEST(KeepAliveTest, PipelinedRequests) {
+  auto res = send_pipelined_requests(
+      {"GET /hi/1 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+       "POST /echo HTTP/1.1\r\nHost: localhost\r\n"
+       "Content-Length: 4\r\n\r\nbody"
+       "GET /hi/3 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"});
+  expect_in_order(res, {"hi 1", "echo body", "hi 3"});
+}
+
+// The second request starts in the server's buffer and ends on the socket.
+TEST(KeepAliveTest, PipelinedRequestSplitAcrossReads) {
+  auto res =
+      send_pipelined_requests({"GET /hi/1 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                               "GET /hi/2 HTTP/1.1\r\nHo",
+                               "st: localhost\r\nConnection: close\r\n\r\n"});
+  expect_in_order(res, {"hi 1", "hi 2"});
+}
+
+// RFC 9112 2.2: an empty line before the request-line is ignored, so an extra
+// CRLF after a body does not turn into a 400 for the next request.
+TEST(KeepAliveTest, EmptyLineBeforeRequestLineIsIgnored) {
+  auto res = send_pipelined_requests(
+      {"POST /echo HTTP/1.1\r\nHost: localhost\r\n"
+       "Content-Length: 4\r\n\r\nbody\r\n"
+       "GET /hi/2 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"});
+  EXPECT_EQ(std::string::npos, res.find("400 Bad Request"));
+  expect_in_order(res, {"echo body", "hi 2"});
+}
+
+// Where an unparsable request ends is unknown, so what follows it in the buffer
+// must not be served as the next request.
+TEST(KeepAliveTest, PipelinedRequestAfterInvalidRequestIsNotServed) {
+  auto res = send_pipelined_requests(
+      {"INVALID REQUEST LINE\r\n\r\n"
+       "GET /hi/1 HTTP/1.1\r\nHost: localhost\r\n\r\n"});
+  EXPECT_EQ("HTTP/1.1 400 Bad Request", res.substr(0, 24));
+  EXPECT_EQ(std::string::npos, res.find("hi 1"));
+}
+
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+// Over TLS, the next request is held by the TLS library as already decrypted
+// data rather than on the socket.
+TEST(KeepAliveTest, SSLPipelinedRequests) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  std::string res;
+  serve_pipelining_routes(svr, [&](int port) {
+    // One part, so all three requests arrive in one TLS record
+    EXPECT_TRUE(send_ssl_request_in_parts(
+        2,
+        {"GET /hi/1 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+         "GET /hi/2 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+         "GET /hi/3 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"},
+        &res, port));
+  });
+  expect_in_order(res, {"hi 1", "hi 2", "hi 3"});
+}
+#endif
+
 TEST(KeepAliveTest, Issue1041) {
   Server svr;
   svr.set_keep_alive_timeout(3);
@@ -8786,6 +13307,35 @@ TEST(KeepAliveTest, Issue1041) {
   result = cli.Get("/hi");
   ASSERT_TRUE(result);
   EXPECT_EQ(StatusCode::OK_200, result->status);
+}
+
+TEST(KeepAliveTest, MaxCountZeroSetsNoLimit) {
+  Server svr;
+  svr.set_keep_alive_max_count(0);
+  std::set<int> remote_ports;
+  svr.Get("/hi", [&](const Request &req, Response &res) {
+    remote_ports.insert(req.remote_port);
+    res.set_content("hi", "text/plain");
+  });
+
+  auto listen_thread = std::thread([&svr] { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, PORT);
+  cli.set_keep_alive(true);
+  for (int i = 0; i < 3; i++) {
+    auto res = cli.Get("/hi");
+    ASSERT_TRUE(res);
+    EXPECT_EQ("timeout=5", res->get_header_value("Keep-Alive"));
+  }
+  // All three over one connection
+  EXPECT_EQ(1u, remote_ports.size());
 }
 
 TEST(KeepAliveTest, Issue1959) {
@@ -8949,7 +13499,7 @@ TEST(SNI_AutoDetectionTest, SNI_Logic) {
       SSLClient cli("localhost", PORT);
       cli.enable_server_certificate_verification(false);
       auto res = cli.Get("/sni?expected=localhost");
-      ASSERT_TRUE(res);
+      ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     }
 
     {
@@ -8966,6 +13516,44 @@ TEST(SNI_AutoDetectionTest, SNI_Logic) {
       }
     }
   }
+}
+
+// The SNI of a failed handshake does not reach the next connection that the
+// same worker thread serves
+TEST(SNI_AutoDetectionTest, FailedHandshakeLeavesNoSNI) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.new_task_queue = [] { return new ThreadPool(1); };
+  svr.Get("/sni", [](const Request &req, Response &res) {
+    res.set_content(req.sni(), "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port("127.0.0.1");
+  ASSERT_LT(0, port);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  {
+    // Sends SNI, then rejects the server certificate, which the CA did not sign
+    SSLClient cli("localhost", port);
+    cli.set_direct_hostname_addr_map({{"localhost", "127.0.0.1"}});
+    cli.set_ca_cert_path(CLIENT_CA_CERT_FILE);
+    auto res = cli.Get("/sni");
+    ASSERT_FALSE(res);
+    EXPECT_EQ(Error::SSLServerVerification, res.error());
+  }
+
+  // An IP host sends no SNI (RFC 6066)
+  SSLClient cli("127.0.0.1", port);
+  cli.enable_server_certificate_verification(false);
+  auto res = cli.Get("/sni");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("", res->body);
 }
 #endif
 
@@ -9016,9 +13604,271 @@ TEST(ClientProblemDetectionTest, ContentProvider) {
   {
     auto res = cli.Get("/empty", [&](const char * /*data*/,
                                      size_t /*data_length*/) { return false; });
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   }
 }
+
+TEST(ContentProviderTest, ProviderMakingNoProgressFails) {
+  // A provider that reports success without writing anything and without
+  // calling done() used to be handed the same offset and length again on every
+  // pass, so it spun for as long as the peer stayed connected.
+  Server svr;
+
+  svr.Post("/", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  std::atomic<int> call_count{0};
+
+  Client cli(HOST, port);
+  auto res = cli.Post(
+      "/", 1024,
+      [&](size_t /*offset*/, size_t /*length*/, DataSink & /*sink*/) {
+        // Give up after enough passes to show the spin, so that losing the
+        // check below fails this test instead of hanging it.
+        return ++call_count < 100;
+      },
+      "text/plain");
+
+  ASSERT_FALSE(res);
+  EXPECT_EQ(Error::Write, res.error());
+  EXPECT_EQ(1, call_count.load());
+}
+
+TEST(DataSinkTest, OptionalCallbacksAreCallableByDefault) {
+  // A writer only has to assign `write`. The other three used to be left as
+  // empty std::functions, so a provider calling one threw
+  // std::bad_function_call out of the thread running it and took the whole
+  // process down.
+  DataSink sink;
+
+  std::string written;
+  sink.write = [&](const char *data, size_t data_len) {
+    written.append(data, data_len);
+    return true;
+  };
+
+  EXPECT_TRUE(sink.is_writable());
+  sink.done();
+  sink.done_with_trailer(Headers{{"X-Trailer", "value"}});
+  EXPECT_TRUE(written.empty());
+}
+
+TEST(DataSinkTest, DoneWithTrailerFallsBackToDone) {
+  // A sink that cannot carry trailers still has to finish.
+  DataSink sink;
+
+  auto done_count = 0;
+  sink.done = [&]() { done_count++; };
+
+  sink.done_with_trailer(Headers{{"X-Trailer", "value"}});
+  EXPECT_EQ(1, done_count);
+}
+
+TEST(DataSinkTest, LengthFramedProviderMayCallDoneAfterWritingEverything) {
+  Server svr;
+
+  const std::string body(4096, 'x');
+
+  svr.Get("/", [&](const Request & /*req*/, Response &res) {
+    res.set_content_provider(body.size(), "text/plain",
+                             [&](size_t offset, size_t length, DataSink &sink) {
+                               sink.write(body.data() + offset, length);
+                               sink.done();
+                               return true;
+                             });
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/");
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ(body, res->body);
+}
+
+TEST(DataSinkTest, LengthFramedProviderThatFinishesEarlyFailsTheResponse) {
+  Server svr;
+
+  svr.Get("/", [](const Request & /*req*/, Response &res) {
+    res.set_content_provider(
+        1024, "text/plain",
+        [](size_t /*offset*/, size_t /*length*/, DataSink &sink) {
+          sink.write("hello", 5);
+          sink.done(); // short of the 1024 bytes the response promised
+          return true;
+        });
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_read_timeout(5, 0);
+
+  // The response is short of its Content-Length, so the client cannot read a
+  // complete body. What matters is that this returns at all: a no-op done()
+  // would leave the writer looping over a provider that never makes progress.
+  auto res = cli.Get("/");
+  EXPECT_FALSE(res);
+}
+
+// Read as the next response by a peer that sees it after a framed body.
+static const std::string smuggled_response =
+    "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nSMUGGLED";
+
+TEST(DataSinkTest, LengthFramedProviderCannotWritePastTheLength) {
+  Server svr;
+
+  svr.Get("/", [](const Request & /*req*/, Response &res) {
+    res.set_content_provider(
+        5, "text/plain",
+        [](size_t /*offset*/, size_t /*length*/, DataSink &sink) {
+          auto data = "AAAAA" + smuggled_response;
+          sink.write(data.data(), data.size());
+          return true;
+        });
+  });
+
+  thread t = thread([&] { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  std::string resp;
+  ASSERT_TRUE(send_request(1, "GET / HTTP/1.1\r\nHost: x\r\n\r\n", &resp));
+  EXPECT_EQ("AAAAA", resp.substr(resp.find("\r\n\r\n") + 4));
+
+  resp.clear();
+  ASSERT_TRUE(send_request(
+      1, "GET / HTTP/1.1\r\nHost: x\r\nRange: bytes=0-1\r\n\r\n", &resp));
+  EXPECT_EQ("AA", resp.substr(resp.find("\r\n\r\n") + 4));
+}
+
+TEST(NoContentTest, BodyIsNotSent) {
+  Server svr;
+
+  svr.Get("/204", [](const Request & /*req*/, Response &res) {
+    res.status = StatusCode::NoContent_204;
+    res.set_content(smuggled_response, "text/plain");
+  });
+  svr.Get("/304", [](const Request & /*req*/, Response &res) {
+    res.status = StatusCode::NotModified_304;
+    res.set_chunked_content_provider(
+        "text/plain", [](size_t /*offset*/, DataSink &sink) {
+          sink.write(smuggled_response.data(), smuggled_response.size());
+          sink.done();
+          return true;
+        });
+  });
+
+  thread t = thread([&] { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  for (auto path : {"/204", "/304"}) {
+    std::string resp;
+    ASSERT_TRUE(send_request(
+        1, std::string("GET ") + path + " HTTP/1.1\r\nHost: x\r\n\r\n", &resp));
+    EXPECT_EQ(resp.size(), resp.find("\r\n\r\n") + 4) << path;
+    EXPECT_EQ(std::string::npos, resp.find("Content-Length")) << path;
+    EXPECT_EQ(std::string::npos, resp.find("Transfer-Encoding")) << path;
+  }
+}
+
+TEST(DataSinkTest, RequestProviderCannotWritePastTheLength) {
+  Server svr;
+
+  std::atomic<bool> smuggled(false);
+  svr.Post("/", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+  svr.Get("/smuggled", [&](const Request & /*req*/, Response & /*res*/) {
+    smuggled = true;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  // What follows the body would be read as the next request.
+  Client cli(HOST, port);
+  auto res = cli.Post(
+      "/", 5,
+      [](size_t /*offset*/, size_t /*length*/, DataSink &sink) {
+        std::string data = "helloGET /smuggled HTTP/1.1\r\nHost: x\r\n\r\n";
+        sink.write(data.data(), data.size());
+        return true;
+      },
+      "text/plain");
+
+  ASSERT_FALSE(res);
+  EXPECT_EQ(Error::Write, res.error());
+  EXPECT_FALSE(smuggled);
+}
+
+#ifdef CPPHTTPLIB_ZLIB_SUPPORT
+TEST(DataSinkTest, CompressedRequestProviderThatFinishesEarlyFails) {
+  // The compressed path builds the whole body before connecting, so this
+  // fails client-side and never reaches a server.
+  Client cli(HOST, PORT);
+  cli.set_compress(true);
+
+  auto res = cli.Post(
+      "/", 1024,
+      [](size_t /*offset*/, size_t /*length*/, DataSink &sink) {
+        sink.write("hello", 5);
+        sink.done(); // short of the 1024 bytes the request announced
+        return true;
+      },
+      "text/plain");
+
+  ASSERT_FALSE(res);
+  EXPECT_EQ(Error::Write, res.error());
+}
+#endif
 
 TEST(ErrorHandlerWithContentProviderTest, ErrorHandler) {
   Server svr;
@@ -9045,9 +13895,302 @@ TEST(ErrorHandlerWithContentProviderTest, ErrorHandler) {
   Client cli("localhost", PORT);
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::NotFound_404, res->status);
   EXPECT_EQ("helloworld", res->body);
+}
+
+// A body set after a content provider must replace it, not be sent through it.
+TEST(ResponseContentSourceTest, FileRequestHandlerCanReplaceFile) {
+  Server svr;
+  svr.set_mount_point("/", "./www");
+  svr.set_file_request_handler([](const Request &req, Response &res) {
+    if (req.path == "/dir/test.html") {
+      res.status = StatusCode::Forbidden_403;
+      res.set_content(std::string(5000, 'D'), "text/plain");
+    } else if (req.path == "/file") {
+      res.status = StatusCode::Forbidden_403;
+      res.body = "Denied";
+    }
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto t = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+
+  {
+    auto res = cli.Get("/dir/test.html");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::Forbidden_403, res->status);
+    EXPECT_EQ(std::string(5000, 'D'), res->body);
+    EXPECT_EQ(1U, res->get_header_value_count("Content-Type"));
+  }
+
+  {
+    auto res = cli.Get("/file");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::Forbidden_403, res->status);
+    EXPECT_EQ("Denied", res->body);
+  }
+
+  {
+    auto res = cli.Get("/dir/index.html");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ(0U, res->body.find("<html>"));
+  }
+}
+
+#ifndef CPPHTTPLIB_NO_EXCEPTIONS
+TEST(ResponseContentSourceTest, ErrorAndExceptionHandlersReplaceProvider) {
+  Server svr;
+
+  std::vector<bool> released;
+  std::mutex released_mutex;
+  auto releaser = [&](bool success) {
+    std::lock_guard<std::mutex> guard(released_mutex);
+    released.push_back(success);
+  };
+
+  auto provider = [](size_t offset, size_t length, DataSink &sink) {
+    return sink.write(&"hello"[offset], length);
+  };
+
+  svr.Get("/sized", [&](const Request &, Response &res) {
+    res.status = StatusCode::NotFound_404;
+    res.set_content_provider(5, "text/plain", provider, releaser);
+  });
+  svr.Get("/chunked", [&](const Request &, Response &res) {
+    res.status = StatusCode::ServiceUnavailable_503;
+    res.set_chunked_content_provider(
+        "text/plain",
+        [](size_t, DataSink &sink) {
+          sink.os << "chunk";
+          sink.done();
+          return true;
+        },
+        releaser);
+  });
+  svr.Get("/throw", [&](const Request &, Response &res) -> void {
+    res.set_content_provider(5, "text/plain", provider, releaser);
+    throw std::runtime_error("after the provider");
+  });
+
+  svr.set_error_handler([](const Request &req, Response &res) {
+    // Leave the exception handler's content to it.
+    if (req.path == "/throw") { return Server::HandlerResponse::Unhandled; }
+    res.set_content(std::string(1000, 'E'), "text/html");
+    return Server::HandlerResponse::Handled;
+  });
+  svr.set_exception_handler(
+      [](const Request &, Response &res, std::exception_ptr) {
+        res.status = StatusCode::InternalServerError_500;
+        res.set_content(std::string(1000, 'X'), "text/html");
+      });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto t = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+
+  {
+    auto res = cli.Get("/sized");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::NotFound_404, res->status);
+    EXPECT_EQ(std::string(1000, 'E'), res->body);
+    EXPECT_EQ("text/html", res->get_header_value("Content-Type"));
+  }
+
+  {
+    auto res = cli.Get("/chunked");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::ServiceUnavailable_503, res->status);
+    EXPECT_EQ(std::string(1000, 'E'), res->body);
+    EXPECT_FALSE(res->has_header("Transfer-Encoding"));
+  }
+
+  {
+    auto res = cli.Get("/throw");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::InternalServerError_500, res->status);
+    EXPECT_EQ(std::string(1000, 'X'), res->body);
+  }
+
+  std::lock_guard<std::mutex> guard(released_mutex);
+  EXPECT_EQ((std::vector<bool>{false, false, false}), released);
+}
+#endif
+
+TEST(ResponseContentSourceTest, LastContentSetterWins) {
+  Server svr;
+
+  auto abc = [](size_t offset, size_t length, DataSink &sink) {
+    return sink.write(&"abc"[offset], length);
+  };
+
+  svr.Get("/file-then-body", [](const Request &, Response &res) {
+    res.set_file_content("./www/dir/test.html");
+    res.set_content("body", "text/plain");
+  });
+  svr.Get("/body-then-file", [](const Request &, Response &res) {
+    res.set_content(std::string(100, 'B'), "text/plain");
+    res.set_file_content("./www/dir/test.html");
+  });
+  svr.Get("/body-then-provider", [&](const Request &, Response &res) {
+    res.set_content(std::string(100, 'B'), "text/plain");
+    res.set_content_provider(3, "text/x-provider", abc);
+  });
+  svr.Get("/provider-then-body", [&](const Request &, Response &res) {
+    res.set_content_provider(3, "text/x-provider", abc);
+    res.set_content(std::string(100, 'B'), "text/plain");
+  });
+  svr.Get("/provider-then-file", [&](const Request &, Response &res) {
+    res.set_content_provider(3, "text/x-provider", abc);
+    res.set_file_content("./www/dir/test.html", "text/x-file");
+  });
+  svr.Get("/file-then-header", [](const Request &, Response &res) {
+    res.set_file_content("./www/dir/test.html");
+    res.set_header("Content-Type", "text/x-handler");
+  });
+  svr.Get("/provider-then-direct-body", [&](const Request &, Response &res) {
+    res.set_content_provider(3, "text/plain", abc);
+    res.body = "direct";
+  });
+  svr.Get("/file-then-direct-body", [](const Request &, Response &res) {
+    res.set_file_content("./www/dir/test.html");
+    res.body = "direct";
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto t = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+
+  auto expect_body = [&](const char *path, const std::string &body,
+                         const std::string &type) {
+    // Uncompressed, so Content-Length can be compared with the body.
+    auto res = cli.Get(path, Headers{{"Accept-Encoding", ""}});
+    ASSERT_TRUE(res) << path << " Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status) << path;
+    EXPECT_EQ(body, res->body) << path;
+    EXPECT_EQ(std::to_string(body.size()),
+              res->get_header_value("Content-Length"))
+        << path;
+    EXPECT_EQ(1u, res->get_header_value_count("Content-Type")) << path;
+    EXPECT_EQ(type, res->get_header_value("Content-Type")) << path;
+  };
+
+  expect_body("/file-then-body", "body", "text/plain");
+  expect_body("/body-then-file", "test.html", "text/html");
+  expect_body("/body-then-provider", "abc", "text/x-provider");
+  expect_body("/provider-then-body", std::string(100, 'B'), "text/plain");
+  expect_body("/provider-then-file", "test.html", "text/x-file");
+  expect_body("/file-then-header", "test.html", "text/x-handler");
+  expect_body("/provider-then-direct-body", "direct", "text/plain");
+  expect_body("/file-then-direct-body", "direct", "text/plain");
+
+  // Ranges are checked against the body, not the dropped provider.
+  {
+    auto res = cli.Get("/provider-then-direct-body",
+                       Headers{{make_range_header({{1, 2}})}});
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::PartialContent_206, res->status);
+    EXPECT_EQ("ir", res->body);
+  }
+  {
+    auto res = cli.Get("/file-then-direct-body",
+                       Headers{{make_range_header({{7, 8}})}});
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::RangeNotSatisfiable_416, res->status);
+  }
+}
+
+#if defined(CPPHTTPLIB_SSL_ENABLED) && !defined(_WIN32)
+TEST(FileContentTest, TruncatedWhileServedEndsTheResponse) {
+  const char *path = "./truncated_while_served.txt";
+  const size_t size = 32 * 1024 * 1024;
+  {
+    std::ofstream f(path, std::ios::binary);
+    f << std::string(size, 'x');
+  }
+  auto se_file = detail::scope_exit([&] { std::remove(path); });
+
+  // Over TLS, where the bytes are encrypted in this process rather than
+  // copied by send().
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  svr.Get("/file", [&](const Request &, Response &res) {
+    res.set_file_content(path, "text/plain");
+  });
+  auto thread = std::thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  // The file shrinks once the first bytes are in, as a rewrite in place
+  // would, and reading the mapping past its new end used to raise SIGBUS.
+  SSLClient cli(HOST, PORT);
+  cli.enable_server_certificate_verification(false);
+  size_t received = 0;
+  auto res = cli.Get("/file", [&](const char *, size_t len) {
+    if (received == 0) { EXPECT_EQ(0, ::truncate(path, 0)); }
+    received += len;
+    return true;
+  });
+  EXPECT_FALSE(res);
+  EXPECT_LT(received, size);
+}
+#endif
+
+// Forward declaration (see the base64_encode note).
+namespace httplib {
+namespace detail {
+void set_file_content_provider(Response &res, const std::shared_ptr<mmap> &m,
+                               const std::string &content_type,
+                               EncodingType encoding);
+} // namespace detail
+} // namespace httplib
+
+TEST(ResponseContentSourceTest, FileContentProviderStaysWithinFile) {
+  auto mm = std::make_shared<detail::mmap>("./www/dir/test.html");
+  ASSERT_TRUE(mm->is_open());
+
+  Response res;
+  detail::set_file_content_provider(res, mm, "text/html",
+                                    detail::EncodingType::None);
+
+  std::string out;
+  DataSink sink;
+  sink.write = [&](const char *d, size_t l) {
+    out.append(d, l);
+    return true;
+  };
+
+  EXPECT_TRUE(res.content_provider_(0, mm->size() + 4096, sink));
+  EXPECT_EQ("test.html", out);
+  EXPECT_FALSE(res.content_provider_(mm->size(), 1, sink));
+  EXPECT_EQ("test.html", out);
 }
 
 TEST(LongPollingTest, ClientCloseDetection) {
@@ -9183,7 +14326,7 @@ TEST(GetWithParametersTest, GetWithParameters) {
     params.emplace("hello3", "world3");
     auto res = cli.Get("/", params, Headers{});
 
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
 
@@ -9192,7 +14335,7 @@ TEST(GetWithParametersTest, GetWithParameters) {
 
     auto res = cli.Get("/params?hello=world&hello2=world2&hello3=world3");
 
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
 
@@ -9201,7 +14344,7 @@ TEST(GetWithParametersTest, GetWithParameters) {
 
     auto res = cli.Get("/resources/resource-id?param1=foo&param2=bar");
 
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
 
@@ -9210,7 +14353,7 @@ TEST(GetWithParametersTest, GetWithParameters) {
 
     auto res = cli.Get("/users/user-id?param1=foo&param2=bar");
 
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
 }
@@ -9244,7 +14387,7 @@ TEST(GetWithParametersTest, GetWithParameters2) {
                        return true;
                      });
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("world", body);
 }
@@ -9271,7 +14414,7 @@ TEST(GetWithParametersTest, GetWithParamsOnlyNoHeaders) {
   // Verify that Get(path, params) works without requiring Headers argument
   auto res = cli.Get("/search", httplib::Params{{"q", "cpp-httplib"}});
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("cpp-httplib", res->body);
 }
@@ -9291,14 +14434,14 @@ TEST(ClientDefaultHeadersTest, DefaultHeaders_Online) {
 
   {
     auto res = cli.Get(path);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ("bcdefghijk", res->body);
     EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   }
 
   {
     auto res = cli.Get(path);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ("bcdefghijk", res->body);
     EXPECT_EQ(StatusCode::PartialContent_206, res->status);
   }
@@ -9325,7 +14468,7 @@ TEST(ServerDefaultHeadersTest, DefaultHeaders) {
 
   auto res = cli.Get("/");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("ok", res->body);
   EXPECT_EQ("World", res->get_header_value("Hello"));
@@ -9367,6 +14510,48 @@ TEST(KeepAliveTest, ReadTimeoutSSL) {
   ASSERT_TRUE(resb);
   EXPECT_EQ(StatusCode::OK_200, resb->status);
   EXPECT_EQ("b", resb->body);
+}
+
+// Closing an idle keep-alive connection sends close_notify and returns. The
+// server must not wait for the client's close_notify: an idle client never
+// sends one, so the worker would be held until the read timeout expires, and
+// stop() would wait for it.
+TEST(KeepAliveTest, SSLIdleCloseDoesNotWaitForPeer) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.set_keep_alive_timeout(1);
+  svr.set_read_timeout(10, 0);
+  svr.Get("/", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    if (listen_thread.joinable()) {
+      svr.stop();
+      listen_thread.join();
+    }
+  });
+  svr.wait_until_ready();
+
+  SSLClient cli(HOST, port);
+  cli.enable_server_certificate_verification(false);
+  cli.set_keep_alive(true);
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+
+  // Stay idle past the keep-alive timeout so the server closes the connection.
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+
+  auto start = std::chrono::steady_clock::now();
+  svr.stop();
+  listen_thread.join();
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - start)
+                     .count();
+  EXPECT_LT(elapsed, 3000);
 }
 #endif
 
@@ -9412,7 +14597,7 @@ protected:
 
 TEST_F(ServerTestWithAI_PASSIVE, GetMethod200) {
   auto res = cli_.Get("/hi");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("text/plain", res->get_header_value("Content-Type"));
   EXPECT_EQ("Hello World!", res->body);
@@ -9490,11 +14675,11 @@ protected:
 
 TEST_F(PayloadMaxLengthTest, ExceedLimit) {
   auto res = cli_.Post("/test", "123456789", "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PayloadTooLarge_413, res->status);
 
   res = cli_.Post("/test", "12345678", "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -9503,7 +14688,7 @@ TEST_F(PayloadMaxLengthTest, ChunkedEncodingSecurityTest) {
   std::string large_chunked_data(16, 'A'); // 16 bytes, exceeds 8-byte limit
 
   auto res = cli_.Post("/test", large_chunked_data, "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PayloadTooLarge_413, res->status);
 }
 
@@ -9512,7 +14697,7 @@ TEST_F(PayloadMaxLengthTest, ChunkedEncodingWithinLimit) {
   std::string small_chunked_data(4, 'B'); // 4 bytes, within 8-byte limit
 
   auto res = cli_.Post("/test", small_chunked_data, "text/plain");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -9550,79 +14735,6 @@ TEST_F(PayloadMaxLengthTest, RawSocketChunkedTest) {
                   response.find("Payload Too Large") != std::string::npos ||
                   response.find("400") != std::string::npos);
     }
-  }
-}
-
-TEST_F(PayloadMaxLengthTest, NoContentLengthPayloadLimit) {
-  // Test request without Content-Length header exceeding payload limit
-  std::string request_without_content_length = "POST /test HTTP/1.1\r\n"
-                                               "Host: " +
-                                               std::string(HOST) + ":" +
-                                               std::to_string(PORT) +
-                                               "\r\n"
-                                               "Connection: close\r\n"
-                                               "\r\n";
-
-  // Add payload exceeding the 8-byte limit
-  std::string large_payload(16, 'X'); // 16 bytes, exceeds 8-byte limit
-  request_without_content_length += large_payload;
-
-  std::string response;
-  bool result = send_request(1, request_without_content_length, &response);
-
-  if (!result) {
-    // If send_request fails, server likely closed connection due to payload
-    // limit
-    SUCCEED() << "Server rejected oversized request without Content-Length "
-                 "(connection closed)";
-  } else {
-    // Check if server responded with error or closed connection early
-    if (response.length() <= 10) {
-      SUCCEED() << "Server closed connection for oversized request without "
-                   "Content-Length";
-    } else {
-      // Check for error status codes
-      EXPECT_TRUE(response.find("413") != std::string::npos ||
-                  response.find("Payload Too Large") != std::string::npos ||
-                  response.find("400") != std::string::npos);
-    }
-  }
-}
-
-TEST_F(PayloadMaxLengthTest, NoContentLengthWithinLimit) {
-  // Test request without Content-Length header within payload limit
-  std::string request_without_content_length = "POST /test HTTP/1.1\r\n"
-                                               "Host: " +
-                                               std::string(HOST) + ":" +
-                                               std::to_string(PORT) +
-                                               "\r\n"
-                                               "Connection: close\r\n"
-                                               "\r\n";
-
-  // Add payload within the 8-byte limit
-  std::string small_payload(4, 'Y'); // 4 bytes, within 8-byte limit
-  request_without_content_length += small_payload;
-
-  std::string response;
-  bool result = send_request(1, request_without_content_length, &response);
-
-  // For requests without Content-Length, the server may have different behavior
-  // The key is that it should not reject due to payload limit for small
-  // payloads
-  if (result) {
-    // Check for any HTTP response (success or error, but not connection closed)
-    if (response.length() > 10) {
-      SUCCEED()
-          << "Server processed request without Content-Length within limit";
-    } else {
-      // Short response might indicate connection closed, which is acceptable
-      SUCCEED() << "Server closed connection for request without "
-                   "Content-Length (acceptable behavior)";
-    }
-  } else {
-    // Connection failure might be due to protocol requirements
-    SUCCEED() << "Connection issue with request without Content-Length "
-                 "(environment-specific)";
   }
 }
 
@@ -9674,7 +14786,7 @@ TEST_F(LargePayloadMaxLengthTest, ChunkedEncodingWithin10MB) {
                              'A'); // 5MB payload, within 10MB limit
 
   auto res = cli_.Post("/test", medium_payload, "application/octet-stream");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -9692,69 +14804,62 @@ TEST_F(LargePayloadMaxLengthTest, ChunkedEncodingExceeds10MB) {
   }
 }
 
-TEST_F(LargePayloadMaxLengthTest, NoContentLengthWithin10MB) {
-  // Test request without Content-Length header within 10MB limit
-  std::string request_without_content_length = "POST /test HTTP/1.1\r\n"
-                                               "Host: " +
-                                               std::string(HOST) + ":" +
-                                               std::to_string(PORT) +
-                                               "\r\n"
-                                               "Connection: close\r\n"
-                                               "\r\n";
+TEST(ClientPayloadTest, DoesNotReserveTheClaimedLength) {
+  Server svr;
+  svr.Get("/", [](const Request &, Response &res) {
+    // Claims the most the client accepts, far more than it sends, then drops
+    // the connection.
+    res.set_content_provider(std::string().max_size(), "text/plain",
+                             [](size_t, size_t, DataSink &sink) {
+                               sink.write("abc", 3);
+                               return false;
+                             });
+  });
 
-  // Add 1MB payload (within 10MB limit)
-  std::string medium_payload(1024 * 1024, 'C'); // 1MB payload
-  request_without_content_length += medium_payload;
+  auto thread = std::thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
 
-  std::string response;
-  bool result = send_request(5, request_without_content_length, &response);
-
-  if (result) {
-    // Should get a proper HTTP response for payloads within limit
-    if (response.length() > 10) {
-      SUCCEED() << "Server processed 1MB request without Content-Length within "
-                   "10MB limit";
-    } else {
-      SUCCEED() << "Server closed connection (acceptable behavior for no "
-                   "Content-Length)";
-    }
-  } else {
-    SUCCEED() << "Connection issue with 1MB payload (environment-specific)";
-  }
+  Client cli(HOST, PORT);
+  cli.set_payload_max_length(0);
+  EXPECT_FALSE(cli.Get("/"));
 }
 
-TEST_F(LargePayloadMaxLengthTest, NoContentLengthExceeds10MB) {
-  // Test request without Content-Length header exceeding 10MB limit
-  std::string request_without_content_length = "POST /test HTTP/1.1\r\n"
-                                               "Host: " +
-                                               std::string(HOST) + ":" +
-                                               std::to_string(PORT) +
-                                               "\r\n"
-                                               "Connection: close\r\n"
-                                               "\r\n";
+// A response body over the limit is reported as ExceedMaxPayloadSize, as the
+// Stream API does, not as a plain read failure
+TEST(ClientPayloadTest, OverLimitIsExceedMaxPayloadSize) {
+  Server svr;
+  svr.Get("/big", [](const Request &, Response &res) {
+    res.set_content(std::string(100000, 'b'), "text/plain");
+  });
 
-  // Add 12MB payload (exceeds 10MB limit)
-  std::string large_payload(12 * 1024 * 1024, 'D'); // 12MB payload
-  request_without_content_length += large_payload;
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+  });
+  svr.wait_until_ready();
 
-  std::string response;
-  bool result = send_request(10, request_without_content_length, &response);
+  Client cli(HOST, port);
+  cli.set_payload_max_length(1000);
 
-  if (!result) {
-    // Server should close connection due to payload limit
-    SUCCEED() << "Server rejected 12MB request without Content-Length "
-                 "(connection closed)";
-  } else {
-    // Check for error response
-    if (response.length() <= 10) {
-      SUCCEED()
-          << "Server closed connection for 12MB request exceeding 10MB limit";
-    } else {
-      EXPECT_TRUE(response.find("413") != std::string::npos ||
-                  response.find("Payload Too Large") != std::string::npos ||
-                  response.find("400") != std::string::npos);
-    }
-  }
+  auto res = cli.Get("/big", Headers{{"Accept-Encoding", ""}});
+  EXPECT_EQ(Error::ExceedMaxPayloadSize, res.error());
+
+  res = cli.Get("/big", Headers{{"Accept-Encoding", ""}},
+                [](const char *, size_t) { return true; });
+  EXPECT_EQ(Error::ExceedMaxPayloadSize, res.error());
+
+#ifdef CPPHTTPLIB_ZLIB_SUPPORT
+  // Small on the wire, over the limit once decompressed
+  res = cli.Get("/big", Headers{{"Accept-Encoding", "gzip"}});
+  EXPECT_EQ(Error::ExceedMaxPayloadSize, res.error());
+#endif
 }
 
 #ifdef CPPHTTPLIB_ZLIB_SUPPORT
@@ -9809,7 +14914,7 @@ TEST(PayloadLimitBypassTest, StreamingGzipDecompression) {
   Headers headers = {{"Content-Encoding", "gzip"}};
   auto res = cli.Post("/stream", headers, gz.data(), gz.size(),
                       "application/octet-stream");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
 
   // Server must reject oversized decompressed payloads with 413.
   EXPECT_EQ(StatusCode::PayloadTooLarge_413, res->status);
@@ -9817,7 +14922,372 @@ TEST(PayloadLimitBypassTest, StreamingGzipDecompression) {
   // Decompressed bytes delivered to the handler must not exceed LIMIT.
   EXPECT_LE(total, LIMIT);
 }
+
 #endif
+
+// Some servers misuse Content-Encoding to advertise a character set, e.g.
+// `Content-Encoding: UTF-8` on a JPEG. Such a value is not a content coding, so
+// the payload must be passed through untouched instead of being rejected.
+TEST(ContentEncodingTest, UnknownEncodingIsPassedThrough) {
+  const std::string body = "\xff\xd8\xff\xe0 not really a jpeg";
+
+  Server svr;
+
+  svr.Get("/image", [&](const Request & /*req*/, Response &res) {
+    res.set_content(body, "image/jpeg");
+    res.set_header("Content-Encoding", "UTF-8");
+  });
+
+  svr.Get("/identity", [&](const Request & /*req*/, Response &res) {
+    res.set_content(body, "image/jpeg");
+    res.set_header("Content-Encoding", "identity");
+  });
+
+  svr.Post("/echo", [](const Request &req, Response &res) {
+    res.set_content(req.body, "image/jpeg");
+  });
+
+  thread t = thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, PORT);
+
+  {
+    auto res = cli.Get("/image");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ(body, res->body);
+  }
+
+  {
+    auto res = cli.Get("/identity");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ(body, res->body);
+  }
+
+  {
+    // The same applies to a request body reaching the server.
+    Headers headers = {{"Content-Encoding", "UTF-8"}};
+    auto res = cli.Post("/echo", headers, body, "image/jpeg");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ(body, res->body);
+  }
+}
+
+// "Hello World!" as gzip. Hard-coded so that the test below can serve a
+// gzip-encoded response even when the build has no zlib support.
+static const char GZIPPED_HELLO_WORLD[] = {
+    '\x1f', '\x8b', '\x08', '\x00', '\x00', '\x00', '\x00', '\x00',
+    '\x02', '\x03', '\xf3', '\x48', '\xcd', '\xc9', '\xc9', '\x57',
+    '\x08', '\xcf', '\x2f', '\xca', '\x49', '\x51', '\x04', '\x00',
+    '\xa3', '\x1c', '\x29', '\x1c', '\x0c', '\x00', '\x00', '\x00'};
+
+// A content coding is a whole token, not something the field value merely
+// contains. Matching "br" and "zstd" as substrings made unrelated values such
+// as "fibre" look like Brotli, and turned a multi-coding value like
+// "gzip, br" into a Brotli-labeled body, so a decompressor was run over data
+// it was never meant to see.
+TEST(ContentEncodingTest, SubstringOfACodingIsNotTheCoding) {
+  const std::string body = "\xff\xd8\xff\xe0 not really a jpeg";
+
+  Server svr;
+
+  svr.Get("/fibre", [&](const Request & /*req*/, Response &res) {
+    res.set_content(body, "image/jpeg");
+    res.set_header("Content-Encoding", "fibre");
+  });
+
+  svr.Get("/multi", [&](const Request & /*req*/, Response &res) {
+    res.set_content(body, "image/jpeg");
+    res.set_header("Content-Encoding", "gzip, br");
+  });
+
+  svr.Get("/zstdish", [&](const Request & /*req*/, Response &res) {
+    res.set_content(body, "image/jpeg");
+    res.set_header("Content-Encoding", "x-zstd-ish");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+
+  for (const char *path : {"/fibre", "/multi", "/zstdish"}) {
+    auto res = cli.Get(path);
+    ASSERT_TRUE(res) << path << " -> " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status) << path;
+    // Not a coding we recognize, so the payload comes back untouched
+    EXPECT_EQ(body, res->body) << path;
+  }
+}
+
+// A content coding cpp-httplib recognizes but was not built with must be
+// reported as such. Handing the still-compressed payload back to the caller
+// would silently corrupt it.
+TEST(ContentEncodingTest, KnownEncodingWithoutSupportIsReported) {
+  const std::string gzipped(GZIPPED_HELLO_WORLD, sizeof(GZIPPED_HELLO_WORLD));
+
+  Server svr;
+
+  // "image/jpeg" keeps the server from applying a content coding of its own,
+  // so the hand-crafted Content-Encoding below survives.
+  svr.Get("/gzipped", [&](const Request & /*req*/, Response &res) {
+    res.set_content(gzipped, "image/jpeg");
+    res.set_header("Content-Encoding", "gzip");
+  });
+
+  // Content codings are case-insensitive (RFC 9110 8.4.1).
+  svr.Get("/gzipped-uppercase", [&](const Request & /*req*/, Response &res) {
+    res.set_content(gzipped, "image/jpeg");
+    res.set_header("Content-Encoding", "GZIP");
+  });
+
+  thread t = thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, PORT);
+
+  {
+    auto res = cli.Get("/gzipped");
+#ifdef CPPHTTPLIB_ZLIB_SUPPORT
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ("Hello World!", res->body);
+#else
+    ASSERT_FALSE(res);
+    EXPECT_EQ(Error::UnsupportedContentEncoding, res.error());
+#endif
+  }
+
+  {
+    // open_stream() must behave the same way.
+    auto handle = cli.open_stream("GET", "/gzipped");
+#ifdef CPPHTTPLIB_ZLIB_SUPPORT
+    ASSERT_TRUE(handle.is_valid());
+    std::string received;
+    char buf[256];
+    ssize_t n;
+    while ((n = handle.read(buf, sizeof(buf))) > 0) {
+      received.append(buf, static_cast<size_t>(n));
+    }
+    EXPECT_EQ("Hello World!", received);
+#else
+    EXPECT_FALSE(handle.is_valid());
+    EXPECT_EQ(Error::UnsupportedContentEncoding, handle.error);
+#endif
+  }
+
+  {
+    // A differently-cased coding must not be mistaken for an unknown one, or
+    // the body would be handed back still compressed.
+    auto res = cli.Get("/gzipped-uppercase");
+#ifdef CPPHTTPLIB_ZLIB_SUPPORT
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ("Hello World!", res->body);
+#else
+    ASSERT_FALSE(res);
+    EXPECT_EQ(Error::UnsupportedContentEncoding, res.error());
+#endif
+  }
+}
+
+#ifdef CPPHTTPLIB_ZLIB_SUPPORT
+// A handler serving pre-compressed content (e.g. build-time gzipped static
+// assets) sets Content-Encoding itself. The server used to pick a coding from
+// Accept-Encoding and the content type alone, gzipping the already-gzipped
+// body a second time and appending a second Content-Encoding field line, so
+// clients that decode one coding per listed value handed back raw gzip bytes.
+TEST(ContentEncodingTest, PreEncodedResponseIsNotCompressedAgain) {
+  const std::string gzipped(GZIPPED_HELLO_WORLD, sizeof(GZIPPED_HELLO_WORLD));
+
+  Server svr;
+
+  // text/plain is a compressible type, so only the pre-set Content-Encoding
+  // keeps the server from applying a coding of its own.
+  svr.Get("/pre-gzipped", [&](const Request & /*req*/, Response &res) {
+    res.set_content(gzipped, "text/plain");
+    res.set_header("Content-Encoding", "gzip");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+
+  Headers headers = {{"Accept-Encoding", "gzip"}};
+  auto res = cli.Get("/pre-gzipped", headers);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ(1U, res->get_header_value_count("Content-Encoding"));
+  EXPECT_EQ("Hello World!", res->body);
+}
+
+// set_compress(false) sends every handler response as it is, buffered or
+// streamed
+TEST(ContentEncodingTest, SetCompressFalseSendsIdentity) {
+  const std::string text(1000, 'a');
+
+  Server svr;
+  svr.set_compress(false);
+  svr.Get("/buffered", [&](const Request &, Response &res) {
+    res.set_content(text, "text/plain");
+  });
+  svr.Get("/streamed", [&](const Request &, Response &res) {
+    res.set_chunked_content_provider("text/plain", [&](size_t, DataSink &sink) {
+      sink.write(text.data(), text.size());
+      sink.done();
+      return true;
+    });
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_LT(0, port);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_decompress(false);
+  for (auto path : {"/buffered", "/streamed"}) {
+    SCOPED_TRACE(path);
+    auto res = cli.Get(path, Headers{{"Accept-Encoding", "gzip"}});
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_FALSE(res->has_header("Content-Encoding"));
+    EXPECT_EQ(text, res->body);
+  }
+}
+
+// A chunked provider settles its coding where the headers are written and
+// reuses it at write time. Both ends of that have to hold: a handler's own
+// Content-Encoding suppresses the coding, and a response without one is still
+// compressed as it always was.
+TEST(ContentEncodingTest, PreEncodedChunkedResponseIsNotCompressedAgain) {
+  const std::string gzipped(GZIPPED_HELLO_WORLD, sizeof(GZIPPED_HELLO_WORLD));
+  const std::string plain = "Hello World! Hello World! Hello World!";
+
+  Server svr;
+
+  svr.Get("/pre-gzipped", [&](const Request & /*req*/, Response &res) {
+    res.set_header("Content-Encoding", "gzip");
+    res.set_chunked_content_provider(
+        "text/plain", [gzipped](size_t /*offset*/, DataSink &sink) {
+          sink.write(gzipped.data(), gzipped.size());
+          sink.done();
+          return true;
+        });
+  });
+
+  svr.Get("/negotiated", [&](const Request & /*req*/, Response &res) {
+    res.set_chunked_content_provider(
+        "text/plain", [plain](size_t /*offset*/, DataSink &sink) {
+          sink.write(plain.data(), plain.size());
+          sink.done();
+          return true;
+        });
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  Headers headers = {{"Accept-Encoding", "gzip"}};
+
+  {
+    auto res = cli.Get("/pre-gzipped", headers);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ(1U, res->get_header_value_count("Content-Encoding"));
+    EXPECT_EQ("Hello World!", res->body);
+  }
+
+  {
+    auto res = cli.Get("/negotiated", headers);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+    EXPECT_EQ(plain, res->body);
+  }
+}
+#endif
+
+// RFC 9110 Section 5.3: a Content-Encoding split over several field lines is
+// the same message as the comma-joined one, so both have to be read the same
+// way. Reading only the first line made "gzip" followed by "gzip" look like a
+// single gzip coding, and a body the sender says was encoded twice was handed
+// back after one pass, still compressed but presented as decoded.
+TEST(ContentEncodingTest, DuplicateFieldLinesAreTheSameAsTheJoinedValue) {
+  const std::string body = "\xff\xd8\xff\xe0 not really a jpeg";
+
+  Server svr;
+  svr.Get("/split", [&](const Request & /*req*/, Response &res) {
+    res.set_content(body, "image/jpeg");
+    res.headers.emplace("Content-Encoding", "gzip");
+    res.headers.emplace("Content-Encoding", "gzip");
+  });
+  svr.Get("/joined", [&](const Request & /*req*/, Response &res) {
+    res.set_content(body, "image/jpeg");
+    res.set_header("Content-Encoding", "gzip, gzip");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+
+  // Two codings is not something cpp-httplib decodes, so both representations
+  // take the pass-through path rather than one of them being gunzipped once.
+  for (const char *path : {"/split", "/joined"}) {
+    auto res = cli.Get(path);
+    ASSERT_TRUE(res) << path << " -> " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status) << path;
+    EXPECT_EQ(body, res->body) << path;
+  }
+}
 
 // Regression test for DoS vulnerability: a malicious server sending a response
 // without Content-Length header must not cause unbounded memory consumption on
@@ -10209,7 +15679,7 @@ TEST(ClientVulnerabilityTest, ContentReceiverBypassesDefaultPayloadMaxLength) {
           return true;
         });
 
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
 
@@ -10432,7 +15902,7 @@ TEST(ClientVulnerabilityTest,
           return true;
         });
 
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
   }
 
@@ -10612,6 +16082,23 @@ TEST(HostAndPortPropertiesTest, PortOutOfRange) {
   // Port 99999 exceeds valid range (1-65535) — should not crash
   httplib::Client cli("http://www.google.com:99999");
   ASSERT_FALSE(cli.is_valid());
+
+  auto res = cli.Get("/");
+  EXPECT_FALSE(res);
+  EXPECT_EQ(Error::Connection, res.error());
+}
+
+TEST(HostAndPortPropertiesTest, UserinfoIsNotSupported) {
+  httplib::Client cli("http://user:pass@localhost:1234");
+  ASSERT_FALSE(cli.is_valid());
+  EXPECT_FALSE(cli.Get("/"));
+
+  EXPECT_FALSE(httplib::Client("//user@localhost:1234").is_valid());
+}
+
+TEST(HostAndPortPropertiesTest, TrailingCharactersInPort) {
+  httplib::Client cli("http://www.google.com:80abc");
+  ASSERT_FALSE(cli.is_valid());
 }
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
@@ -10637,7 +16124,7 @@ TEST(SSLClientTest, UpdateCAStoreWithPem_Online) {
   // Verify client is still valid and can make connections
   httplib_client.enable_server_certificate_verification(true);
   auto res = httplib_client.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   // Google may return 200 or 301 depending on various factors
   EXPECT_TRUE(res->status == StatusCode::OK_200 ||
               res->status == StatusCode::MovedPermanently_301);
@@ -10649,7 +16136,7 @@ TEST(SSLClientTest, ServerNameIndication_Online) {
 
   SSLClient cli(host, 443);
   auto res = cli.Get(path);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -10667,9 +16154,9 @@ TEST(SSLClientTest, ServerCertificateVerificationError_Online) {
   // OpenSSL: X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT (18)
   // Mbed TLS: MBEDTLS_X509_BADCERT_NOT_TRUSTED or similar flags
   EXPECT_NE(0UL, res.ssl_backend_error());
+  EXPECT_EQ(static_cast<int>(tls::ErrorCode::CertVerifyFailed),
+            res.ssl_error());
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-  // For OpenSSL, ssl_error is 0 for verification errors
-  EXPECT_EQ(0, res.ssl_error());
 #if !defined(_WIN32) ||                                                        \
     defined(CPPHTTPLIB_DISABLE_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE)
   // On non-Windows or when Windows Schannel is disabled, the error comes
@@ -10689,18 +16176,13 @@ TEST(SSLClientTest, ServerHostnameVerificationError_Online) {
 
   auto res = cli.Get("/");
   ASSERT_TRUE(!res);
-
-  // The error type depends on when hostname verification occurs:
-  // - OpenSSL: SSLServerHostnameVerification (post-handshake verification)
-  // - Mbed TLS: SSLServerVerification (during handshake)
-  EXPECT_TRUE(res.error() == Error::SSLServerHostnameVerification ||
-              res.error() == Error::SSLServerVerification);
+  EXPECT_EQ(Error::SSLServerHostnameVerification, res.error());
 
   // Verify backend error is captured for hostname verification failure
   EXPECT_NE(0UL, res.ssl_backend_error());
+  EXPECT_EQ(static_cast<int>(tls::ErrorCode::HostnameMismatch),
+            res.ssl_error());
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-  // For OpenSSL, ssl_error is 0 for verification errors
-  EXPECT_EQ(0, res.ssl_error());
 #if !defined(_WIN32) ||                                                        \
     defined(CPPHTTPLIB_DISABLE_WINDOWS_AUTOMATIC_ROOT_CERTIFICATES_UPDATE)
   // On non-Windows or when Windows Schannel is disabled, the error comes
@@ -10729,12 +16211,45 @@ TEST(SSLClientTest, WindowsCertificateVerification_Disabled) {
   auto res = cli.Get("/");
   if (res) { EXPECT_NE(StatusCode::InternalServerError_500, res->status); }
 }
+
+// The server sends an intermediate cross-signed by a root Windows trusts,
+// while the leaf's AIA URL leads to one under a root Windows does not trust.
+TEST(SSLClientTest, WindowsCertificateVerification_ServerIntermediates_Online) {
+  SSLClient cli("accounts.spotify.com", 443);
+  auto res = cli.Get("/");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error())
+                   << " ssl_backend_error=" << res.ssl_backend_error();
+}
+
+// Windows, not the backend, decides on the chain: the error is a CryptoAPI
+// policy status, which no backend reports for a self-signed certificate.
+TEST(SSLClientTest, WindowsCertificateVerification_RejectsUntrustedRoot) {
+  SSLServer svr(SERVER_CERT2_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+
+  thread t = thread([&]() { ASSERT_TRUE(svr.listen("127.0.0.1", PORT)); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  SSLClient cli("127.0.0.1", PORT);
+  cli.set_connection_timeout(30);
+
+  auto res = cli.Get("/");
+  ASSERT_FALSE(res);
+  EXPECT_EQ(Error::SSLServerVerification, res.error());
+  EXPECT_EQ(static_cast<DWORD>(CERT_E_UNTRUSTEDROOT), res.ssl_backend_error());
+}
 #endif
 
 TEST(SSLClientTest, ServerCertificateVerification1_Online) {
   Client cli("https://google.com");
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::MovedPermanently_301, res->status);
 }
 
@@ -10742,7 +16257,7 @@ TEST(SSLClientTest, ServerCertificateVerification2_Online) {
   SSLClient cli("google.com");
   cli.set_ca_cert_path(CA_CERT_FILE);
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::MovedPermanently_301, res->status);
 }
 
@@ -10797,7 +16312,7 @@ TEST(SSLClientTest, ServerCertificateVerification4) {
   cli.set_connection_timeout(30);
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -10808,7 +16323,7 @@ TEST(SSLClientTest, ServerCertificateVerification5_Online) {
   SSLClient cli("google.com");
   cli.load_ca_cert_store(cert.data(), cert.size());
   const auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::MovedPermanently_301, res->status);
 }
 
@@ -10840,7 +16355,7 @@ TEST(SSLClientTest, ServerCertificateVerification6_Online) {
   SSLClient cli("google.com");
   cli.load_ca_cert_store(cert, sizeof(cert));
   const auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::MovedPermanently_301, res->status);
 }
 
@@ -10852,7 +16367,7 @@ TEST(SSLClientTest, WildcardHostNameMatch_Online) {
   cli.set_follow_location(true);
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -10865,7 +16380,7 @@ TEST(SSLClientTest, WildcardHostNameMatchCase_Online) {
   cli.set_follow_location(true);
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -10877,7 +16392,7 @@ TEST(SSLClientTest, HostNameMatchCase_Online) {
   cli.set_follow_location(true);
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -10886,7 +16401,7 @@ TEST(SSLClientTest, Issue2004_Online) {
   client.set_follow_location(true);
 
   auto res = client.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 
   auto body = res->body;
@@ -10955,22 +16470,23 @@ TEST(SSLClientTest, SetInterfaceWithINET6) {
   cli->set_interface("en0");
 
   auto res = cli->Get("/get");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
 #endif
 
-// ClientCertPresent uses get_peer_cert() - works with all TLS backends
+// Client certificate tests - work with all TLS backends
 #ifdef CPPHTTPLIB_SSL_ENABLED
+using ClientCertServerSetup = std::function<void(SSLServer &)>;
+
 void ClientCertPresent(
     const std::string &client_cert_file,
     const std::string &client_private_key_file,
-    const std::string &client_encrypted_private_key_pass = std::string()) {
-  using namespace httplib::tls;
-
-  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, CLIENT_CA_CERT_FILE,
-                CLIENT_CA_CERT_DIR);
+    const std::string &client_encrypted_private_key_pass = std::string(),
+    const ClientCertServerSetup &setup = nullptr) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, CLIENT_CA_CERT_FILE);
   ASSERT_TRUE(svr.is_valid());
+  if (setup) { setup(svr); }
 
   svr.Get("/test", [&](const Request &req, Response &res) {
     res.set_content("test", "text/plain");
@@ -10982,7 +16498,9 @@ void ClientCertPresent(
     EXPECT_EQ("Common Name", common_name);
   });
 
-  thread t = thread([&]() { ASSERT_TRUE(svr.listen(HOST, PORT)); });
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_LT(0, port);
+  thread t = thread([&]() { svr.listen_after_bind(); });
   auto se = detail::scope_exit([&] {
     svr.stop();
     t.join();
@@ -10991,13 +16509,13 @@ void ClientCertPresent(
 
   svr.wait_until_ready();
 
-  SSLClient cli(HOST, PORT, client_cert_file, client_private_key_file,
+  SSLClient cli(HOST, port, client_cert_file, client_private_key_file,
                 client_encrypted_private_key_pass);
   cli.enable_server_certificate_verification(false);
   cli.set_connection_timeout(30);
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -11011,11 +16529,185 @@ TEST(SSLClientServerTest, ClientEncryptedCertPresent) {
                     CLIENT_ENCRYPTED_PRIVATE_KEY_PASS);
 }
 
-// PEM memory-based constructor tests (works with all TLS backends)
+// Expects svr, which must require client certificates, to reject a client
+// that has none
+void RejectsClientWithoutCert(SSLServer &svr) {
+  svr.Get("/test", [](const Request &, Response &) { FAIL(); });
+
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_LT(0, port);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  SSLClient cli(HOST, port);
+  cli.set_connection_timeout(30);
+  // Skip the server certificate check, so that the request fails because the
+  // client certificate is missing rather than because cert.pem is not trusted
+  cli.enable_server_certificate_verification(false);
+
+  auto res = cli.Get("/test");
+  ASSERT_FALSE(res);
+  // The server rejects the client during the handshake, or on TLS 1.3 right
+  // after it, which the client notices on its first write or read
+  EXPECT_TRUE(res.error() == Error::SSLConnection ||
+              res.error() == Error::Write || res.error() == Error::Read)
+      << to_string(res.error());
+
+  if (res.error() == Error::SSLConnection) {
+    EXPECT_NE(0UL, res.ssl_backend_error());
+  }
+  // A rejection noticed on the write keeps the TLS error the write hit
+  if (res.error() == Error::Write) { EXPECT_NE(0, res.ssl_error()); }
+}
+
+void ClientCertMissing(const ClientCertServerSetup &setup = nullptr) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, CLIENT_CA_CERT_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  if (setup) { setup(svr); }
+  RejectsClientWithoutCert(svr);
+}
+
+TEST(SSLClientServerTest, ClientCertMissing) { ClientCertMissing(); }
+
+// A server that requires client certificates must keep requiring them after
+// setup changes it, and keep accepting a client that has one
+void ClientCertStillRequired(const ClientCertServerSetup &setup) {
+  ClientCertMissing(setup);
+  ClientCertPresent(CLIENT_CERT_FILE, CLIENT_PRIVATE_KEY_FILE, std::string(),
+                    setup);
+}
+
+TEST(SSLClientServerTest, ClientCertStillRequiredAfterVerifyCallbackSet) {
+  ClientCertStillRequired([](SSLServer &svr) {
+    ASSERT_TRUE(tls::set_verify_callback(
+        svr.tls_context(), [](const tls::VerifyContext &) { return true; }));
+  });
+}
+
+TEST(SSLClientServerTest, ClientCertStillRequiredAfterVerifyCallbackCleared) {
+  ClientCertStillRequired([](SSLServer &svr) {
+    ASSERT_TRUE(tls::set_verify_callback(
+        svr.tls_context(), [](const tls::VerifyContext &) { return true; }));
+    ASSERT_TRUE(tls::set_verify_callback(svr.tls_context(), nullptr));
+  });
+}
+
+// The client verifies the server certificate during the handshake, so a
+// server that fails the check never gets the client certificate, even when a
+// verifier of the client's own accepts it
+TEST(SSLClientServerTest, ClientCertNotSentToUnverifiedServer) {
+  struct Case {
+    const char *trusted_ca;
+    const char *host;
+    Error error;
+  };
+  // cert2.pem names localhost: the first client does not trust it, and the
+  // second trusts it but asks for another name
+  for (const auto &c :
+       {Case{CLIENT_CA_CERT_FILE, "localhost", Error::SSLServerVerification},
+        Case{SERVER_CERT2_FILE, "example.com",
+             Error::SSLServerHostnameVerification}}) {
+    for (auto with_verifier : {false, true}) {
+      SCOPED_TRACE(std::string(c.host) + (with_verifier ? " +verifier" : ""));
+      SSLServer svr(SERVER_CERT2_FILE, SERVER_PRIVATE_KEY_FILE,
+                    CLIENT_CA_CERT_FILE);
+      ASSERT_TRUE(svr.is_valid());
+      std::atomic<bool> got_client_cert{false};
+      ASSERT_TRUE(tls::set_verify_callback(svr.tls_context(),
+                                           [&](const tls::VerifyContext &) {
+                                             got_client_cert = true;
+                                             return true;
+                                           }));
+      auto port = svr.bind_to_any_port("127.0.0.1");
+      ASSERT_LT(0, port);
+      thread t = thread([&] { svr.listen_after_bind(); });
+      svr.wait_until_ready();
+
+      SSLClient cli(c.host, port, CLIENT_CERT_FILE, CLIENT_PRIVATE_KEY_FILE);
+      cli.set_direct_hostname_addr_map({{c.host, "127.0.0.1"}});
+      cli.set_ca_cert_path(c.trusted_ca);
+      if (with_verifier) {
+        cli.set_server_certificate_verifier(
+            [](const tls::VerifyContext &) { return true; });
+      }
+      auto res = cli.Get("/");
+      EXPECT_FALSE(res);
+      EXPECT_EQ(c.error, res.error());
+
+      svr.stop();
+      t.join();
+      EXPECT_FALSE(got_client_cert);
+    }
+  }
+}
+
+void UpdateCertsPemWithClientCA(SSLServer &svr) {
+  std::string cert_pem, key_pem, ca_pem;
+  read_file(SERVER_CERT_FILE, cert_pem);
+  read_file(SERVER_PRIVATE_KEY_FILE, key_pem);
+  read_file(CLIENT_CA_CERT_FILE, ca_pem);
+  ASSERT_TRUE(
+      svr.update_certs_pem(cert_pem.c_str(), key_pem.c_str(), ca_pem.c_str()));
+}
+
+TEST(SSLClientServerTest, UpdateCertsPemWithClientCARequiresClientCert) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  UpdateCertsPemWithClientCA(svr);
+  RejectsClientWithoutCert(svr);
+}
+
+TEST(SSLClientServerTest, ClientCertStillRequiredAfterUpdateCertsPem) {
+  ClientCertStillRequired(UpdateCertsPemWithClientCA);
+}
+
+// A TLS error from one request must not show up in a later request's Result
+TEST(SSLClientServerTest, SSLErrorNotCarriedToLaterRequest) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("test", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_LT(0, port);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  SSLClient cli(HOST, port);
+  cli.set_connection_timeout(30);
+  cli.enable_server_hostname_verification(false);
+
+  // cert.pem is not trusted, so the handshake fails
+  ASSERT_FALSE(cli.Get("/test"));
+
+  cli.enable_server_certificate_verification(false);
+  auto res = cli.Get("/test");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(0, res.ssl_error());
+  EXPECT_EQ(0UL, res.ssl_backend_error());
+}
+
+// PEM memory-based constructor tests (works with all TLS backends).
+// exact_size passes each PEM in a buffer of its own size, with no NUL
+// terminator after it.
 void PemMemoryClientCertPresent(
     const std::string &client_cert_file,
     const std::string &client_private_key_file,
-    const std::string &client_encrypted_private_key_pass = std::string()) {
+    const std::string &client_encrypted_private_key_pass = std::string(),
+    bool exact_size = false) {
   // Read PEM files into memory
   std::string server_cert_pem, server_key_pem;
   std::string client_ca_pem;
@@ -11027,21 +16719,32 @@ void PemMemoryClientCertPresent(
   read_file(client_cert_file, client_cert_pem);
   read_file(client_private_key_file, client_key_pem);
 
+  std::list<std::vector<char>> exact_copies;
+  auto data = [&](const std::string &pem) -> const char * {
+    if (!exact_size) { return pem.c_str(); }
+    exact_copies.emplace_back(pem.begin(), pem.end());
+    return exact_copies.back().data();
+  };
+
   // Create server with PEM memory
   SSLServer::PemMemory server_pem = {
-      server_cert_pem.c_str(),
+      data(server_cert_pem),
       server_cert_pem.size(),
-      server_key_pem.c_str(),
+      data(server_key_pem),
       server_key_pem.size(),
-      client_ca_pem.c_str(),
+      data(client_ca_pem),
       client_ca_pem.size(),
       nullptr // no password for server key
   };
   SSLServer svr(server_pem);
   ASSERT_TRUE(svr.is_valid());
 
-  svr.Get("/test", [&](const Request &, Response &res) {
+  svr.Get("/test", [&](const Request &req, Response &res) {
     res.set_content("test", "text/plain");
+
+    auto cert = req.peer_cert();
+    ASSERT_TRUE(static_cast<bool>(cert));
+    EXPECT_EQ("Common Name", cert.subject_cn());
   });
 
   thread t = thread([&]() { ASSERT_TRUE(svr.listen(HOST, PORT)); });
@@ -11058,14 +16761,14 @@ void PemMemoryClientCertPresent(
                              ? nullptr
                              : client_encrypted_private_key_pass.c_str();
   SSLClient::PemMemory client_pem = {
-      client_cert_pem.c_str(), client_cert_pem.size(), client_key_pem.c_str(),
+      data(client_cert_pem), client_cert_pem.size(), data(client_key_pem),
       client_key_pem.size(), password};
   SSLClient cli(HOST, PORT, client_pem);
   cli.enable_server_certificate_verification(false);
   cli.set_connection_timeout(30);
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -11079,62 +16782,65 @@ TEST(SSLClientServerTest, PemMemoryClientEncryptedCertPresent) {
                              CLIENT_ENCRYPTED_PRIVATE_KEY_PASS);
 }
 
-TEST(SSLClientServerTest, ClientCertMissing) {
-  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, CLIENT_CA_CERT_FILE,
-                CLIENT_CA_CERT_DIR);
-  ASSERT_TRUE(svr.is_valid());
+// A server built from PEM memory with a client CA requires client certificates,
+// also when the CA is a NUL-terminated string passed with a length of 0
+TEST(SSLClientServerTest, PemMemoryClientCertMissing) {
+  std::string server_cert_pem, server_key_pem, client_ca_pem;
+  read_file(SERVER_CERT_FILE, server_cert_pem);
+  read_file(SERVER_PRIVATE_KEY_FILE, server_key_pem);
+  read_file(CLIENT_CA_CERT_FILE, client_ca_pem);
 
-  svr.Get("/test", [&](const Request &, Response &) { ASSERT_TRUE(false); });
+  SSLServer::PemMemory server_pem = {
+      server_cert_pem.c_str(),
+      server_cert_pem.size(),
+      server_key_pem.c_str(),
+      server_key_pem.size(),
+      client_ca_pem.c_str(),
+      client_ca_pem.size(),
+      nullptr // no password for server key
+  };
+  for (auto client_ca_pem_len : {client_ca_pem.size(), size_t{0}}) {
+    SCOPED_TRACE(client_ca_pem_len);
+    server_pem.client_ca_pem_len = client_ca_pem_len;
+    SSLServer svr(server_pem);
+    ASSERT_TRUE(svr.is_valid());
+    RejectsClientWithoutCert(svr);
+  }
 
-  thread t = thread([&]() { ASSERT_TRUE(svr.listen(HOST, PORT)); });
-  auto se = detail::scope_exit([&] {
-    svr.stop();
-    t.join();
-    ASSERT_FALSE(svr.is_running());
-  });
-
-  svr.wait_until_ready();
-
-  SSLClient cli(HOST, PORT);
-  cli.set_connection_timeout(30);
-
-  auto res = cli.Get("/test");
-  ASSERT_TRUE(!res);
-  // When client cert is missing and server requires it, connection fails
-  // Error type depends on backend implementation
-  EXPECT_TRUE(res.error() == Error::SSLServerVerification ||
-              res.error() == Error::SSLConnection);
-
-  // Verify backend error is captured
-  // Note: This test may have different error codes depending on the exact
-  // verification failure
-  EXPECT_NE(0UL, res.ssl_backend_error());
+  // An empty CA fails to load instead of turning the check off
+  server_pem.client_ca_pem = "";
+  server_pem.client_ca_pem_len = 0;
+  EXPECT_FALSE(SSLServer(server_pem).is_valid());
 }
 
-TEST(SSLClientServerTest, TrustDirOptional) {
-  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, CLIENT_CA_CERT_FILE);
-  ASSERT_TRUE(svr.is_valid());
+// The PemMemory lengths are honoured, so the PEM needs no NUL terminator
+TEST(SSLClientServerTest, PemMemoryExactSizeBuffers) {
+  PemMemoryClientCertPresent(CLIENT_CERT_FILE, CLIENT_PRIVATE_KEY_FILE, "",
+                             true);
+}
 
-  svr.Get("/test", [&](const Request &, Response &res) {
-    res.set_content("test", "text/plain");
-  });
+// A length shorter than the PEM cuts it short, so it no longer loads
+TEST(SSLClientServerTest, PemMemoryShortLengthCutsThePem) {
+  std::string cert, key;
+  read_file(SERVER_CERT_FILE, cert);
+  read_file(SERVER_PRIVATE_KEY_FILE, key);
 
-  thread t = thread([&]() { ASSERT_TRUE(svr.listen(HOST, PORT)); });
-  auto se = detail::scope_exit([&] {
-    svr.stop();
-    t.join();
-    ASSERT_FALSE(svr.is_running());
-  });
+  for (auto cut_cert : {true, false}) {
+    auto cert_len = cut_cert ? cert.size() / 2 : cert.size();
+    auto key_len = cut_cert ? key.size() : key.size() / 2;
 
-  svr.wait_until_ready();
+    SSLServer::PemMemory server_pem = {
+        cert.c_str(), cert_len, key.c_str(), key_len, nullptr, 0, nullptr};
+    EXPECT_FALSE(SSLServer(server_pem).is_valid());
 
-  SSLClient cli(HOST, PORT, CLIENT_CERT_FILE, CLIENT_PRIVATE_KEY_FILE);
-  cli.enable_server_certificate_verification(false);
-  cli.set_connection_timeout(30);
+    SSLClient::PemMemory client_pem = {cert.c_str(), cert_len, key.c_str(),
+                                       key_len, nullptr};
+    EXPECT_FALSE(SSLClient(HOST, PORT, client_pem).is_valid());
 
-  auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
-  ASSERT_EQ(StatusCode::OK_200, res->status);
+    ws::WebSocketClient::PemMemory ws_pem = {cert.c_str(), cert_len,
+                                             key.c_str(), key_len, nullptr};
+    EXPECT_FALSE(ws::WebSocketClient("wss://localhost/", ws_pem).is_valid());
+  }
 }
 
 TEST(SSLClientServerTest, SSLConnectTimeout) {
@@ -11218,12 +16924,11 @@ TEST(SSLClientServerTest, CustomizeServerSSLCtxGeneric) {
   cli.set_connection_timeout(30);
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
 
-// Test verify_hostname for both OpenSSL and MbedTLS backends
-// Verifies that wildcard matching and exact matching work consistently
+// Test verify_hostname on every backend: a host is named by a SAN only
 TEST(SSLClientServerTest, TlsVerifyHostname) {
   using namespace httplib::tls;
 
@@ -11257,7 +16962,7 @@ TEST(SSLClientServerTest, TlsVerifyHostname) {
 
     if (!ctx.cert) return false;
 
-    // Test 1: "Common Name" should match (our test server cert CN)
+    // Test 1: "Common Name" is the CN of our test server cert, which has no SAN
     verify_result_cn = ctx.check_hostname("Common Name");
 
     // Test 2: wrong hostname should not match
@@ -11273,25 +16978,48 @@ TEST(SSLClientServerTest, TlsVerifyHostname) {
   ASSERT_TRUE(verify_callback_called)
       << "Verify callback should have been called";
 
-  // CN="Common Name" should match our test certificate
-  //
-  // BoringSSL intentionally drops CN-based hostname matching per RFC 6125
-  // §6.4.4 — only SubjectAltName is consulted. Other backends (OpenSSL,
-  // MbedTLS, wolfSSL) still honor the CN fallback, so flip the expectation
-  // for BoringSSL builds. OPENSSL_IS_BORINGSSL is defined by BoringSSL's
-  // <openssl/base.h>, which is included transitively when
-  // CPPHTTPLIB_OPENSSL_SUPPORT is set against a BoringSSL install.
-#if defined(OPENSSL_IS_BORINGSSL)
   EXPECT_FALSE(verify_result_cn)
-      << "BoringSSL should reject CN-based hostname matching (SAN-only)";
-#else
-  EXPECT_TRUE(verify_result_cn)
-      << "verify_hostname should match 'Common Name' (certificate CN)";
-#endif
+      << "verify_hostname must not match the certificate CN (no SAN)";
 
   // Wrong hostname should not match
   EXPECT_FALSE(verify_result_wrong)
       << "verify_hostname should not match 'wronghost.example.com'";
+}
+
+// A DNS name in the CN must not authenticate a host (RFC 9525), whichever
+// backend verifies it.
+TEST(SSLClientServerTest, TlsVerifyHostnameDnsNotMatchedByCommonName) {
+  // Certificate CN is "localhost" and it carries no SAN.
+  SSLServer svr(SERVER_CERT_DNS_CN_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  SSLClient cli("localhost", port);
+  cli.set_ca_cert_path(SERVER_CERT_DNS_CN_FILE);
+  cli.enable_server_certificate_verification(true);
+  cli.set_connection_timeout(5);
+
+  auto res = cli.Get("/test");
+  ASSERT_FALSE(res);
+  EXPECT_EQ(Error::SSLServerHostnameVerification, res.error());
+
+  // The same certificate is accepted once host name verification is off, so the
+  // failure above is the host name and not the chain.
+  cli.enable_server_hostname_verification(false);
+  res = cli.Get("/test");
+  ASSERT_TRUE(res) << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
 // An IP-literal host must only be authenticated via an iPAddress SAN, never via
@@ -11395,6 +17123,182 @@ TEST(SSLClientServerTest, TlsVerifyHostnameIpv6San) {
   EXPECT_FALSE(cn_ipv6_matched)
       << "An IPv6 host must not be authenticated via the certificate CN";
 }
+
+// A SAN entry must only match a host of its own type: the bytes of the dNSName
+// "a.zz" are also 97.46.122.122, and 42.46.122.122 reads as "*.zz".
+TEST(SSLClientServerTest, TlsVerifyHostnameSanType) {
+  using namespace httplib::tls;
+
+  // SANs: DNS:a.zz, IP:42.46.122.122
+  SSLServer svr(SERVER_CERT_SAN_TYPES_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  bool verify_callback_called = false;
+  bool dns_san_matched = false;
+  bool ip_san_matched = false;
+  bool ip_matched_via_dns_san = true;
+  bool dns_matched_via_ip_san = true;
+  bool cn_matched_next_to_dns_san = true;
+
+  SSLClient cli(HOST, port);
+  cli.enable_server_certificate_verification(true);
+  cli.set_ca_cert_path(CA_CERT_FILE);
+  cli.set_connection_timeout(5);
+
+  cli.set_server_certificate_verifier([&](const VerifyContext &ctx) -> bool {
+    verify_callback_called = true;
+    if (!ctx.cert) return false;
+
+    dns_san_matched = ctx.check_hostname("a.zz");
+    ip_san_matched = ctx.check_hostname("42.46.122.122");
+
+    ip_matched_via_dns_san = ctx.check_hostname("97.46.122.122");
+    dns_matched_via_ip_san = ctx.check_hostname("b.zz");
+    cn_matched_next_to_dns_san = ctx.check_hostname("san-types");
+
+    return true; // Accept for the purpose of this test
+  });
+
+  cli.Get("/test");
+
+  ASSERT_TRUE(verify_callback_called)
+      << "Verify callback should have been called";
+  EXPECT_TRUE(dns_san_matched) << "verify_hostname should match a dNSName SAN";
+  EXPECT_TRUE(ip_san_matched)
+      << "verify_hostname should match an iPAddress SAN";
+  EXPECT_FALSE(ip_matched_via_dns_san)
+      << "An IP host must not be authenticated via a dNSName SAN";
+  EXPECT_FALSE(dns_matched_via_ip_san)
+      << "A DNS host must not be authenticated via an iPAddress SAN";
+  EXPECT_FALSE(cn_matched_next_to_dns_san)
+      << "The CN must not be consulted next to a dNSName SAN (RFC 6125)";
+}
+
+// RFC 6125 6.4.3: only the leftmost label of a dNSName may be a wildcard, so
+// "www.*.example.test" names one host and not every host under example.test.
+TEST(SSLClientServerTest, TlsVerifyHostnameWildcardLabel) {
+  using namespace httplib::tls;
+
+  // SANs: DNS:*.leftmost.example.test, DNS:www.*.example.test
+  SSLServer svr(SERVER_CERT_WILDCARD_SAN_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  bool verify_callback_called = false;
+  bool leftmost_wildcard_matched = false;
+  bool wildcard_spanned_labels = true;
+  bool inner_wildcard_matched = true;
+
+  SSLClient cli(HOST, port);
+  cli.enable_server_certificate_verification(true);
+  cli.set_ca_cert_path(CA_CERT_FILE);
+  cli.set_connection_timeout(5);
+
+  cli.set_server_certificate_verifier([&](const VerifyContext &ctx) -> bool {
+    verify_callback_called = true;
+    if (!ctx.cert) return false;
+
+    leftmost_wildcard_matched = ctx.check_hostname("a.leftmost.example.test");
+
+    wildcard_spanned_labels = ctx.check_hostname("a.b.leftmost.example.test");
+    inner_wildcard_matched = ctx.check_hostname("www.evil.example.test");
+
+    return true; // Accept for the purpose of this test
+  });
+
+  cli.Get("/test");
+
+  ASSERT_TRUE(verify_callback_called)
+      << "Verify callback should have been called";
+  EXPECT_TRUE(leftmost_wildcard_matched)
+      << "A leftmost wildcard should match a single label";
+  EXPECT_FALSE(wildcard_spanned_labels)
+      << "A wildcard label must not match more than one label";
+  EXPECT_FALSE(inner_wildcard_matched)
+      << "A wildcard outside the leftmost label must not be honoured";
+}
+
+// sans() must report each SAN entry under its own type.
+TEST(SSLClientServerTest, TlsCertSansEntryTypes) {
+  using namespace httplib::tls;
+
+  // SANs: DNS:a.zz, IP:42.46.122.122
+  SSLServer svr(SERVER_CERT_SAN_TYPES_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  bool verify_callback_called = false;
+  std::vector<SanEntry> sans;
+
+  SSLClient cli(HOST, port);
+  cli.enable_server_certificate_verification(true);
+  cli.set_ca_cert_path(CA_CERT_FILE);
+  cli.set_connection_timeout(5);
+
+  cli.set_server_certificate_verifier([&](const VerifyContext &ctx) -> bool {
+    verify_callback_called = true;
+    if (!ctx.cert) return false;
+
+    sans = ctx.sans();
+
+    return true; // Accept for the purpose of this test
+  });
+
+  cli.Get("/test");
+
+  ASSERT_TRUE(verify_callback_called)
+      << "Verify callback should have been called";
+
+  auto has_san = [&](SanType type, const std::string &value) {
+    return std::any_of(sans.begin(), sans.end(), [&](const SanEntry &san) {
+      return san.type == type && san.value == value;
+    });
+  };
+
+  EXPECT_TRUE(has_san(SanType::DNS, "a.zz"))
+      << "sans() should report the dNSName SAN";
+  EXPECT_TRUE(has_san(SanType::IP, "42.46.122.122"))
+      << "sans() should report the iPAddress SAN";
+
+  EXPECT_FALSE(has_san(SanType::IP, "97.46.122.122"))
+      << "sans() must not report the dNSName SAN as an address";
+  EXPECT_FALSE(has_san(SanType::DNS, "*.zz"))
+      << "sans() must not report the iPAddress SAN as a DNS name";
+}
 #endif
 
 // mbedTLS-specific callback constructor test
@@ -11428,7 +17332,7 @@ TEST(SSLClientServerTest, ClientCAListSentToClient) {
   cli.set_connection_timeout(30);
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_TRUE(client_cert_verified);
   EXPECT_EQ("success", res->body);
@@ -11480,7 +17384,7 @@ TEST(SSLClientServerTest, ClientCAListSetInContext) {
   cli.set_connection_timeout(30);
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
   ASSERT_TRUE(handler_called);
   EXPECT_EQ("authenticated", res->body);
@@ -11526,7 +17430,7 @@ TEST(TlsCertIntrospectionTest, GetCertSANs) {
   });
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_TRUE(cert_checked);
 }
 
@@ -11568,7 +17472,7 @@ TEST(TlsCertIntrospectionTest, GetCertValidity) {
   });
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_TRUE(validity_checked);
 }
 
@@ -11610,7 +17514,7 @@ TEST(TlsCertIntrospectionTest, GetCertSerial) {
   });
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_TRUE(serial_checked);
 }
 
@@ -11689,9 +17593,183 @@ TEST(VerifyCallbackTest, VerifyContextFields) {
   });
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_GT(callback_count, 0);
   EXPECT_TRUE(saw_leaf_cert);
+}
+
+// A verifier that accepts runs alongside the built-in verification, and is the
+// only check once that is turned off.
+TEST(VerifyCallbackTest, AcceptingVerifierDoesNotOverrideVerification) {
+  using namespace httplib::tls;
+
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  SSLClient cli(HOST, port);
+  cli.enable_server_hostname_verification(false);
+  auto calls = 0;
+  cli.set_server_certificate_verifier([&](const VerifyContext &) {
+    calls++;
+    return true;
+  });
+
+  // cert.pem is not trusted
+  auto res = cli.Get("/test");
+  ASSERT_FALSE(res);
+  EXPECT_EQ(Error::SSLServerVerification, res.error());
+  EXPECT_GT(calls, 0);
+
+  cli.enable_server_certificate_verification(false);
+  res = cli.Get("/test");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("ok", res->body);
+}
+
+// A verifier belongs to the client that set it, not to the thread that set it.
+TEST(VerifyCallbackTest, VerifierStaysWithItsClient) {
+  using namespace httplib::tls;
+
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  auto rejecting_calls = 0;
+  SSLClient rejecting(HOST, port);
+  rejecting.enable_server_certificate_verification(false);
+  rejecting.set_server_certificate_verifier([&](const VerifyContext &) {
+    rejecting_calls++;
+    return false;
+  });
+
+  auto accepting_calls = 0;
+  SSLClient accepting(HOST, port);
+  accepting.enable_server_certificate_verification(false);
+  // Set on another thread than the requests below.
+  thread([&]() {
+    accepting.set_server_certificate_verifier([&](const VerifyContext &) {
+      accepting_calls++;
+      return true;
+    });
+  }).join();
+
+  // Requested on another thread than the verifier was set on.
+  thread([&]() { EXPECT_FALSE(rejecting.Get("/test")); }).join();
+  EXPECT_GT(rejecting_calls, 0);
+
+  auto res = accepting.Get("/test");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_GT(accepting_calls, 0);
+}
+
+// A verifier replaced while a handshake runs it lives until it returns.
+TEST(VerifyCallbackTest, VerifierReplacedDuringHandshake) {
+  using namespace httplib::tls;
+
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  SSLClient cli(HOST, port);
+  cli.enable_server_certificate_verification(false);
+
+  std::promise<void> entered;
+  std::promise<void> replaced;
+  auto replaced_future = replaced.get_future();
+  auto first_call = true;
+  // Long enough to live on the heap
+  std::string expected(64, 'v');
+  cli.set_server_certificate_verifier([&, expected](const VerifyContext &) {
+    if (first_call) {
+      first_call = false;
+      entered.set_value();
+      replaced_future.wait();
+    }
+    return expected == std::string(64, 'v');
+  });
+
+  thread request([&]() {
+    auto res = cli.Get("/test");
+    EXPECT_TRUE(res) << "Error: " << to_string(res.error());
+  });
+
+  entered.get_future().wait();
+  cli.set_server_certificate_verifier(
+      [](const VerifyContext &) { return true; });
+  replaced.set_value();
+  request.join();
+}
+
+// VerifyContext::session is the same handle the other tls:: functions take.
+TEST(VerifyCallbackTest, SessionMatchesSessionVerifier) {
+  using namespace httplib::tls;
+
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  SSLClient cli(HOST, port);
+  cli.enable_server_certificate_verification(false);
+
+  session_t verifier_session = nullptr;
+  cli.set_server_certificate_verifier([&](const VerifyContext &ctx) {
+    verifier_session = ctx.session;
+    return true;
+  });
+
+  session_t session_verifier_session = nullptr;
+  cli.set_session_verifier([&](session_t session) {
+    session_verifier_session = session;
+    return SSLVerifierResponse::NoDecisionMade;
+  });
+
+  auto res = cli.Get("/test");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_NE(nullptr, verifier_session);
+  EXPECT_EQ(session_verifier_session, verifier_session);
 }
 
 TEST(TlsVerifyErrorTest, GetVerifyErrorString) {
@@ -11736,7 +17814,7 @@ TEST(SessionVerifierTest, CertificateAccepted) {
   });
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(200, res->status);
   EXPECT_TRUE(callback_called);
 }
@@ -11802,7 +17880,7 @@ TEST(SessionVerifierTest, NoDecisionFallsThrough) {
   });
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(200, res->status);
   EXPECT_TRUE(callback_called);
 }
@@ -11879,7 +17957,7 @@ TEST(SSLClientServerTest, ClientCAListFromPem) {
   cli.enable_server_certificate_verification(false);
 
   auto res = cli.Get("/test-pem-ca");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(200, res->status);
   EXPECT_EQ("ok", res->body);
 
@@ -11920,7 +17998,7 @@ TEST(SendAPI, SimpleInterface_Online) {
   req.path = "/";
   auto res = cli.send(req);
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::MovedPermanently_301, res->status);
 }
 
@@ -11950,11 +18028,11 @@ TEST(SendAPI, WithParamsInRequest) {
     req.path = "/";
     req.params.emplace("test", "test_value");
     auto res = cli.send(req);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   }
   {
     auto res = cli.Get("/", {{"test", "test_value"}}, Headers{});
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   }
 }
 
@@ -11988,7 +18066,7 @@ TEST(ClientImplMethods, GetSocketTest) {
     // earlier than this one to be considered.
 
     auto res = cli.Get("/");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
 
     EXPECT_EQ(StatusCode::OK_200, res->status);
     ASSERT_TRUE(cli.socket() != INVALID_SOCKET);
@@ -12000,12 +18078,12 @@ TEST(YahooRedirectTest2, SimpleInterface_Online) {
   Client cli("http://yahoo.com");
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::MovedPermanently_301, res->status);
 
   cli.set_follow_location(true);
   res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("https://www.yahoo.com/", res->location);
 }
@@ -12014,12 +18092,12 @@ TEST(YahooRedirectTest3, SimpleInterface_Online) {
   Client cli("https://yahoo.com");
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::MovedPermanently_301, res->status);
 
   cli.set_follow_location(true);
   res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("https://www.yahoo.com/", res->location);
 }
@@ -12028,9 +18106,9 @@ TEST(YahooRedirectTest3, NewResultInterface_Online) {
   Client cli("https://yahoo.com");
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_FALSE(!res);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_FALSE(res == nullptr);
   ASSERT_TRUE(res != nullptr);
   EXPECT_EQ(Error::Success, res.error());
@@ -12040,7 +18118,7 @@ TEST(YahooRedirectTest3, NewResultInterface_Online) {
 
   cli.set_follow_location(true);
   res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(Error::Success, res.error());
   EXPECT_EQ(StatusCode::OK_200, res.value().status);
   EXPECT_EQ(StatusCode::OK_200, (*res).status);
@@ -12054,7 +18132,7 @@ TEST(DecodeWithChunkedEncoding, BrotliEncoding_Online) {
   auto res = cli.Get("/ajax/libs/jquery/3.5.1/jquery.js",
                      Headers{{"Accept-Encoding", "br"}});
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(287630U, res->body.size());
   EXPECT_EQ("application/javascript; charset=utf-8",
@@ -12072,7 +18150,7 @@ TEST(HttpsToHttpRedirectTest, SimpleInterface_Online) {
   auto res =
       cli.Get(REDIR_PATH "?url=http%3A%2F%2Fexample.com&status_code=302");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -12085,7 +18163,7 @@ TEST(HttpsToHttpRedirectTest2, SimpleInterface_Online) {
   params.emplace("status_code", "302");
 
   auto res = cli.Get(REDIR_PATH, params, Headers{});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -12097,7 +18175,7 @@ TEST(HttpsToHttpRedirectTest3, SimpleInterface_Online) {
   params.emplace("url", "http://example.com");
 
   auto res = cli.Get(REDIR_PATH "?status_code=302", params, Headers{});
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -12138,7 +18216,7 @@ TEST(HttpToHttpsRedirectTest, CertFile) {
   cli.set_connection_timeout(30);
 
   auto res = cli.Get("/index");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -12181,9 +18259,125 @@ TEST(SSLClientRedirectTest, CertFile) {
   cli.set_connection_timeout(30);
 
   auto res = cli.Get("/index");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
+
+// Redirects from a server with SERVER_CERT2_FILE to one with target_cert on
+// another port, so the client follows it with a new client.
+static Result GetThroughTlsRedirectToDifferentPort(
+    const std::function<void(SSLClient &)> &setup,
+    const char *target_cert = SERVER_CERT2_FILE,
+    const char *target_key = SERVER_PRIVATE_KEY_FILE) {
+  auto ssl_port = PORT + 1;
+
+  SSLServer ssl_svr1(SERVER_CERT2_FILE, SERVER_PRIVATE_KEY_FILE);
+  ssl_svr1.Get("/index", [&](const Request &, Response &res) {
+    res.set_redirect("https://127.0.0.1:" + std::to_string(ssl_port) +
+                     "/index");
+  });
+
+  SSLServer ssl_svr2(target_cert, target_key);
+  ssl_svr2.Get("/index", [&](const Request &, Response &res) {
+    res.set_content("test", "text/plain");
+  });
+
+  thread t = thread([&]() { ssl_svr1.listen("127.0.0.1", PORT); });
+  thread t2 = thread([&]() { ssl_svr2.listen("127.0.0.1", ssl_port); });
+  auto se = detail::scope_exit([&] {
+    ssl_svr2.stop();
+    ssl_svr1.stop();
+    t2.join();
+    t.join();
+  });
+
+  ssl_svr1.wait_until_ready();
+  ssl_svr2.wait_until_ready();
+
+  SSLClient cli("127.0.0.1", PORT);
+  cli.set_follow_location(true);
+  cli.set_connection_timeout(30);
+  setup(cli);
+  return cli.Get("/index");
+}
+
+TEST(SSLClientRedirectTest, KeepSessionVerifier) {
+  auto calls = 0;
+  auto res = GetThroughTlsRedirectToDifferentPort([&](SSLClient &cli) {
+    cli.enable_server_certificate_verification(false);
+    // Accept the first server only.
+    cli.set_session_verifier([&](tls::session_t) {
+      return ++calls == 1 ? SSLVerifierResponse::NoDecisionMade
+                          : SSLVerifierResponse::CertificateRejected;
+    });
+  });
+  ASSERT_FALSE(res);
+  EXPECT_EQ(Error::SSLServerVerification, res.error());
+  EXPECT_EQ(2, calls);
+}
+
+TEST(SSLClientRedirectTest, KeepServerCertificateVerifier) {
+  std::string pinned;
+  auto res = GetThroughTlsRedirectToDifferentPort(
+      [&](SSLClient &cli) {
+        cli.enable_server_certificate_verification(false);
+        // Pin the first certificate seen.
+        cli.set_server_certificate_verifier([&](const tls::VerifyContext &ctx) {
+          if (pinned.empty()) { pinned = ctx.serial(); }
+          return ctx.serial() == pinned;
+        });
+      },
+      // A certificate other than the first server's.
+      SERVER_CERT_FILE);
+  EXPECT_FALSE(res);
+  EXPECT_FALSE(pinned.empty());
+}
+
+TEST(SSLClientRedirectTest, KeepCaCertStore) {
+  auto res = GetThroughTlsRedirectToDifferentPort([](SSLClient &cli) {
+    std::string cert;
+    read_file(SERVER_CERT2_FILE, cert);
+    cli.set_ca_cert_store(tls::create_ca_store(cert.c_str(), cert.size()));
+  });
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+
+// The target's certificate is signed by the root CA, which the first server's
+// is not. Its name is not checked, as it carries none of 127.0.0.1.
+TEST(SSLClientRedirectTest, KeepEveryCaCertPem) {
+  auto res = GetThroughTlsRedirectToDifferentPort(
+      [](SSLClient &cli) {
+        std::string root_ca, cert;
+        read_file(CLIENT_CA_CERT_FILE, root_ca);
+        read_file(SERVER_CERT2_FILE, cert);
+        cli.load_ca_cert_store(root_ca.data(), root_ca.size());
+        cli.load_ca_cert_store(cert.data(), cert.size());
+        cli.enable_server_hostname_verification(false);
+      },
+      CLIENT_CERT_FILE, CLIENT_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+
+#ifndef CPPHTTPLIB_WOLFSSL_SUPPORT
+// set_ca_cert_store() replaces the root CA loaded before it, so the target is
+// not trusted after the redirect either. (wolfSSL adds the store instead.)
+TEST(SSLClientRedirectTest, CaCertStoreReplacesEarlierPem) {
+  auto res = GetThroughTlsRedirectToDifferentPort(
+      [](SSLClient &cli) {
+        std::string root_ca, cert;
+        read_file(CLIENT_CA_CERT_FILE, root_ca);
+        read_file(SERVER_CERT2_FILE, cert);
+        cli.load_ca_cert_store(root_ca.data(), root_ca.size());
+        cli.set_ca_cert_store(tls::create_ca_store(cert.c_str(), cert.size()));
+        cli.enable_server_hostname_verification(false);
+      },
+      CLIENT_CERT_FILE, CLIENT_PRIVATE_KEY_FILE);
+  ASSERT_FALSE(res);
+  EXPECT_EQ(Error::SSLServerVerification, res.error());
+}
+#endif
 #endif
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
@@ -12250,7 +18444,7 @@ TEST(SSLClientTest, SetCaCertStoreNativeVerifiesLocalServer) {
   cli.set_connection_timeout(30);
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -12297,7 +18491,7 @@ TEST(UniversalClientRedirectTest, LoadCaCertStore) {
   cli.set_connection_timeout(30);
 
   auto res = cli.Get("/index");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -12313,7 +18507,7 @@ TEST(SSLClientTest, EnableSystemCaWithCustomCa_Online) {
   cli.enable_server_certificate_verification(true);
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::MovedPermanently_301, res->status);
 }
 
@@ -12343,9 +18537,101 @@ TEST(SSLClientTest, EnableSystemCaCustomCaVerifiesLocalServer) {
   cli.set_connection_timeout(30);
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
+
+#ifdef CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN
+// A usage-constraints dictionary of a Keychain Trust Settings array, with
+// the keys SecTrustSettingsCopyTrustSettings() returns.
+static CFDictionaryRef
+make_usage_constraint(SecPolicyRef policy, const char *policy_string,
+                      const SecTrustSettingsResult *result) {
+  auto constraint =
+      CFDictionaryCreateMutable(nullptr, 0, &kCFTypeDictionaryKeyCallBacks,
+                                &kCFTypeDictionaryValueCallBacks);
+  if (policy) {
+    CFDictionarySetValue(constraint, kSecTrustSettingsPolicy, policy);
+  }
+  if (policy_string) {
+    auto str = CFStringCreateWithCString(nullptr, policy_string,
+                                         kCFStringEncodingUTF8);
+    CFDictionarySetValue(constraint, kSecTrustSettingsPolicyString, str);
+    CFRelease(str);
+  }
+  if (result) {
+    auto number_value = static_cast<SInt32>(*result);
+    auto number = CFNumberCreate(nullptr, kCFNumberSInt32Type, &number_value);
+    CFDictionarySetValue(constraint, kSecTrustSettingsResult, number);
+    CFRelease(number);
+  }
+  return constraint;
+}
+
+static SecTrustSettingsResult
+ssl_trust_settings_result(std::vector<CFDictionaryRef> constraints) {
+  auto trust_settings =
+      CFArrayCreateMutable(nullptr, 0, &kCFTypeArrayCallBacks);
+  for (auto constraint : constraints) {
+    CFArrayAppendValue(trust_settings, constraint);
+    CFRelease(constraint);
+  }
+  auto result = tls::impl::macos_ssl_trust_settings_result(trust_settings);
+  CFRelease(trust_settings);
+  return result;
+}
+
+// The system CA loader takes a Keychain certificate as a trusted root only
+// when its Trust Settings say so for SSL, not merely because it has some.
+TEST(SSLClientTest, MacOSKeychainTrustSettingsForSSL) {
+  const auto trust_root = kSecTrustSettingsResultTrustRoot;
+  const auto trust_as_root = kSecTrustSettingsResultTrustAsRoot;
+  const auto deny = kSecTrustSettingsResultDeny;
+  const auto unspecified = kSecTrustSettingsResultUnspecified;
+  auto ssl_policy = SecPolicyCreateSSL(true, nullptr);
+  auto x509_policy = SecPolicyCreateBasicX509();
+
+  // "Always Trust", which stores no constraint at all
+  EXPECT_EQ(kSecTrustSettingsResultTrustRoot, ssl_trust_settings_result({}));
+  EXPECT_EQ(kSecTrustSettingsResultTrustRoot,
+            ssl_trust_settings_result(
+                {make_usage_constraint(nullptr, nullptr, nullptr)}));
+  EXPECT_EQ(kSecTrustSettingsResultTrustRoot,
+            ssl_trust_settings_result(
+                {make_usage_constraint(ssl_policy, nullptr, &trust_root)}));
+  EXPECT_EQ(kSecTrustSettingsResultTrustAsRoot,
+            ssl_trust_settings_result(
+                {make_usage_constraint(ssl_policy, nullptr, &trust_as_root)}));
+
+  // "Never Trust", for everything or for SSL
+  EXPECT_EQ(kSecTrustSettingsResultDeny,
+            ssl_trust_settings_result(
+                {make_usage_constraint(nullptr, nullptr, &deny)}));
+  EXPECT_EQ(kSecTrustSettingsResultDeny,
+            ssl_trust_settings_result(
+                {make_usage_constraint(ssl_policy, nullptr, &deny)}));
+
+  // Trusted for another policy, for one host, or not at all
+  EXPECT_EQ(kSecTrustSettingsResultUnspecified,
+            ssl_trust_settings_result(
+                {make_usage_constraint(x509_policy, nullptr, &trust_root)}));
+  EXPECT_EQ(kSecTrustSettingsResultUnspecified,
+            ssl_trust_settings_result({make_usage_constraint(
+                ssl_policy, "www.example.com", &trust_root)}));
+  EXPECT_EQ(kSecTrustSettingsResultUnspecified,
+            ssl_trust_settings_result(
+                {make_usage_constraint(nullptr, nullptr, &unspecified)}));
+
+  // The first constraint that applies to SSL decides
+  EXPECT_EQ(kSecTrustSettingsResultDeny,
+            ssl_trust_settings_result(
+                {make_usage_constraint(x509_policy, nullptr, &trust_root),
+                 make_usage_constraint(nullptr, nullptr, &deny)}));
+
+  CFRelease(x509_policy);
+  CFRelease(ssl_policy);
+}
+#endif
 
 // Regression test: for IP hosts the Mbed TLS and wolfSSL backends used to
 // skip chain verification entirely (only the certificate identity was
@@ -12381,6 +18667,125 @@ TEST(SSLClientTest, IpHostUntrustedChainFails) {
   ASSERT_FALSE(res);
 }
 
+#ifndef CPPHTTPLIB_WOLFSSL_SUPPORT
+// A custom CA that brings no certificate still keeps the system CAs out, so a
+// CA that failed to come through fails verification instead of trusting them.
+// (wolfSSL does not list the system CAs it loaded.)
+TEST(SSLClientTest, EmptyCustomCaKeepsSystemCasOut) {
+  SSLServer svr(SERVER_CERT2_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  auto port = svr.bind_to_any_port("127.0.0.1");
+  ASSERT_LT(0, port);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  // The CAs a client trusts once its first request has loaded them
+  auto loaded_cas = [&](const std::function<void(Client &)> &setup) {
+    Client cli("https://127.0.0.1:" + std::to_string(port));
+    setup(cli);
+    cli.Get("/");
+    return tls::get_ca_names(cli.tls_context()).size();
+  };
+
+  EXPECT_EQ(0u, loaded_cas([](Client &cli) { cli.load_ca_cert_store("", 0); }));
+  EXPECT_EQ(0u,
+            loaded_cas([](Client &cli) { cli.set_ca_cert_store(nullptr); }));
+}
+#endif
+
+// A TLS setting changed between requests applies to the next one, not just to
+// the next connection
+TEST(SSLClientTest, TlsSettingChangeClosesKeptAliveConnection) {
+  SSLServer svr(SERVER_CERT2_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  svr.Get("/", [](const Request &req, Response &res) {
+    res.set_content(std::to_string(req.remote_port), "text/plain");
+  });
+  auto port = svr.bind_to_any_port("127.0.0.1");
+  ASSERT_LT(0, port);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  SSLClient cli("127.0.0.1", port);
+  cli.set_keep_alive(true);
+  cli.set_ca_cert_path(CLIENT_CA_CERT_FILE); // does not trust cert2.pem
+  cli.enable_server_certificate_verification(false);
+
+  // The port the request went out from, so a new one means a new connection
+  auto client_port = [&] {
+    auto res = cli.Get("/");
+    return res ? res->body : std::string();
+  };
+  auto last = client_port();
+  ASSERT_FALSE(last.empty());
+
+  // Setting a value it already has keeps the connection
+  cli.enable_server_certificate_verification(false);
+  cli.enable_server_hostname_verification(true);
+  EXPECT_EQ(last, client_port());
+
+  cli.enable_server_certificate_verification(true);
+  auto res = cli.Get("/");
+  EXPECT_FALSE(res);
+  EXPECT_EQ(Error::SSLServerVerification, res.error());
+
+  std::string ca;
+  read_file(SERVER_CERT2_FILE, ca);
+  cli.load_ca_cert_store(ca.c_str(), ca.size());
+  last = client_port();
+  ASSERT_FALSE(last.empty());
+
+  std::vector<std::function<void()>> setters = {
+      [&] { cli.enable_server_hostname_verification(false); },
+      [&] { cli.load_ca_cert_store(ca.c_str(), ca.size()); },
+      [&] {
+        cli.set_ca_cert_store(tls::create_ca_store(ca.c_str(), ca.size()));
+      },
+      [&] {
+        cli.set_server_certificate_verifier(
+            [](const tls::VerifyContext &) { return true; });
+      },
+      [&] {
+        cli.set_session_verifier(
+            [](tls::session_t) { return SSLVerifierResponse::NoDecisionMade; });
+      },
+  };
+  for (const auto &setter : setters) {
+    setter();
+    auto next = client_port();
+    ASSERT_FALSE(next.empty());
+    EXPECT_NE(last, next);
+    last = next;
+  }
+
+  cli.set_session_verifier(
+      [](tls::session_t) { return SSLVerifierResponse::CertificateRejected; });
+  auto handle = cli.open_stream("GET", "/");
+  EXPECT_FALSE(handle.is_valid());
+  EXPECT_EQ(Error::SSLServerVerification, handle.error);
+}
+
+// A PEM given to create_ca_store() needs no NUL after it
+TEST(SSLClientTest, CreateCaStoreFromPemWithoutNul) {
+  std::string pem;
+  read_file(SERVER_CERT2_FILE, pem);
+  auto buf = pem + "X";
+  auto store = tls::create_ca_store(buf.data(), pem.size());
+  EXPECT_TRUE(store != nullptr);
+  SSLClient cli("localhost");
+  cli.set_ca_cert_store(store);
+}
+
 // enable_system_ca(false) prevents system CA loading entirely
 TEST(SSLClientTest, DisableSystemCa_Online) {
   SSLClient cli("google.com");
@@ -12406,7 +18811,7 @@ TEST(UniversalClientTest, EnableSystemCaWithCustomCa_Online) {
   cli.enable_server_certificate_verification(true);
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::MovedPermanently_301, res->status);
 }
 
@@ -12440,7 +18845,7 @@ TEST(UniversalClientRedirectTest, EnableSystemCaCarriesOver_Online) {
   // Receiving any response proves the redirect client completed the TLS
   // handshake with a system-CA-signed host
   auto res = cli.Get("/index");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
 }
 
 TEST(MultipartFormDataTest, LargeData) {
@@ -12502,7 +18907,7 @@ TEST(MultipartFormDataTest, LargeData) {
     };
 
     auto res = cli.Post("/post", items);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     ASSERT_EQ(StatusCode::OK_200, res->status);
   }
 }
@@ -12647,7 +19052,7 @@ TEST(MultipartFormDataTest, DataProviderItems) {
 
     {
       auto res = cli.Post("/post-none", {}, {}, {});
-      ASSERT_TRUE(res);
+      ASSERT_TRUE(res) << "Error: " << to_string(res.error());
       ASSERT_EQ(StatusCode::OK_200, res->status);
     }
 
@@ -12656,7 +19061,7 @@ TEST(MultipartFormDataTest, DataProviderItems) {
     {
       auto res =
           cli.Post("/post-items", {}, items, providers); // empty providers
-      ASSERT_TRUE(res);
+      ASSERT_TRUE(res) << "Error: " << to_string(res.error());
       ASSERT_EQ(StatusCode::OK_200, res->status);
     }
 
@@ -12694,13 +19099,13 @@ TEST(MultipartFormDataTest, DataProviderItems) {
 
     {
       auto res = cli.Post("/post-providers", {}, {}, providers);
-      ASSERT_TRUE(res);
+      ASSERT_TRUE(res) << "Error: " << to_string(res.error());
       ASSERT_EQ(StatusCode::OK_200, res->status);
     }
 
     {
       auto res = cli.Post("/post-both", {}, items, providers);
-      ASSERT_TRUE(res);
+      ASSERT_TRUE(res) << "Error: " << to_string(res.error());
       ASSERT_EQ(StatusCode::OK_200, res->status);
     }
   }
@@ -12746,7 +19151,7 @@ TEST(MultipartFormDataTest, BadHeader) {
   Client cli(HOST, PORT);
   auto res = cli.Post("/post", body, content_type.c_str());
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::BadRequest_400, res->status);
 }
 
@@ -12789,7 +19194,7 @@ TEST(MultipartFormDataTest, WithPreamble) {
   Client cli(HOST, PORT);
   auto res = cli.Post("/post", body, content_type.c_str());
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -12852,7 +19257,7 @@ TEST(MultipartFormDataTest, PostCustomBoundary) {
     };
 
     auto res = cli.Post("/post_customboundary", {}, items, "abc-abc");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     ASSERT_EQ(StatusCode::OK_200, res->status);
   }
 }
@@ -12936,7 +19341,7 @@ TEST(MultipartFormDataTest, PutFormData) {
     };
 
     auto res = cli.Put("/put", items);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     ASSERT_EQ(StatusCode::OK_200, res->status);
   }
 }
@@ -13001,7 +19406,7 @@ TEST(MultipartFormDataTest, PutFormDataCustomBoundary) {
     };
 
     auto res = cli.Put("/put_customboundary", {}, items, "abc-abc_");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     ASSERT_EQ(StatusCode::OK_200, res->status);
   }
 }
@@ -13068,6 +19473,7 @@ TEST(MultipartFormDataTest, AlternateFilename) {
   svr.wait_until_ready();
 
   auto req = "POST /test HTTP/1.1\r\n"
+             "Host: localhost\r\n"
              "Content-Type: multipart/form-data;boundary=--------\r\n"
              "Content-Length: 399\r\n"
              "\r\n"
@@ -13136,6 +19542,7 @@ TEST(MultipartFormDataTest, AlternateFilenameLongValueAndCaseInsensitive) {
                      "------------\r\n";
 
   auto req = "POST /test HTTP/1.1\r\n"
+             "Host: localhost\r\n"
              "Content-Type: multipart/form-data;boundary=--------\r\n"
              "Content-Length: " +
              std::to_string(body.size()) + "\r\n\r\n" + body;
@@ -13170,6 +19577,7 @@ TEST(MultipartFormDataTest, CloseDelimiterWithoutCRLF) {
   svr.wait_until_ready();
 
   auto req = "POST /test HTTP/1.1\r\n"
+             "Host: localhost\r\n"
              "Content-Type: multipart/form-data;boundary=--------\r\n"
              "Content-Length: 146\r\n"
              "\r\n----------\r\n"
@@ -13214,6 +19622,7 @@ TEST(MultipartFormDataTest, ContentLength) {
   svr.wait_until_ready();
 
   auto req = "POST /test HTTP/1.1\r\n"
+             "Host: localhost\r\n"
              "Content-Type: multipart/form-data;boundary=--------\r\n"
              "Content-Length: 167\r\n"
              "\r\n----------\r\n"
@@ -13268,6 +19677,7 @@ TEST(MultipartFormDataTest, AccessPartHeaders) {
   svr.wait_until_ready();
 
   auto req = "POST /test HTTP/1.1\r\n"
+             "Host: localhost\r\n"
              "Content-Type: multipart/form-data;boundary=--------\r\n"
              "Content-Length: 232\r\n"
              "\r\n----------\r\n"
@@ -13322,6 +19732,7 @@ TEST(MultipartFormDataTest, LargeHeader) {
                         "--" +
                         boundary + "--\r\n";
   std::string header_prefix = "POST /test HTTP/1.1\r\n"
+                              "Host: localhost\r\n"
                               "Content-Type: multipart/form-data;boundary=" +
                               boundary +
                               "\r\n"
@@ -13377,7 +19788,7 @@ TEST(MultipartFormDataTest, UploadItemsHasContentLength) {
 
   Client cli(HOST, port);
   auto res = cli.Post("/upload", {}, items);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -13468,7 +19879,7 @@ TEST(MultipartFormDataTest, ManyItemsEndToEnd) {
 
   Client cli(HOST, port);
   auto res = cli.Post("/upload", items);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -13524,8 +19935,252 @@ TEST(MultipartFormDataTest, MakeFileProvider) {
 
   Client cli(HOST, port);
   auto res = cli.Post("/upload", {}, {}, providers);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+
+TEST(MultipartFormDataTest, ExcessivePartHeaders) {
+  // Verify that a multipart part with more than CPPHTTPLIB_HEADER_MAX_COUNT
+  // (100) headers is rejected with a 400 Bad Request response.
+  Server svr;
+  svr.Post("/post", [&](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  thread t = thread([&] { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  // Build a multipart part with 101 custom headers (exceeding
+  // CPPHTTPLIB_HEADER_MAX_COUNT=100)
+  std::stringstream body;
+  body << "--simpleboundary\r\n"
+       << "Content-Disposition: form-data; name=\"field1\"\r\n";
+  for (int i = 0; i < 101; i++) {
+    body << "X-Custom-Header-" << i << ": value\r\n";
+  }
+  body << "\r\n"
+       << "value1\r\n"
+       << "--simpleboundary--\r\n";
+
+  std::string content_type = "multipart/form-data; boundary=simpleboundary";
+
+  Client cli(HOST, PORT);
+  auto res = cli.Post("/post", body.str(), content_type.c_str());
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::BadRequest_400, res->status);
+}
+
+TEST(MultipartFormDataTest, NoInitialBoundaryParsingIsNotQuadratic) {
+  // A body that never contains the declared boundary must not be accumulated
+  // while the parser waits for it. Buffering it would also make every read
+  // rescan everything seen so far, which is quadratic in the body size.
+  Server svr;
+  svr.Post("/post", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_read_timeout(60, 0);
+  cli.set_write_timeout(60, 0);
+
+  // '-' is the worst case: it matches the first character of the boundary, so
+  // every position has to be checked against it.
+  auto post_dashes = [&](size_t size) {
+    const std::string body(size, '-');
+    auto start = std::chrono::steady_clock::now();
+    auto res =
+        cli.Post("/post", body, "multipart/form-data; boundary=simpleboundary");
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - start)
+                  .count();
+    EXPECT_TRUE(res) << "Error: " << to_string(res.error());
+    if (res) { EXPECT_EQ(StatusCode::BadRequest_400, res->status); }
+    return ms;
+  };
+
+  // Not named `small`/`large`: <rpcndr.h> defines `small` as a macro on
+  // Windows.
+  auto ms_4mb = post_dashes(4u * 1024 * 1024);
+  auto ms_16mb = post_dashes(16u * 1024 * 1024);
+
+  // Comparing the two sizes rather than checking an absolute duration keeps
+  // this meaningful across build types and CI load, both of which move the
+  // absolute numbers by more than an order of magnitude. Four times the bytes
+  // costs about four times the time when parsing is linear, and about sixteen
+  // times when the body is buffered and rescanned.
+  ASSERT_GT(ms_4mb, 0) << "timer resolution too coarse to compare";
+  EXPECT_LT(ms_16mb, ms_4mb * 10)
+      << "4MB took " << ms_4mb << "ms but 16MB took " << ms_16mb
+      << "ms, which suggests the body is being buffered and rescanned";
+}
+
+TEST(MultipartFormDataTest, BoundaryNotFollowedByDelimiterFailsFast) {
+  // A boundary can only be followed by CRLF or by "--", so anything else is
+  // malformed no matter what comes next. The parser must say so right away
+  // instead of buffering the rest of the declared body.
+  Server svr;
+  svr.Post("/post", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  // Announce a 1 MB body but send only the malformed prefix. A parser that
+  // buffers instead of failing would still be waiting for the remaining bytes.
+  const std::string body = "--zzzz\r\n"
+                           "Content-Disposition: form-data; name=\"text1\"\r\n"
+                           "\r\n"
+                           "text1"
+                           "\r\n--zzzzXX";
+
+  const std::string req = "POST /post HTTP/1.1\r\n"
+                          "Content-Type: multipart/form-data; boundary=zzzz\r\n"
+                          "Content-Length: 1048576\r\n"
+                          "\r\n" +
+                          body;
+
+  std::string response;
+  ASSERT_TRUE(send_request(3, req, &response, port));
+  ASSERT_GE(response.size(), 12u) << "no response before the read timeout";
+  EXPECT_EQ("400", response.substr(9, 3));
+}
+
+// Posts a multipart body split into two writes, so that the server sees the
+// split at whatever offset the caller chose, and expects the single "text1"
+// field to come through.
+static void expect_split_multipart_ok(const std::string &body1,
+                                      const std::string &body2) {
+  auto handled = false;
+
+  Server svr;
+  svr.Post("/post", [&](const Request &req, Response &) {
+    EXPECT_EQ(1u, req.form.fields.size());
+    EXPECT_EQ("text1", req.form.get_field("text1"));
+    handled = true;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+    ASSERT_TRUE(handled);
+  });
+
+  svr.wait_until_ready();
+
+  // "Connection: close" makes the server close once it has answered, so the
+  // response drain ends immediately instead of idling until the read timeout.
+  const std::string head =
+      "POST /post HTTP/1.1\r\n"
+      "Host: localhost\r\n"
+      "Content-Type: multipart/form-data; boundary=zzzz\r\n"
+      "Connection: close\r\n"
+      "Content-Length: " +
+      std::to_string(body1.size() + body2.size()) + "\r\n\r\n";
+
+  std::string response;
+  ASSERT_TRUE(send_request_in_parts(3, {head + body1, body2}, &response, port));
+  ASSERT_GE(response.size(), 12u) << "no response";
+  EXPECT_EQ("200", response.substr(9, 3));
+}
+
+TEST(MultipartFormDataTest, EpilogueSplitAcrossReadsIsIgnored) {
+  // RFC 2046: everything after the close-delimiter is an epilogue and is to be
+  // ignored, including when it does not arrive in the same read as the
+  // close-delimiter itself.
+  expect_split_multipart_ok("--zzzz\r\n"
+                            "Content-Disposition: form-data; name=\"text1\"\r\n"
+                            "\r\n"
+                            "text1"
+                            "\r\n--zzzz--",
+                            "\r\nthis epilogue must be ignored\r\n");
+}
+
+TEST(MultipartFormDataTest, InitialBoundarySplitAfterLongPreamble) {
+  // The initial boundary may be preceded by a preamble of any length and may
+  // straddle a read boundary. Discarding data while waiting for it must not
+  // throw away a partial boundary sitting at the end of the buffer.
+  expect_split_multipart_ok(std::string(64u * 1024, 'p') + "--zz",
+                            "zz\r\n"
+                            "Content-Disposition: form-data; name=\"text1\"\r\n"
+                            "\r\n"
+                            "text1"
+                            "\r\n--zzzz--\r\n");
+}
+
+TEST(MultipartFormDataTest, BoundaryLengthLimitIsEnforced) {
+  // The received boundary was only checked for being non-empty, so it could be
+  // as long as a header is allowed to be. The parser scans the body for
+  // "--" + boundary, so a body crafted to repeat that delimiter's leading bytes
+  // costs a nearly full comparison at nearly every position, making the
+  // boundary's length a multiplier on the worst-case parsing cost. RFC 2046
+  // 5.1.1 caps a boundary at 70 characters; honoring that caps the multiplier.
+  Server svr;
+  svr.Post("/post", [](const Request &req, Response &res) {
+    EXPECT_EQ(1u, req.form.fields.size());
+    EXPECT_EQ("text1", req.form.get_field("text1"));
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+
+  auto post_with_boundary_of_length = [&](size_t len) {
+    const std::string boundary(len, 'a');
+    const std::string body =
+        "--" + boundary +
+        "\r\n"
+        "Content-Disposition: form-data; name=\"text1\"\r\n"
+        "\r\n"
+        "text1"
+        "\r\n--" +
+        boundary + "--\r\n";
+    return cli.Post("/post", body, "multipart/form-data; boundary=" + boundary);
+  };
+
+  auto res = post_with_boundary_of_length(70);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+
+  res = post_with_boundary_of_length(71);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::BadRequest_400, res->status);
 }
 
 TEST(MakeFileBodyTest, Basic) {
@@ -13564,8 +20219,68 @@ TEST(MakeFileBodyTest, Basic) {
   Client cli(HOST, port);
   auto res =
       cli.Post("/upload", fb.first, fb.second, "application/octet-stream");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+
+TEST(MakeFileBodyTest, TruncatedFileMakesTheProviderFail) {
+  const std::string path = "./httplib_test_make_file_body_truncated.bin";
+  {
+    std::ofstream ofs(path, std::ios::binary);
+    const std::string content(100, 'A');
+    ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
+  }
+  auto cleanup = detail::scope_exit([&] { std::remove(path.c_str()); });
+
+  auto body = make_file_body(path);
+  ASSERT_EQ(100u, body.first);
+  ASSERT_TRUE(static_cast<bool>(body.second));
+
+  // Rewritten shorter after its length was measured - and, on a server, after
+  // that length has already gone out as Content-Length.
+  {
+    std::ofstream ofs(path, std::ios::binary | std::ios::trunc);
+    const std::string content(10, 'A');
+    ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
+  }
+
+  std::string written;
+  DataSink sink;
+  sink.write = [&](const char *d, size_t l) {
+    written.append(d, l);
+    return true;
+  };
+
+  // The provider has to report failure. write_content_with_progress() advances
+  // its offset only by what was written, so a provider that returns true
+  // without completing the length it promised is called again straight away,
+  // and again.
+  EXPECT_FALSE(body.second(0, body.first, sink));
+  EXPECT_EQ(std::string(10, 'A'), written);
+}
+
+TEST(MakeFileBodyTest, WholeFileIsSent) {
+  const std::string path = "./httplib_test_make_file_body_whole.bin";
+  const std::string content(9000, 'Z'); // spans more than one 8 KiB read
+  {
+    std::ofstream ofs(path, std::ios::binary);
+    ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
+  }
+  auto cleanup = detail::scope_exit([&] { std::remove(path.c_str()); });
+
+  auto body = make_file_body(path);
+  ASSERT_EQ(content.size(), body.first);
+  ASSERT_TRUE(static_cast<bool>(body.second));
+
+  std::string written;
+  DataSink sink;
+  sink.write = [&](const char *d, size_t l) {
+    written.append(d, l);
+    return true;
+  };
+
+  EXPECT_TRUE(body.second(0, body.first, sink));
+  EXPECT_EQ(content, written);
 }
 
 TEST(TaskQueueTest, IncreaseAtomicInteger) {
@@ -13651,6 +20366,39 @@ TEST(TaskQueueTest, IdleTimeoutAtRuntime) {
   EXPECT_EQ(3u, count.load());
 }
 
+TEST(TaskQueueTest, BurstOfTasksGetsDynamicThreads) {
+  static constexpr size_t number_of_tasks{32};
+  std::unique_ptr<TaskQueue> task_queue{
+      new ThreadPool{/*num_threads=*/16, /*max_threads=*/64}};
+
+  // Let the base threads go idle so the burst below finds them waiting.
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  std::mutex mtx;
+  std::condition_variable cv;
+  size_t running = 0;
+  bool release = false;
+
+  for (size_t i = 0; i < number_of_tasks; i++) {
+    EXPECT_TRUE(task_queue->enqueue([&] {
+      std::unique_lock<std::mutex> lock(mtx);
+      running++;
+      cv.notify_all();
+      cv.wait(lock, [&] { return release; });
+    }));
+  }
+
+  {
+    std::unique_lock<std::mutex> lock(mtx);
+    EXPECT_TRUE(cv.wait_for(lock, std::chrono::seconds(5),
+                            [&] { return running == number_of_tasks; }));
+    release = true;
+  }
+  cv.notify_all();
+
+  task_queue->shutdown();
+}
+
 TEST(TaskQueueTest, MaxQueuedRequests) {
   static constexpr unsigned int qlimit{3};
   std::unique_ptr<TaskQueue> task_queue{new ThreadPool{1, 1, qlimit}};
@@ -13718,6 +20466,210 @@ TEST(TaskQueueTest, MaxQueuedRequests) {
 #endif
 }
 
+TEST(RedirectTest, SeeOtherDoesNotResendContentProviderBody) {
+  Server svr;
+  std::string method;
+  std::string body;
+  auto has_content_length = false;
+  auto has_transfer_encoding = false;
+  std::atomic<int> bad_requests{0};
+
+  // Leftover body bytes get parsed as a malformed request and answered with
+  // 400
+  svr.set_logger([&](const Request & /*req*/, const Response &res) {
+    if (res.status == StatusCode::BadRequest_400) { bad_requests++; }
+  });
+
+  svr.Post("/up", [](const Request & /*req*/, Response &res) {
+    res.set_redirect("/down", StatusCode::SeeOther_303);
+  });
+  svr.Get("/down", [&](const Request &req, Response &res) {
+    method = req.method;
+    body = req.body;
+    has_content_length = req.has_header("Content-Length");
+    has_transfer_encoding = req.has_header("Transfer-Encoding");
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  const std::string payload = "SECRET-BODY";
+
+  auto check = [&](Client &cli, const Result &res) {
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
+    EXPECT_EQ("ok", res->body);
+    EXPECT_EQ("GET", method);
+    EXPECT_TRUE(body.empty());
+    EXPECT_FALSE(has_content_length);
+    EXPECT_FALSE(has_transfer_encoding);
+
+    // Nothing of the original body may be left on the connection
+    auto res2 = cli.Get("/down");
+    ASSERT_TRUE(res2) << "Error: " << to_string(res2.error());
+    EXPECT_EQ(StatusCode::OK_200, res2->status);
+    EXPECT_EQ("ok", res2->body);
+    EXPECT_EQ(0, bad_requests);
+  };
+
+  // With content length
+  {
+    Client cli(HOST, port);
+    cli.set_keep_alive(true);
+    cli.set_follow_location(true);
+
+    auto res = cli.Post(
+        "/up", payload.size(),
+        [&](size_t offset, size_t length, DataSink &sink) {
+          return sink.write(payload.data() + offset, length);
+        },
+        "text/plain");
+    check(cli, res);
+  }
+
+  // Without content length (chunked)
+  {
+    Client cli(HOST, port);
+    cli.set_keep_alive(true);
+    cli.set_follow_location(true);
+
+    auto res = cli.Post(
+        "/up",
+        [&](size_t /*offset*/, DataSink &sink) {
+          sink.write(payload.data(), payload.size());
+          sink.done();
+          return true;
+        },
+        "text/plain");
+    check(cli, res);
+  }
+}
+
+TEST(RedirectTest, LocationPathIsNotDecoded) {
+  Server svr;
+  std::string target;
+
+  svr.Get(R"(/start/.*)", [](const Request &req, Response &res) {
+    // Echo the still-encoded name back in the Location
+    const std::string prefix = "/start/";
+    res.status = StatusCode::Found_302;
+    res.set_header("Location", "/dest/" + req.target.substr(prefix.size()));
+  });
+  svr.Get(R"(/dest.*)", [&](const Request &req, Response &res) {
+    target = req.target;
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  // Decoding the Location path would turn the first four into a path
+  // separator, a query delimiter, a fragment delimiter and a different
+  // percent-encoded octet. The rest must keep reaching the server as they are.
+  const std::vector<std::string> names = {
+      "a%2Fb", "x%3Fy", "x%23y", "a%2520b", "a%20b", "%C3%BC", "a-b_c.d~e",
+  };
+
+  for (auto path_encode : {true, false}) {
+    Client cli(HOST, port);
+    cli.set_follow_location(true);
+    cli.set_path_encode(path_encode);
+
+    for (const auto &name : names) {
+      target.clear();
+      auto res = cli.Get("/start/" + name);
+      ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+      EXPECT_EQ(StatusCode::OK_200, res->status);
+      EXPECT_EQ("/dest/" + name, target);
+    }
+  }
+}
+
+TEST(RedirectTest, NotModifiedIsReturned) {
+  Server svr;
+  svr.Get("/cached", [](const Request &, Response &res) {
+    res.status = StatusCode::NotModified_304;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_follow_location(true);
+
+  auto res = cli.Get("/cached", Headers{{"If-None-Match", "\"v1\""}});
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::NotModified_304, res->status);
+}
+
+TEST(RedirectTest, NoLocationIsReturned) {
+  Server svr;
+  svr.Get("/no-location", [](const Request &, Response &res) {
+    res.status = StatusCode::Found_302;
+    res.set_content("no location", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_follow_location(true);
+
+  auto res = cli.Get("/no-location");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::Found_302, res->status);
+  EXPECT_EQ("no location", res->body);
+
+  // The callbacks see the body of the response that is returned
+  auto handler_called = false;
+  auto progress_called = false;
+  std::string body;
+  auto res2 = cli.Get(
+      "/no-location",
+      [&](const Response &) {
+        handler_called = true;
+        return true;
+      },
+      [&](const char *data, size_t data_length) {
+        body.append(data, data_length);
+        return true;
+      },
+      [&](size_t, size_t) {
+        progress_called = true;
+        return true;
+      });
+  ASSERT_TRUE(res2) << "Error: " << to_string(res2.error());
+  EXPECT_EQ(StatusCode::Found_302, res2->status);
+  EXPECT_TRUE(handler_called);
+  EXPECT_TRUE(progress_called);
+  EXPECT_EQ("no location", body);
+}
+
 TEST(RedirectTest, RedirectToUrlWithQueryParameters) {
   Server svr;
 
@@ -13743,7 +20695,7 @@ TEST(RedirectTest, RedirectToUrlWithQueryParameters) {
     cli.set_follow_location(true);
 
     auto res = cli.Get("/");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ("val&key2=val2", res->body);
   }
@@ -13775,7 +20727,7 @@ TEST(RedirectTest, RedirectToUrlWithPlusInQueryParameters) {
     cli.set_follow_location(true);
 
     auto res = cli.Get("/");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ("AByz09 ~-._ &?ü+", res->body);
   }
@@ -13807,10 +20759,197 @@ TEST(RedirectTest, RedirectWithPlusInPath) {
     cli.set_follow_location(true);
 
     auto res = cli.Get("/");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ("/a+b", res->body);
   }
+}
+
+TEST(RedirectTest, ResolveRelativeLocation) {
+  // Examples from RFC 3986 section 5.4, base "http://a/b/c/d;p?q".
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {"g", "/b/c/g"},
+      {"./g", "/b/c/g"},
+      {"g/", "/b/c/g/"},
+      {"?y", "/b/c/d;p?y"},
+      {"g?y", "/b/c/g?y"},
+      {"#s", "/b/c/d;p?q#s"},
+      {"g#s", "/b/c/g#s"},
+      {"g?y#s", "/b/c/g?y#s"},
+      {";x", "/b/c/;x"},
+      {"g;x", "/b/c/g;x"},
+      {".", "/b/c/"},
+      {"./", "/b/c/"},
+      {"..", "/b/"},
+      {"../", "/b/"},
+      {"../g", "/b/g"},
+      {"../..", "/"},
+      {"../../", "/"},
+      {"../../g", "/g"},
+      {"../../../g", "/g"},
+      {"g.", "/b/c/g."},
+      {".g", "/b/c/.g"},
+      {"g..", "/b/c/g.."},
+      {"..g", "/b/c/..g"},
+      {"./../g", "/b/g"},
+      {"./g/.", "/b/c/g/"},
+      {"g/./h", "/b/c/g/h"},
+      {"g/../h", "/b/c/h"},
+      {"g;x=1/./y", "/b/c/g;x=1/y"},
+      {"g;x=1/../y", "/b/c/y"},
+      {"g?y/./x", "/b/c/g?y/./x"},
+      {"g#s/../x", "/b/c/g#s/../x"},
+      // Not relative-path references, so left for parse_url.
+      {"/g", "/g"},
+      {"//g", "//g"},
+      {"http://g/x", "http://g/x"},
+      {"g:h", "g:h"},
+  };
+  for (const auto &c : cases) {
+    EXPECT_EQ(c.second,
+              detail::resolve_relative_location(c.first, "/b/c/d;p?q"))
+        << c.first;
+  }
+
+  // A result starting with "//" is still a path, not a network-path reference
+  EXPECT_EQ("/.//g",
+            detail::resolve_relative_location("../../..//g", "/b/c/d;p?q"));
+  EXPECT_EQ("/.//g/x", detail::resolve_relative_location("x", "//g/h"));
+  EXPECT_EQ("/.//g/h?y", detail::resolve_relative_location("?y", "//g/h"));
+  EXPECT_EQ("/.//g/h#s", detail::resolve_relative_location("#s", "//g/h"));
+}
+
+TEST(RedirectTest, RemoveDotSegments) {
+  // RFC 3986 section 5.2.4
+  EXPECT_EQ("/a/g", detail::remove_dot_segments("/a/b/c/./../../g"));
+  EXPECT_EQ("/mid/6", detail::remove_dot_segments("/mid/content=5/../6"));
+  EXPECT_EQ("/g", detail::remove_dot_segments("/./g"));
+  EXPECT_EQ("/g", detail::remove_dot_segments("/../g"));
+  EXPECT_EQ("/", detail::remove_dot_segments("/.."));
+  EXPECT_EQ("/a/", detail::remove_dot_segments("/a/b/.."));
+  EXPECT_EQ("/a/b", detail::remove_dot_segments("/a/b"));
+}
+
+TEST(RedirectTest, AbsoluteLocationIsNormalized) {
+  Server svr;
+
+  svr.Get("/absolute-path", [](const Request & /*req*/, Response &res) {
+    res.set_redirect("/dir/../target?x=1");
+  });
+  svr.Get("/absolute-uri", [](const Request & /*req*/, Response &res) {
+    res.set_redirect("http://localhost:" + std::to_string(PORT) +
+                     "/dir/./../target");
+  });
+  svr.Get("/target", [](const Request &req, Response &res) {
+    res.set_content(req.path, "text/plain");
+  });
+
+  auto th = std::thread([&]() { svr.listen("localhost", PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    th.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli("localhost", PORT);
+  cli.set_follow_location(true);
+
+  for (auto path : {"/absolute-path", "/absolute-uri"}) {
+    auto res = cli.Get(path);
+    ASSERT_TRUE(res) << path << ": " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status) << path;
+    EXPECT_EQ("/target", res->body) << path;
+  }
+}
+
+TEST(RedirectTest, RelativeLocationWithoutLeadingSlash) {
+  Server svr;
+
+  svr.Get("/dir/page", [](const Request &req, Response &res) {
+    res.set_redirect(req.get_param_value("to"));
+  });
+
+  svr.Get("/dir/next", [](const Request &req, Response &res) {
+    res.set_content(req.target, "text/plain");
+  });
+
+  svr.Get("/other", [](const Request &req, Response &res) {
+    res.set_content(req.target, "text/plain");
+  });
+
+  auto thread = std::thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {"next", "/dir/next"},
+      {"./next?x=1", "/dir/next?x=1"},
+      {"../other", "/other"},
+  };
+  for (const auto &c : cases) {
+    Client cli(HOST, PORT);
+    cli.set_follow_location(true);
+
+    auto res = cli.Get("/dir/page?to=" + encode_query_component(c.first));
+    ASSERT_TRUE(res) << c.first << ": " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status) << c.first;
+    EXPECT_EQ(c.second, res->body) << c.first;
+  }
+}
+
+// "..//host:port/x" resolves to the path "//host:port/x" on the same host
+// (RFC 3986 5.2), as curl and the URL Standard have it, not to another host.
+TEST(RedirectTest, RelativeLocationStaysOnHost) {
+  Server other;
+  std::atomic<int> other_hits{0};
+  other.Get(".*", [&](const Request & /*req*/, Response &res) {
+    other_hits++;
+    res.set_content("other", "text/plain");
+  });
+  auto other_port = other.bind_to_any_port("127.0.0.1");
+  auto other_thread = std::thread([&]() { other.listen_after_bind(); });
+
+  Server svr;
+  svr.Get("/dir/page", [](const Request &req, Response &res) {
+    res.set_redirect(req.get_param_value("to"));
+  });
+  svr.Get(".*", [](const Request &req, Response &res) {
+    res.set_content(req.path, "text/plain");
+  });
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    other.stop();
+    other_thread.join();
+    ASSERT_FALSE(svr.is_running());
+    ASSERT_FALSE(other.is_running());
+  });
+
+  svr.wait_until_ready();
+  other.wait_until_ready();
+
+  auto authority = "127.0.0.1:" + std::to_string(other_port);
+  for (const auto &to :
+       {"..//" + authority + "/x", "../..//" + authority + "/x"}) {
+    Client cli(HOST, port);
+    cli.set_follow_location(true);
+
+    auto res = cli.Get("/dir/page?to=" + encode_query_component(to));
+    ASSERT_TRUE(res) << to << ": " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status) << to;
+    EXPECT_EQ("//" + authority + "/x", res->body) << to;
+  }
+  EXPECT_EQ(0, other_hits.load());
 }
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
@@ -13821,7 +20960,7 @@ TEST(RedirectTest, Issue2185_Online) {
   auto res = client.Get("/Coollab-Art/Coollab/releases/download/1.1.1_UI-Scale/"
                         "Coollab-Windows.zip");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(9920427U, res->body.size());
 }
@@ -13942,6 +21081,96 @@ TEST(VulnerabilityTest, CRLFInjectionInHeaders) {
   EXPECT_EQ(Error::InvalidHeaders, res.error());
 
   server_thread.join();
+}
+
+// A request rejected before any byte reaches the socket must fail right away
+// instead of waiting for a response the server will never send.
+TEST(ClientRejectedRequestTest, DoesNotWaitForResponse) {
+  // The kernel completes the TCP handshake from the listen backlog, so the
+  // client connects, but nothing ever reads, responds or closes.
+  auto srv = ::socket(AF_INET, SOCK_STREAM, 0);
+  default_socket_options(srv);
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(PORT + 1));
+  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  ASSERT_EQ(0, ::bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
+  ASSERT_EQ(0, ::listen(srv, 8));
+
+  auto cli = Client("127.0.0.1", PORT + 1);
+  cli.set_read_timeout(10, 0);
+
+  auto elapsed_ms = [](std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - start)
+        .count();
+  };
+
+  {
+    Request req;
+    req.method = "GE T";
+    req.path = "/";
+    auto start = std::chrono::steady_clock::now();
+    auto res = cli.send(req);
+    EXPECT_FALSE(res);
+    EXPECT_EQ(Error::Write, res.error());
+    EXPECT_LT(elapsed_ms(start), 1000);
+  }
+
+  {
+    auto start = std::chrono::steady_clock::now();
+    auto res = cli.Get("/", Headers{{"A", "B\r\nEvil: 1"}});
+    EXPECT_FALSE(res);
+    EXPECT_EQ(Error::InvalidHeaders, res.error());
+    EXPECT_LT(elapsed_ms(start), 1000);
+  }
+
+  EXPECT_FALSE(cli.is_socket_open());
+
+  detail::close_socket(srv);
+}
+
+TEST(ClientRejectedRequestTest, OpenStreamSendsNothingOnInvalidHeader) {
+  auto srv = ::socket(AF_INET, SOCK_STREAM, 0);
+  default_socket_options(srv);
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(PORT + 1));
+  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  ASSERT_EQ(0, ::bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
+  ASSERT_EQ(0, ::listen(srv, 1));
+
+  std::string received;
+  auto server_thread = std::thread([&] {
+    auto sock = ::accept(srv, nullptr, nullptr);
+    if (sock == INVALID_SOCKET) { return; }
+    detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, 2, 0);
+
+    char buf[2048];
+    ssize_t n;
+    while ((n = ::recv(sock, buf, sizeof(buf), 0)) > 0) {
+      received.append(buf, static_cast<size_t>(n));
+    }
+    detail::close_socket(sock);
+  });
+
+  {
+    auto cli = Client("127.0.0.1", PORT + 1);
+
+    // "Z" sorts after the default headers, so writing straight to the socket
+    // would have sent the request line and those headers before the rejection.
+    auto handle =
+        cli.open_stream("GET", "/", Params{}, Headers{{"Z", "B\r\nEvil: 1"}});
+    EXPECT_FALSE(handle.is_valid());
+    EXPECT_EQ(Error::InvalidHeaders, handle.error);
+  }
+
+  server_thread.join();
+  detail::close_socket(srv);
+
+  EXPECT_TRUE(received.empty()) << received;
 }
 
 TEST(PathParamsTest, StaticMatch) {
@@ -14093,6 +21322,128 @@ TEST(PathParamsTest, SemicolonInTheMiddleIsNotAParam) {
   EXPECT_EQ(request.path_params, expected_params);
 }
 
+TEST(RegexMatcherTest, OverlongPathIsRejectedBeforeRegexMatch) {
+  // std::regex_match's backtracking (most acute on libstdc++) can exhaust the
+  // calling thread's stack on a long enough path for a quantified pattern;
+  // RegexMatcher must refuse to run regex matching on paths beyond
+  // CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH instead of invoking it.
+  detail::RegexMatcher matcher("/files/(.*)");
+
+  Request within_limit;
+  within_limit.path = "/files/" + std::string(10, 'A');
+  EXPECT_TRUE(matcher.match(within_limit));
+
+  Request over_limit;
+  over_limit.path =
+      "/files/" + std::string(CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH, 'A');
+  EXPECT_FALSE(matcher.match(over_limit));
+}
+
+TEST(RegexMatcherTest, ServerSurvivesOverlongPathOnRegexRoute) {
+  Server svr;
+  svr.Get(R"(/files/(.*))", [](const Request & /*req*/, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto thread = std::thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  // Comfortably past CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH, well within the
+  // request URI limit; this used to be able to crash the process.
+  std::string path =
+      "/files/" + std::string(CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH * 4, 'A');
+  std::string req = "GET " + path +
+                    " HTTP/1.1\r\n"
+                    "Host: " +
+                    std::string(HOST) + ":" + std::to_string(port) +
+                    "\r\n"
+                    "Connection: close\r\n"
+                    "\r\n";
+
+  std::string response;
+  ASSERT_TRUE(send_request(5, req, &response, port));
+  EXPECT_NE(std::string::npos, response.find("404"));
+}
+
+TEST(RouteMatcherTest, LiteralPatternsAndRegexPatterns) {
+  Server svr;
+
+  auto handler = [](const Request & /*req*/, Response &res) {
+    res.set_content("hit", "text/plain");
+  };
+
+  // No regex metacharacter, so this one is compared literally
+  svr.Get("/literal/route", handler);
+  // '.' is a regex metacharacter, so this one must keep regex semantics
+  svr.Get("/a.c", handler);
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+
+  struct {
+    const char *path;
+    int status;
+  } cases[] = {
+      {"/literal/route", StatusCode::OK_200},
+      {"/literal/routes", StatusCode::NotFound_404},
+      {"/literal/rout", StatusCode::NotFound_404},
+      {"/abc", StatusCode::OK_200},
+      {"/a.c", StatusCode::OK_200},
+  };
+
+  for (const auto &x : cases) {
+    auto res = cli.Get(x.path);
+    ASSERT_TRUE(res) << x.path;
+    EXPECT_EQ(x.status, res->status) << x.path;
+  }
+}
+
+TEST(RouteMatcherTest, LongLiteralPatternIsNotSubjectToTheRegexPathLimit) {
+  // CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH exists to keep std::regex_match
+  // from exhausting the stack, so it must only constrain routes that actually
+  // run a regular expression. A literal route is matched by comparison and
+  // stays usable at any length.
+  Server svr;
+
+  const std::string pattern =
+      "/files/" + std::string(CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH * 2, 'a');
+
+  svr.Get(pattern, [](const Request & /*req*/, Response &res) {
+    res.set_content("hit", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+
+  auto res = cli.Get(pattern);
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+}
+
 TEST(ParseUrlTest, VariousPatterns) {
   {
     detail::UrlComponents uc;
@@ -14121,6 +21472,23 @@ TEST(ParseUrlTest, VariousPatterns) {
   {
     detail::UrlComponents uc;
     ASSERT_FALSE(detail::parse_url("http://[::1/path", uc));
+  }
+  {
+    // Bytes after the IPv6 literal must be a delimiter, not folded into
+    // the path while the connection still targets the bracketed host.
+    detail::UrlComponents uc;
+    ASSERT_FALSE(detail::parse_url("http://[::1]evil.com/", uc));
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_FALSE(detail::parse_url("http://[::1]evil", uc));
+  }
+  {
+    detail::UrlComponents uc;
+    ASSERT_TRUE(detail::parse_url("http://[::1]/path", uc));
+    EXPECT_EQ("::1", uc.host);
+    EXPECT_TRUE(uc.port.empty());
+    EXPECT_EQ("/path", uc.path);
   }
   {
     detail::UrlComponents uc;
@@ -14195,11 +21563,14 @@ TEST(ParseUrlTest, FragmentHandling) {
 }
 
 TEST(ParseUrlTest, UserinfoHandling) {
-  // Userinfo with @ but no colon — host includes @
-  detail::UrlComponents uc;
-  ASSERT_TRUE(detail::parse_url("http://user@host.com/path", uc));
-  EXPECT_EQ("user@host.com", uc.host);
-  EXPECT_EQ("/path", uc.path);
+  // userinfo, and a backslash some parsers take for '/', are rejected: such
+  // parsers would see evil.com as the host.
+  const char *urls[] = {"http://user@evil.com/", "http://user:pass@evil.com/",
+                        "http://evil.com\\@good.com/", "//user@evil.com/x"};
+  for (auto url : urls) {
+    detail::UrlComponents uc;
+    EXPECT_FALSE(detail::parse_url(url, uc)) << url;
+  }
 }
 
 TEST(ParseUrlTest, IPv6EdgeCases) {
@@ -14408,6 +21779,36 @@ TEST(MakeHostAndPortStringTest, VariousPatterns) {
             detail::make_host_and_port_string("example.com", 65536, false));
 }
 
+namespace httplib {
+namespace detail {
+std::string
+make_connect_request_target(const std::map<std::string, std::string> &addr_map,
+                            const std::string &host, int port);
+} // namespace detail
+} // namespace httplib
+
+TEST(MakeConnectRequestTargetTest, FollowsHostnameAddrMap) {
+  std::map<std::string, std::string> addr_map = {
+      {"ipv4.example", "192.0.2.10"},
+      {"ipv6.example", "2001:db8::1"},
+      {"name.example", "internal.example.lan"},
+      {"empty.example", ""}};
+
+  EXPECT_EQ("192.0.2.10:443",
+            detail::make_connect_request_target(addr_map, "ipv4.example", 443));
+  EXPECT_EQ("[2001:db8::1]:443",
+            detail::make_connect_request_target(addr_map, "ipv6.example", 443));
+  EXPECT_EQ("internal.example.lan:8443", detail::make_connect_request_target(
+                                             addr_map, "name.example", 8443));
+
+  // An empty or absent mapping keeps the hostname as the target
+  EXPECT_EQ("empty.example:443", detail::make_connect_request_target(
+                                     addr_map, "empty.example", 443));
+  EXPECT_EQ("other.example:443", detail::make_connect_request_target(
+                                     addr_map, "other.example", 443));
+  EXPECT_EQ("[::1]:443", detail::make_connect_request_target({}, "::1", 443));
+}
+
 #ifdef CPPHTTPLIB_SSL_ENABLED
 TEST(SSLClientHostHeaderTest, Issue2301_Online) {
   httplib::SSLClient cli("roblox.com", 443);
@@ -14415,7 +21816,7 @@ TEST(SSLClientHostHeaderTest, Issue2301_Online) {
 
   auto res = cli.Get("/");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 }
 #endif
@@ -14509,7 +21910,7 @@ TEST(InvalidHeaderCharsTest, OnServer) {
     auto res = cli.Get(
         R"(/test_name?header=Value%00%0d%0aHEADER_KEY%3aHEADER_VALUE%0d%0a%0d%0aBODY_BODY_BODY)");
 
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ("Page Content Page Content", res->body);
     EXPECT_FALSE(res->has_header("HEADER_KEY"));
   }
@@ -14517,7 +21918,7 @@ TEST(InvalidHeaderCharsTest, OnServer) {
     auto res = cli.Get(
         R"(/test_value?header=Value%00%0d%0aHEADER_KEY%3aHEADER_VALUE%0d%0a%0d%0aBODY_BODY_BODY)");
 
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ("Page Content Page Content", res->body);
     EXPECT_FALSE(res->has_header("HEADER_KEY"));
   }
@@ -14549,11 +21950,236 @@ TEST(InvalidHeaderValueTest, InvalidContentLength) {
             response.substr(0, response.find("\r\n")));
 }
 
+// RFC 9110 Section 10.1.1: Expect is a comma-separated list, its value is
+// case-insensitive, and a server that receives a 100-continue expectation in
+// an HTTP/1.0 request MUST ignore it.
+static void probe_expect(int port, const std::string &req, bool *got_100) {
+  std::string response;
+  ASSERT_TRUE(send_request(1, req, &response, port));
+  *got_100 = response.find("100 Continue") != std::string::npos;
+}
+
+class ExpectTokenTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    svr_.Post("/p", [](const Request &, Response &res) {
+      res.set_content("ok", "text/plain");
+    });
+    port_ = svr_.bind_to_any_port(HOST);
+    thread_ = thread([&]() { svr_.listen_after_bind(); });
+    svr_.wait_until_ready();
+  }
+
+  void TearDown() override {
+    svr_.stop();
+    if (thread_.joinable()) { thread_.join(); }
+  }
+
+  std::string request(const char *version, const char *expect_value) const {
+    return std::string("POST /p ") + version +
+           "\r\n"
+           "Host: localhost\r\n"
+           "Content-Length: 2\r\n"
+           "Connection: close\r\n"
+           "Expect: " +
+           expect_value +
+           "\r\n"
+           "\r\n"
+           "hi";
+  }
+
+  Server svr_;
+  int port_ = 0;
+  thread thread_;
+};
+
+TEST_F(ExpectTokenTest, Http11GetsTheInterimResponse) {
+  bool got_100 = false;
+  probe_expect(port_, request("HTTP/1.1", "100-continue"), &got_100);
+  EXPECT_TRUE(got_100);
+}
+
+TEST_F(ExpectTokenTest, Http10ExpectationIsIgnored) {
+  bool got_100 = true;
+  probe_expect(port_, request("HTTP/1.0", "100-continue"), &got_100);
+  EXPECT_FALSE(got_100);
+}
+
+TEST_F(ExpectTokenTest, ExpectationIsCaseInsensitive) {
+  bool got_100 = false;
+  probe_expect(port_, request("HTTP/1.1", "100-Continue"), &got_100);
+  EXPECT_TRUE(got_100);
+}
+
+TEST_F(ExpectTokenTest, ExpectationAmongOthersIsRecognized) {
+  bool got_100 = false;
+  probe_expect(port_, request("HTTP/1.1", "100-continue, foo"), &got_100);
+  EXPECT_TRUE(got_100);
+}
+
+// `100 Continue` is sent only when the server starts reading the body, so a
+// request rejected before that never invites the client to send it. The
+// requests below carry the expectation but withhold the body, as a client
+// waiting for `100 Continue` would.
+// A POST that expects `100 Continue` and withholds its two-byte body.
+static std::string expect_headers_only(const std::string &path) {
+  return "POST " + path +
+         " HTTP/1.1\r\n"
+         "Host: localhost\r\n"
+         "Content-Length: 2\r\n"
+         "Expect: 100-continue\r\n"
+         "\r\n";
+}
+
+class ExpectLazyContinueTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    svr_.set_pre_routing_handler([](const Request &req, Response &res) {
+      if (req.path == "/pre-routing") {
+        res.status = StatusCode::Unauthorized_401;
+        return Server::HandlerResponse::Handled;
+      }
+      return Server::HandlerResponse::Unhandled;
+    });
+    svr_.set_pre_request_handler([](const Request &req, Response &res) {
+      if (req.matched_route == "/pre-request") {
+        res.status = StatusCode::Forbidden_403;
+        return Server::HandlerResponse::Handled;
+      }
+      return Server::HandlerResponse::Unhandled;
+    });
+    svr_.Post("/pre-routing", [](const Request &, Response &res) {
+      res.set_content("ok", "text/plain");
+    });
+    svr_.Post("/pre-request", [](const Request &, Response &res) {
+      res.set_content("ok", "text/plain");
+    });
+    svr_.Post("/reader-used", [](const Request &, Response &res,
+                                 const ContentReader &content_reader) {
+      std::string body;
+      content_reader([&](const char *data, size_t len) {
+        body.append(data, len);
+        return true;
+      });
+      res.set_content(body, "text/plain");
+    });
+    svr_.Post("/reader-unused",
+              [](const Request &, Response &res, const ContentReader &) {
+                res.set_content("ignored", "text/plain");
+              });
+    port_ = svr_.bind_to_any_port(HOST);
+    thread_ = thread([&]() { svr_.listen_after_bind(); });
+    svr_.wait_until_ready();
+  }
+
+  void TearDown() override {
+    svr_.stop();
+    if (thread_.joinable()) { thread_.join(); }
+  }
+
+  // Sends `req` and reads until the server closes the connection. Returns
+  // false if the read had to wait for the client-side timeout instead.
+  bool send_until_closed(const std::string &req, std::string *resp) const {
+    auto start = std::chrono::steady_clock::now();
+    if (!send_request(3, req, resp, port_)) { return false; }
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    return elapsed < std::chrono::seconds(2);
+  }
+
+  // The final response comes without `100 Continue`, and the server closes
+  // the connection since the body may or may not follow.
+  void expect_final_without_interim(const std::string &path,
+                                    const char *status_line) const {
+    std::string resp;
+    ASSERT_TRUE(send_until_closed(expect_headers_only(path), &resp));
+    EXPECT_EQ(std::string::npos, resp.find("100 Continue"));
+    EXPECT_EQ(0u, resp.find(status_line));
+    EXPECT_NE(std::string::npos, resp.find("Connection: close"));
+  }
+
+  Server svr_;
+  int port_ = 0;
+  thread thread_;
+};
+
+TEST_F(ExpectLazyContinueTest, PreRoutingRejectsWithoutInterimResponse) {
+  expect_final_without_interim("/pre-routing", "HTTP/1.1 401");
+}
+
+TEST_F(ExpectLazyContinueTest, PreRequestRejectsWithoutInterimResponse) {
+  expect_final_without_interim("/pre-request", "HTTP/1.1 403");
+}
+
+TEST_F(ExpectLazyContinueTest, UnknownRouteRejectsWithoutInterimResponse) {
+  expect_final_without_interim("/nowhere", "HTTP/1.1 404");
+}
+
+TEST_F(ExpectLazyContinueTest, UnreadContentReaderClosesWithoutInterim) {
+  expect_final_without_interim("/reader-unused", "HTTP/1.1 200");
+}
+
+TEST_F(ExpectLazyContinueTest, ContentReaderGetsInterimResponse) {
+  // The body follows once `100 Continue` has had time to arrive.
+  auto req = expect_headers_only("/reader-used");
+  req.insert(req.size() - 2, "Connection: close\r\n");
+  std::string resp;
+  ASSERT_TRUE(send_request_in_parts(3, {req, "hi"}, &resp, port_));
+  EXPECT_EQ(0u, resp.find("HTTP/1.1 100 Continue"));
+  EXPECT_NE(std::string::npos, resp.find("HTTP/1.1 200"));
+  EXPECT_NE(std::string::npos, resp.find("hi"));
+}
+
+TEST_F(ExpectLazyContinueTest, ClientWithholdsBodyWhenRejected) {
+  // Large enough for the client to add `Expect: 100-continue` itself.
+  const size_t length = CPPHTTPLIB_EXPECT_100_THRESHOLD * 4;
+  std::atomic<bool> body_sent{false};
+
+  Client cli(HOST, port_);
+  auto res = cli.Post(
+      "/pre-request", length,
+      [&](size_t /*offset*/, size_t len, DataSink &sink) {
+        body_sent = true;
+        std::string chunk(len, 'x');
+        sink.write(chunk.data(), chunk.size());
+        return true;
+      },
+      "application/octet-stream");
+
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::Forbidden_403, res->status);
+  EXPECT_FALSE(body_sent);
+}
+
+TEST(Expect100ContinueHandlerTest, ExpectationFailedIsFinalResponse) {
+  Server svr;
+  svr.set_expect_100_continue_handler([](const Request &, Response &) {
+    return StatusCode::ExpectationFailed_417;
+  });
+  svr.Post("/p", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  std::string resp;
+  ASSERT_TRUE(send_request(3, expect_headers_only("/p"), &resp, port));
+  EXPECT_EQ(0u, resp.find("HTTP/1.1 417"));
+  EXPECT_NE(std::string::npos, resp.find("Connection: close"));
+  // Exactly one response: the route handler must not run after the 417.
+  EXPECT_EQ(std::string::npos, resp.find("HTTP/1.1", 1));
+}
+
 #ifndef _WIN32
 TEST(Expect100ContinueTest, ServerClosesConnection) {
   static constexpr char reject[] = "Unauthorized";
   static constexpr char accept[] = "Upload accepted";
-  constexpr size_t total_size = 10 * 1024 * 1024 * 1024ULL;
+  constexpr uint64_t total_size = 10 * 1024 * 1024 * 1024ULL;
 
   Server svr;
 
@@ -14591,8 +22217,8 @@ TEST(Expect100ContinueTest, ServerClosesConnection) {
     curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, list.get());
 
     struct read_data {
-      size_t read_size;
-      size_t total_size;
+      uint64_t read_size;
+      uint64_t total_size;
     } data = {0, total_size};
     using read_callback_t =
         size_t (*)(char *ptr, size_t size, size_t nmemb, void *userdata);
@@ -14606,7 +22232,7 @@ TEST(Expect100ContinueTest, ServerClosesConnection) {
       d->read_size += size * nmemb;
       return size * nmemb;
     };
-    curl_easy_setopt(curl.get(), CURLOPT_READDATA, data);
+    curl_easy_setopt(curl.get(), CURLOPT_READDATA, &data);
     curl_easy_setopt(curl.get(), CURLOPT_READFUNCTION, read_callback);
 
     std::vector<char> buffer;
@@ -15041,6 +22667,7 @@ TEST(RequestSmugglingTest, DuplicateContentLengthSameValues) {
 
   // Two Content-Length headers with same value — should be accepted (RFC 9110)
   auto req = "POST /test HTTP/1.1\r\n"
+             "Host: localhost\r\n"
              "Content-Length: 5\r\n"
              "Content-Length: 5\r\n"
              "\r\n"
@@ -15049,6 +22676,58 @@ TEST(RequestSmugglingTest, DuplicateContentLengthSameValues) {
   std::string response;
   ASSERT_TRUE(send_request(1, req, &response));
   ASSERT_EQ("HTTP/1.1 200 OK", response.substr(0, response.find("\r\n")));
+}
+
+TEST(HostHeaderValidationTest, AmbiguousOrInvalidHostRejected) {
+  Server svr;
+  svr.Get("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  auto status_line = [&](const std::string &host_lines) {
+    std::string res;
+    send_request(
+        5, "GET /test HTTP/1.1\r\n" + host_lines + "Connection: close\r\n\r\n",
+        &res, port);
+    return res.substr(0, res.find("\r\n"));
+  };
+
+  const char *accepted[] = {
+      "Host: localhost\r\n",
+      "Host: a.example:8080\r\n",
+      "Host: my_service\r\n",
+      "Host: [::1]:8080\r\n",
+      "Host: [fe80::1%25eth0]\r\n",
+      "Host: \r\n", // RFC 9112 §3.2: the target URI has no authority
+  };
+  for (auto host_lines : accepted) {
+    EXPECT_EQ("HTTP/1.1 200 OK", status_line(host_lines)) << host_lines;
+  }
+
+  const char *rejected[] = {
+      "Host: a.example\r\nHost: b.example\r\n",
+      "Host: a.example\r\nHost: a.example\r\n",
+      "Host: a@b.example\r\n",
+      "Host: a.example/b\r\n",
+      "Host: a.example\\b\r\n",
+      "Host: a.example?b\r\n",
+      "Host: a.example#b\r\n",
+      "Host: a.example b.example\r\n",
+  };
+  for (auto host_lines : rejected) {
+    EXPECT_EQ("HTTP/1.1 400 Bad Request", status_line(host_lines))
+        << host_lines;
+  }
 }
 
 TEST(HeaderSmugglingTest, ChunkedTrailerHeadersMerged) {
@@ -15102,6 +22781,204 @@ TEST(HeaderSmugglingTest, ChunkedTrailerHeadersMerged) {
   ASSERT_TRUE(send_request(1, req, &res));
 }
 
+// RFC 9110 Section 5.2 and 5.3: a comma-separated list field may be sent as
+// several field lines, and the combined value is what has to be parsed. A
+// Trailer field split across lines therefore declares every name it lists;
+// reading only the first line silently drops the trailers the later lines
+// declare. The prohibited-trailer filter still applies to every line.
+TEST(HeaderSmugglingTest, DuplicateTrailerFieldLinesDeclareAllTrailers) {
+  Server svr;
+
+  size_t observed_trailer_count = 0;
+  std::string observed_hello;
+  std::string observed_world;
+  bool observed_content_length = true;
+
+  svr.Get("/", [&](const Request &req, Response &res) {
+    observed_trailer_count = req.trailers.size();
+    observed_hello = req.get_trailer_value("X-Hello");
+    observed_world = req.get_trailer_value("X-World");
+    observed_content_length = req.has_trailer("Content-Length");
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  const std::string req = "GET / HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Transfer-Encoding: chunked\r\n"
+                          "Trailer: X-Hello\r\n"
+                          "Trailer: X-World, Content-Length\r\n"
+                          "\r\n"
+                          "0\r\n"
+                          "X-Hello: hello\r\n"
+                          "X-World: world\r\n"
+                          "Content-Length: 10\r\n"
+                          "\r\n";
+
+  std::string res;
+  ASSERT_TRUE(send_request(1, req, &res, port));
+  EXPECT_EQ("HTTP/1.1 200 OK", res.substr(0, 15));
+
+  // Accepted: both field lines contribute to the declared set
+  EXPECT_EQ(2U, observed_trailer_count);
+  EXPECT_EQ(observed_hello, "hello");
+  EXPECT_EQ(observed_world, "world");
+
+  // Denied: a prohibited name stays prohibited on a later field line
+  EXPECT_FALSE(observed_content_length);
+}
+
+// Undeclared trailer fields must count toward the trailer limit too. Otherwise
+// a peer can keep the trailer-parsing loop running indefinitely by sending an
+// unbounded run of fields that are never declared, because the counter would
+// only advance for declared fields.
+TEST(HeaderSmugglingTest, UndeclaredTrailerFieldsCountTowardLimit) {
+  Server svr;
+
+  bool handler_called = false;
+
+  svr.Get("/", [&](const Request & /*req*/, Response &res) {
+    handler_called = true;
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  // Declare nothing, then send far more undeclared trailer fields than the
+  // header-count limit. Parsing must stop and reject the request rather than
+  // read every line.
+  std::string req = "GET / HTTP/1.1\r\n"
+                    "Transfer-Encoding: chunked\r\n"
+                    "\r\n"
+                    "0\r\n";
+  for (int i = 0; i < CPPHTTPLIB_HEADER_MAX_COUNT + 10; i++) {
+    req += "X-Undeclared-" + std::to_string(i) + ": v\r\n";
+  }
+  req += "\r\n";
+
+  std::string res;
+  ASSERT_TRUE(send_request(1, req, &res, port));
+
+  // The request is rejected before the handler runs.
+  EXPECT_FALSE(handler_called);
+  EXPECT_EQ("HTTP/1.1 400 Bad Request", res.substr(0, res.find("\r\n")));
+}
+
+// The set of declared trailer names is capped so a peer cannot grow it without
+// bound (an unkeyed hash set would otherwise be a hash-flooding target). A name
+// declared past the cap is not honored, even if the field is actually sent.
+TEST(HeaderSmugglingTest, DeclaredTrailerNamesAreCappedAtHeaderMaxCount) {
+  Server svr;
+
+  // One name inside the cap and one past it, so the test tracks the cap rather
+  // than a fixed count.
+  constexpr int declared_count = CPPHTTPLIB_HEADER_MAX_COUNT + 50;
+  const std::string within_cap_name = "X-T-0";
+  const std::string past_cap_name = "X-T-" + std::to_string(declared_count - 1);
+
+  bool observed_within_cap = false;
+  bool observed_past_cap = false;
+
+  svr.Get("/", [&](const Request &req, Response &res) {
+    observed_within_cap = req.has_trailer(within_cap_name);
+    observed_past_cap = req.has_trailer(past_cap_name);
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  // Declare more trailer names than the cap in a single Trailer field, then
+  // actually send the first (within the cap) and the last (past it).
+  std::string trailer_decl = "Trailer: ";
+  for (int i = 0; i < declared_count; i++) {
+    if (i != 0) { trailer_decl += ", "; }
+    trailer_decl += "X-T-" + std::to_string(i);
+  }
+  trailer_decl += "\r\n";
+
+  const std::string req = "GET / HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Transfer-Encoding: chunked\r\n" +
+                          trailer_decl +
+                          "\r\n"
+                          "0\r\n" +
+                          within_cap_name + ": a\r\n" + past_cap_name +
+                          ": b\r\n"
+                          "\r\n";
+
+  std::string res;
+  ASSERT_TRUE(send_request(1, req, &res, port));
+  EXPECT_EQ("HTTP/1.1 200 OK", res.substr(0, res.find("\r\n")));
+
+  // A name within the cap is honored; one declared past the cap is dropped.
+  EXPECT_TRUE(observed_within_cap);
+  EXPECT_FALSE(observed_past_cap);
+}
+
+// A direct client that is not listed in trusted_proxies must not be able to
+// spoof req.remote_addr by sending an arbitrary X-Forwarded-For header. Only
+// the peer address on the actual TCP connection determines whether the
+// header is honored.
+TEST(ForwardedHeadersTest, UntrustedDirectClientCannotSpoofXFF) {
+  Server svr;
+
+  // Deliberately does NOT include the loopback address the test client
+  // actually connects from, so the direct connection is not a trusted proxy.
+  svr.set_trusted_proxies({"203.0.113.66"});
+
+  std::string observed_remote_addr;
+
+  svr.Get("/ip", [&](const Request &req, Response &res) {
+    observed_remote_addr = req.remote_addr;
+    res.set_content("ok", "text/plain");
+  });
+
+  thread t = thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, PORT);
+  auto res = cli.Get("/ip", Headers{{"X-Forwarded-For", "9.9.9.9"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+
+  // The connecting peer is not a trusted proxy, so the spoofed header must be
+  // ignored entirely and the real connection-level address retained.
+  EXPECT_TRUE(observed_remote_addr == "::1" ||
+              observed_remote_addr == "127.0.0.1");
+}
+
 TEST(ForwardedHeadersTest, NoProxiesSetting) {
   Server svr;
 
@@ -15126,7 +23003,7 @@ TEST(ForwardedHeadersTest, NoProxiesSetting) {
   Client cli(HOST, PORT);
   auto res = cli.Get("/ip", Headers{{"X-Forwarded-For", "203.0.113.66"}});
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 
   EXPECT_EQ(observed_xff, "203.0.113.66");
@@ -15160,7 +23037,7 @@ TEST(ForwardedHeadersTest, NoForwardedHeaders) {
   Client cli(HOST, PORT);
   auto res = cli.Get("/ip");
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 
   EXPECT_EQ(observed_xff, "");
@@ -15168,10 +23045,61 @@ TEST(ForwardedHeadersTest, NoForwardedHeaders) {
               observed_remote_addr == "127.0.0.1");
 }
 
+// A server listening on both IPv4 and IPv6 sees an IPv4 peer as an
+// IPv4-mapped IPv6 address, which still matches the proxy's IPv4 address
+TEST(ForwardedHeadersTest, IPv4MappedPeerMatchesIPv4Proxy) {
+  Server svr;
+  svr.set_trusted_proxies({"127.0.0.1"});
+  svr.Get("/ip", [](const Request &req, Response &res) {
+    res.set_content(req.remote_addr, "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port("::");
+  if (port <= 0) { GTEST_SKIP() << "no IPv6 on this host"; }
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli("127.0.0.1", port);
+  auto res = cli.Get("/ip", Headers{{"X-Forwarded-For", "198.51.100.23"}});
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("198.51.100.23", res->body);
+}
+
+TEST(ForwardedHeadersTest, IPv4MappedHopMatchesIPv4Proxy) {
+  Server svr;
+  svr.set_trusted_proxies({"192.0.2.45", "::1", "127.0.0.1"});
+  svr.Get("/ip", [](const Request &req, Response &res) {
+    res.set_content(req.remote_addr, "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_GT(port, 0);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  auto res = cli.Get(
+      "/ip", Headers{{"X-Forwarded-For", "198.51.100.23, ::ffff:192.0.2.45"}});
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("198.51.100.23", res->body);
+}
+
 TEST(ForwardedHeadersTest, SingleTrustedProxy_UsesIPBeforeTrusted) {
   Server svr;
 
-  svr.set_trusted_proxies({"203.0.113.66"});
+  // Include the loopback address the test client actually connects from, so
+  // the direct connection itself is recognized as the trusted proxy hop.
+  svr.set_trusted_proxies({"203.0.113.66", "::1", "127.0.0.1"});
 
   std::string observed_remote_addr;
   std::string observed_xff;
@@ -15195,7 +23123,7 @@ TEST(ForwardedHeadersTest, SingleTrustedProxy_UsesIPBeforeTrusted) {
   auto res = cli.Get(
       "/ip", Headers{{"X-Forwarded-For", "198.51.100.23, 203.0.113.66"}});
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 
   EXPECT_EQ(observed_xff, "198.51.100.23, 203.0.113.66");
@@ -15205,7 +23133,7 @@ TEST(ForwardedHeadersTest, SingleTrustedProxy_UsesIPBeforeTrusted) {
 TEST(ForwardedHeadersTest, MultipleTrustedProxies_UsesClientIP) {
   Server svr;
 
-  svr.set_trusted_proxies({"203.0.113.66", "192.0.2.45"});
+  svr.set_trusted_proxies({"203.0.113.66", "192.0.2.45", "::1", "127.0.0.1"});
 
   std::string observed_remote_addr;
   std::string observed_xff;
@@ -15230,16 +23158,16 @@ TEST(ForwardedHeadersTest, MultipleTrustedProxies_UsesClientIP) {
       "/ip",
       Headers{{"X-Forwarded-For", "198.51.100.23, 203.0.113.66, 192.0.2.45"}});
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(observed_xff, "198.51.100.23, 203.0.113.66, 192.0.2.45");
   EXPECT_EQ(observed_remote_addr, "198.51.100.23");
 }
 
-TEST(ForwardedHeadersTest, TrustedProxyNotInHeader_UsesFirstFromXFF) {
+TEST(ForwardedHeadersTest, TrustedProxyNotInHeader_UsesRightmostIP) {
   Server svr;
 
-  svr.set_trusted_proxies({"192.0.2.45"});
+  svr.set_trusted_proxies({"192.0.2.45", "::1", "127.0.0.1"});
 
   std::string observed_remote_addr;
   std::string observed_xff;
@@ -15263,17 +23191,53 @@ TEST(ForwardedHeadersTest, TrustedProxyNotInHeader_UsesFirstFromXFF) {
   auto res = cli.Get(
       "/ip", Headers{{"X-Forwarded-For", "198.51.100.23, 198.51.100.24"}});
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 
+  // No listed hop is a trusted proxy, so the rightmost entry (the one written
+  // by the closest hop) is used. The leftmost entry is fully client-controlled
+  // and must not be selected.
   EXPECT_EQ(observed_xff, "198.51.100.23, 198.51.100.24");
-  EXPECT_EQ(observed_remote_addr, "198.51.100.23");
+  EXPECT_EQ(observed_remote_addr, "198.51.100.24");
+}
+
+TEST(ForwardedHeadersTest, SpoofedIPBeforeTrustedProxyIsIgnored) {
+  Server svr;
+
+  svr.set_trusted_proxies({"10.0.0.1", "::1", "127.0.0.1"});
+
+  std::string observed_remote_addr;
+
+  svr.Get("/ip", [&](const Request &req, Response &res) {
+    observed_remote_addr = req.remote_addr;
+    res.set_content("ok", "text/plain");
+  });
+
+  thread t = thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  // The trusted proxy appends the address it saw (5.6.7.8). The client prepends
+  // a forged address and the trusted proxy's own address; the forged value must
+  // not win over the address the trusted proxy actually recorded.
+  Client cli(HOST, PORT);
+  auto res = cli.Get(
+      "/ip", Headers{{"X-Forwarded-For", "1.2.3.4, 10.0.0.1, 5.6.7.8"}});
+
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ(observed_remote_addr, "5.6.7.8");
 }
 
 TEST(ForwardedHeadersTest, LastHopTrusted_SelectsImmediateLeftIP) {
   Server svr;
 
-  svr.set_trusted_proxies({"192.0.2.45"});
+  svr.set_trusted_proxies({"192.0.2.45", "::1", "127.0.0.1"});
 
   std::string observed_remote_addr;
   std::string observed_xff;
@@ -15298,7 +23262,7 @@ TEST(ForwardedHeadersTest, LastHopTrusted_SelectsImmediateLeftIP) {
       "/ip",
       Headers{{"X-Forwarded-For", "198.51.100.23, 203.0.113.66, 192.0.2.45"}});
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
 
   EXPECT_EQ(observed_xff, "198.51.100.23, 203.0.113.66, 192.0.2.45");
@@ -15308,7 +23272,7 @@ TEST(ForwardedHeadersTest, LastHopTrusted_SelectsImmediateLeftIP) {
 TEST(ForwardedHeadersTest, HandlesWhitespaceAroundIPs) {
   Server svr;
 
-  svr.set_trusted_proxies({"192.0.2.45"});
+  svr.set_trusted_proxies({"192.0.2.45", "::1", "127.0.0.1"});
 
   std::string observed_remote_addr;
   std::string observed_xff;
@@ -15344,6 +23308,69 @@ TEST(ForwardedHeadersTest, HandlesWhitespaceAroundIPs) {
   EXPECT_EQ(observed_remote_addr, "203.0.113.66");
 }
 
+// RFC 9110 Section 5.2 and 5.3: repeated field lines carry the same meaning as
+// one comma-joined value, in the order received. Proxies such as HAProxy append
+// their own X-Forwarded-For as a separate field line rather than extending the
+// one the client sent, so every occurrence has to be taken into account.
+// Reading only the first one hands back the address the client chose.
+TEST(ForwardedHeadersTest, DuplicateFieldLines_JoinsAllOccurrences) {
+  Server svr;
+
+  svr.set_trusted_proxies({"192.0.2.45", "::1", "127.0.0.1"});
+
+  std::string observed_remote_addr;
+  size_t observed_xff_count = 0;
+
+  svr.Get("/ip", [&](const Request &req, Response &res) {
+    observed_remote_addr = req.remote_addr;
+    observed_xff_count = req.get_header_value_count("X-Forwarded-For");
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  // The client supplies the first field line; the trusted proxy appends the
+  // address it observed as a second one.
+  std::string raw_req = "GET /ip HTTP/1.1\r\n"
+                        "Host: localhost\r\n"
+                        "X-Forwarded-For: 1.2.3.4\r\n"
+                        "X-Forwarded-For: 198.51.100.23, 192.0.2.45\r\n"
+                        "Connection: close\r\n"
+                        "\r\n";
+
+  std::string out;
+  ASSERT_TRUE(send_request(5, raw_req, &out, port));
+  EXPECT_EQ("HTTP/1.1 200 OK", out.substr(0, 15));
+
+  EXPECT_EQ(observed_xff_count, 2U);
+  EXPECT_EQ(observed_remote_addr, "198.51.100.23");
+
+  // The same chain spread over one field line per hop derives the same client
+  // address, i.e. the split and the comma-joined representations agree.
+  std::string per_hop_req = "GET /ip HTTP/1.1\r\n"
+                            "Host: localhost\r\n"
+                            "X-Forwarded-For: 1.2.3.4\r\n"
+                            "X-Forwarded-For: 198.51.100.23\r\n"
+                            "X-Forwarded-For: 192.0.2.45\r\n"
+                            "Connection: close\r\n"
+                            "\r\n";
+
+  out.clear();
+  ASSERT_TRUE(send_request(5, per_hop_req, &out, port));
+  EXPECT_EQ("HTTP/1.1 200 OK", out.substr(0, 15));
+
+  EXPECT_EQ(observed_xff_count, 3U);
+  EXPECT_EQ(observed_remote_addr, "198.51.100.23");
+}
+
 // An X-Forwarded-For header whose value parses to zero IP segments must not
 // crash the server (it used to call front() on an empty vector inside
 // get_client_ip). The connection-level remote address must be retained instead.
@@ -15373,7 +23400,7 @@ static void run_malformed_xff_test(const std::string &xff_value) {
   Client cli(HOST, port);
   auto res = cli.Get("/ip", Headers{{"X-Forwarded-For", xff_value}});
 
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_TRUE(observed_remote_addr == "::1" ||
               observed_remote_addr == "127.0.0.1");
@@ -15391,7 +23418,300 @@ TEST(ForwardedHeadersTest, MultipleCommasXForwardedFor_DoesNotCrash) {
   run_malformed_xff_test(", , ,");
 }
 
-#ifndef _WIN32
+// The same rule applies to Accept: a request whose acceptable types are spread
+// over several field lines must be negotiated against all of them.
+// RFC 9110 Section 7.6.1: Connection carries a comma-separated list of
+// case-insensitive connection options. Comparing the whole field value against
+// one option misses a client that sends several of them, and misses every
+// casing but the one written in the comparison.
+//
+// Sends req, reads the response, then reuses the same socket for a second
+// request to find out whether the server kept the connection.
+static void probe_connection_reuse(int port, const std::string &req,
+                                   bool *announced_close, bool *reusable) {
+  auto error = Error::Success;
+  auto sock = detail::create_client_socket(
+      HOST, "", port, AF_UNSPEC, false, false, nullptr,
+      /*connection_timeout_sec=*/5, 0,
+      /*read_timeout_sec=*/1, 0,
+      /*write_timeout_sec=*/5, 0, std::string(), error);
+  ASSERT_NE(sock, INVALID_SOCKET);
+  auto se = detail::scope_exit([&] { detail::close_socket(sock); });
+
+  const std::string second = "GET /keepalive HTTP/1.1\r\n"
+                             "Host: localhost\r\n"
+                             "Connection: close\r\n"
+                             "\r\n";
+  std::string first_response;
+  std::string second_response;
+
+  detail::process_client_socket(
+      sock, 1, 0, 5, 0, 0, std::chrono::steady_clock::time_point::min(),
+      [&](Stream &strm) {
+        if (strm.write(req.data(), req.size()) !=
+            static_cast<ssize_t>(req.size())) {
+          return false;
+        }
+
+        char buf[512];
+        detail::stream_line_reader reader(strm, buf, sizeof(buf));
+        // Headers plus the two-byte body of the handler below
+        while (reader.getline()) {
+          first_response += reader.ptr();
+          if (first_response.find("ok") != std::string::npos) { break; }
+        }
+
+        if (strm.write(second.data(), second.size()) !=
+            static_cast<ssize_t>(second.size())) {
+          return true;
+        }
+        detail::stream_line_reader reader2(strm, buf, sizeof(buf));
+        while (reader2.getline()) {
+          second_response += reader2.ptr();
+          if (second_response.find("ok") != std::string::npos) { break; }
+        }
+        return true;
+      });
+
+  *announced_close =
+      first_response.find("Connection: close") != std::string::npos;
+  *reusable = second_response.find("HTTP/1.1 200") != std::string::npos;
+}
+
+class ConnectionTokenTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    svr_.Get("/keepalive", [](const Request &, Response &res) {
+      res.set_content("ok", "text/plain");
+    });
+    port_ = svr_.bind_to_any_port(HOST);
+    thread_ = thread([&]() { svr_.listen_after_bind(); });
+    svr_.wait_until_ready();
+  }
+
+  void TearDown() override {
+    svr_.stop();
+    if (thread_.joinable()) { thread_.join(); }
+  }
+
+  Server svr_;
+  int port_ = 0;
+  thread thread_;
+};
+
+// "close" alongside another option still closes the connection, and the
+// response says so rather than leaving the peer to discover it.
+TEST_F(ConnectionTokenTest, CloseAmongSeveralOptionsIsHonored) {
+  bool announced_close = false;
+  bool reusable = true;
+  probe_connection_reuse(port_,
+                         "GET /keepalive HTTP/1.1\r\n"
+                         "Host: localhost\r\n"
+                         "Connection: keep-alive, close\r\n"
+                         "\r\n",
+                         &announced_close, &reusable);
+  EXPECT_TRUE(announced_close);
+  EXPECT_FALSE(reusable);
+}
+
+// "close" split over two field lines is the same list, so it is honored too.
+TEST_F(ConnectionTokenTest, CloseOnALaterFieldLineIsHonored) {
+  bool announced_close = false;
+  bool reusable = true;
+  probe_connection_reuse(port_,
+                         "GET /keepalive HTTP/1.1\r\n"
+                         "Host: localhost\r\n"
+                         "Connection: keep-alive\r\n"
+                         "Connection: close\r\n"
+                         "\r\n",
+                         &announced_close, &reusable);
+  EXPECT_TRUE(announced_close);
+  EXPECT_FALSE(reusable);
+}
+
+// Connection options are case-insensitive, so an HTTP/1.0 client asking for
+// keep-alive in the spelling everyone actually sends keeps its connection.
+TEST_F(ConnectionTokenTest, Http10KeepAliveIsCaseInsensitive) {
+  bool announced_close = false;
+  bool reusable = false;
+  probe_connection_reuse(port_,
+                         "GET /keepalive HTTP/1.0\r\n"
+                         "Host: localhost\r\n"
+                         "Connection: keep-alive\r\n"
+                         "\r\n",
+                         &announced_close, &reusable);
+  EXPECT_FALSE(announced_close);
+  EXPECT_TRUE(reusable);
+}
+
+// A token the value merely contains is not the token itself.
+TEST_F(ConnectionTokenTest, SubstringOfAnOptionIsNotTheOption) {
+  bool announced_close = false;
+  bool reusable = false;
+  probe_connection_reuse(port_,
+                         "GET /keepalive HTTP/1.1\r\n"
+                         "Host: localhost\r\n"
+                         "Connection: notclose\r\n"
+                         "\r\n",
+                         &announced_close, &reusable);
+  EXPECT_FALSE(announced_close);
+  EXPECT_TRUE(reusable);
+}
+
+TEST(RepeatedFieldLinesTest, AcceptCombinesEveryFieldLine) {
+  Server svr;
+
+  std::vector<std::string> observed_types;
+
+  svr.Get("/", [&](const Request &req, Response &res) {
+    observed_types = req.accept_content_types;
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  Headers headers;
+  headers.emplace("Accept", "text/plain;q=0.5");
+  headers.emplace("Accept", "application/json");
+
+  auto res = cli.Get("/", headers);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+
+  // Sorted by q-value, so the second field line's type comes first
+  ASSERT_EQ(2U, observed_types.size());
+  EXPECT_EQ("application/json", observed_types[0]);
+  EXPECT_EQ("text/plain", observed_types[1]);
+}
+
+// RFC 9110 Section 5.6.1.2: empty list elements are parsed and ignored, so an
+// empty field line must not contribute a bare comma to the combined value.
+TEST(RepeatedFieldLinesTest, EmptyFieldLineDoesNotInjectComma) {
+  Server svr;
+
+  std::vector<std::string> observed_types;
+
+  svr.Get("/", [&](const Request &req, Response &res) {
+    observed_types = req.accept_content_types;
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  // Empty first field line, then a real one
+  std::string raw_req = "GET / HTTP/1.1\r\n"
+                        "Host: localhost\r\n"
+                        "Accept:\r\n"
+                        "Accept: application/json\r\n"
+                        "Connection: close\r\n"
+                        "\r\n";
+
+  std::string out;
+  ASSERT_TRUE(send_request(5, raw_req, &out, port));
+  EXPECT_EQ("HTTP/1.1 200 OK", out.substr(0, 15));
+
+  ASSERT_EQ(1U, observed_types.size());
+  EXPECT_EQ("application/json", observed_types[0]);
+}
+
+// The skip in get_combined_header_value() is what keeps an empty field line
+// from contributing a bare comma. Only a trailing empty field line exercises
+// it: a leading one is already covered by the "combined is still empty" check,
+// and parse_accept_header() now ignores the empty element either way, so the
+// request-level test above can no longer tell the two apart.
+TEST(RepeatedFieldLinesTest, EmptyFieldLineIsNotCombined) {
+  Headers headers;
+  headers.emplace("Accept", "text/html");
+  headers.emplace("Accept", "");
+  EXPECT_EQ("text/html", detail::get_combined_header_value(headers, "Accept"));
+
+  headers.clear();
+  headers.emplace("Accept", "");
+  headers.emplace("Accept", "application/json");
+  EXPECT_EQ("application/json",
+            detail::get_combined_header_value(headers, "Accept"));
+}
+
+#ifdef CPPHTTPLIB_ZLIB_SUPPORT
+// An encoding offered on a later Accept-Encoding field line is still offered.
+TEST(RepeatedFieldLinesTest, AcceptEncodingCombinesEveryFieldLine) {
+  Server svr;
+
+  svr.Get("/", [](const Request & /*req*/, Response &res) {
+    res.set_content(std::string(1024, 'x'), "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_decompress(false);
+
+  Headers headers;
+  headers.emplace("Accept-Encoding", "identity");
+  headers.emplace("Accept-Encoding", "gzip");
+
+  auto res = cli.Get("/", headers);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("gzip", res->get_header_value("Content-Encoding"));
+}
+#endif
+
+// RFC 9112 6.3: whatever follows a request with neither Content-Length nor
+// Transfer-Encoding is not its body.
+TEST(ServerRequestParsingTest, BytesAfterUnframedRequestAreNotItsBody) {
+  Server svr;
+  svr.set_payload_max_length(8);
+  svr.Post("/test", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_GT(port, 0);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  std::string resp;
+  ASSERT_TRUE(send_request(1,
+                           "POST /test HTTP/1.1\r\n"
+                           "Host: localhost\r\n"
+                           "Connection: close\r\n"
+                           "\r\n" +
+                               std::string(16, 'X'),
+                           &resp, port));
+  EXPECT_EQ("HTTP/1.1 200 OK", resp.substr(0, resp.find("\r\n")));
+}
+
 TEST(ServerRequestParsingTest, RequestWithoutContentLengthOrTransferEncoding) {
   Server svr;
 
@@ -15461,7 +23781,6 @@ TEST(ServerRequestParsingTest, RequestWithoutContentLengthOrTransferEncoding) {
                            &resp));
   EXPECT_TRUE(resp.find("HTTP/1.1 200 OK") == 0);
 }
-#endif
 
 //==============================================================================
 // open_stream() Tests
@@ -15563,6 +23882,10 @@ protected:
     svr_.Get("/large", [](const Request &, Response &res) {
       res.set_content(std::string(10000, 'X'), "text/plain");
     });
+    svr_.Get("/unknown-encoding", [](const Request &, Response &res) {
+      res.set_content("Hello World!", "image/jpeg");
+      res.set_header("Content-Encoding", "UTF-8");
+    });
     svr_.Get("/chunked", [](const Request &, Response &res) {
       res.set_chunked_content_provider("text/plain",
                                        [](size_t offset, DataSink &sink) {
@@ -15648,6 +23971,13 @@ TEST_F(OpenStreamTest, Basic) {
   Client cli("127.0.0.1", port_);
   auto handle = cli.open_stream("GET", "/hello");
   EXPECT_TRUE(handle.is_valid());
+  EXPECT_EQ("Hello World!", read_all(handle));
+}
+
+TEST_F(OpenStreamTest, UnknownContentEncodingIsPassedThrough) {
+  Client cli("127.0.0.1", port_);
+  auto handle = cli.open_stream("GET", "/unknown-encoding");
+  ASSERT_TRUE(handle.is_valid());
   EXPECT_EQ("Hello World!", read_all(handle));
 }
 
@@ -15760,9 +24090,14 @@ TEST_F(OpenStreamTest, ProhibitedTrailersAreIgnored_Stream) {
   EXPECT_EQ(std::string(""), handle.response->get_header_value("X-Allowed"));
 }
 
-static std::thread serve_single_response(std::promise<int> &port_promise,
-                                         const std::string &response) {
-  return std::thread([&port_promise, response] {
+// Accepts one connection on an OS-assigned port, which it hands over through
+// port_promise, reads the request head and sends back response. after_send,
+// if given, runs on the connection before it is closed.
+static std::thread
+serve_single_response(std::promise<int> &port_promise,
+                      const std::string &response,
+                      std::function<void(socket_t)> after_send = nullptr) {
+  return std::thread([&port_promise, response, after_send] {
     auto srv = ::socket(AF_INET, SOCK_STREAM, 0);
     default_socket_options(srv);
     detail::set_socket_opt_time(srv, SOL_SOCKET, SO_RCVTIMEO, 5, 0);
@@ -15825,6 +24160,7 @@ static std::thread serve_single_response(std::promise<int> &port_promise,
 #endif
              0);
 
+      if (after_send) { after_send(cli); }
       detail::close_socket(cli);
     }
     detail::close_socket(srv);
@@ -15873,15 +24209,758 @@ TEST(OpenStreamMalformedContentLength, OutOfRange) {
   auto port = port_future.get();
   ASSERT_GT(port, 0);
 
-  // Before the fix, std::stoull would throw std::out_of_range here and
-  // crash the process. After the fix, strtoull silently clamps to
-  // ULLONG_MAX so the stream opens without crashing. The important thing
-  // is that the process does NOT terminate.
+  // Historically std::stoull would throw std::out_of_range here and crash
+  // the process, then parsing silently clamped to a bogus framing length and
+  // the stream opened anyway. Now the out-of-range value is flagged invalid,
+  // so the stream fails to open, matching the not-a-number case above. The
+  // process still must NOT terminate.
   Client cli("127.0.0.1", port);
   auto handle = cli.open_stream("GET", "/");
-  EXPECT_TRUE(handle.is_valid());
+  EXPECT_FALSE(handle.is_valid());
 
   server_thread.join();
+}
+
+#ifndef _WIN32
+// As above for the body of a streamed request: a send() cut short by the write
+// timeout must not leave the rest of the body unsent.
+TEST(OpenStreamPartialWriteTest, BodyIsWrittenWhole) {
+  signal(SIGPIPE, SIG_IGN);
+
+  Server svr;
+  svr.set_socket_options([](socket_t sock) {
+    int size = 8192;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
+               reinterpret_cast<const char *>(&size), sizeof(size));
+  });
+  svr.Post("/size", [](const Request &, Response &res,
+                       const ContentReader &content_reader) {
+    // Outlast the client's write timeout before reading the body.
+    std::this_thread::sleep_for(std::chrono::milliseconds(750));
+    size_t received = 0;
+    content_reader([&](const char *, size_t len) {
+      received += len;
+      return true;
+    });
+    res.set_content(std::to_string(received), "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_write_timeout(0, 500000);
+  cli.set_socket_options([](socket_t sock) {
+    int size = 8192;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF,
+               reinterpret_cast<const char *>(&size), sizeof(size));
+  });
+
+  const std::string body(4 * 1024 * 1024, 'A');
+  auto handle = cli.open_stream("POST", "/size", {}, {}, body,
+                                "application/octet-stream");
+  ASSERT_TRUE(handle.is_valid()) << to_string(handle.error);
+  EXPECT_EQ(StatusCode::OK_200, handle.response->status);
+  EXPECT_EQ(std::to_string(body.size()), read_all(handle));
+}
+#endif
+
+// Serves `response` to the single request `fn` makes with a fresh client.
+template <typename Fn>
+static void with_single_response(const std::string &response, Fn fn) {
+#ifndef _WIN32
+  signal(SIGPIPE, SIG_IGN);
+#endif
+
+  std::promise<int> port_promise;
+  auto port_future = port_promise.get_future();
+  auto server_thread = serve_single_response(port_promise, response);
+  auto se = detail::scope_exit([&] { server_thread.join(); });
+
+  auto port = port_future.get();
+  ASSERT_GT(port, 0);
+  Client cli("127.0.0.1", port);
+  fn(cli);
+}
+
+// set_decompress(false) hands out the encoded bytes through the streaming APIs
+// too, also in a build without the decoder for the advertised coding.
+TEST(StreamDecompressionTest, DisabledPreservesEncodedBody) {
+  const std::string gzipped(GZIPPED_HELLO_WORLD, sizeof(GZIPPED_HELLO_WORLD));
+  const auto response = "HTTP/1.1 200 OK\r\n"
+                        "Content-Encoding: gzip\r\n"
+                        "Content-Length: " +
+                        std::to_string(gzipped.size()) +
+                        "\r\n"
+                        "Connection: close\r\n\r\n" +
+                        gzipped;
+
+  with_single_response(response, [&](Client &cli) {
+    cli.set_decompress(false);
+    auto handle = cli.open_stream("GET", "/");
+    ASSERT_TRUE(handle.is_valid()) << to_string(handle.error);
+    EXPECT_EQ("gzip", handle.response->get_header_value("Content-Encoding"));
+    EXPECT_EQ(gzipped, read_all(handle));
+    EXPECT_FALSE(handle.has_read_error());
+  });
+
+  with_single_response(response, [&](Client &cli) {
+    cli.set_decompress(false);
+    auto res = stream::Get(cli, "/", 7);
+    ASSERT_TRUE(res) << to_string(res.error());
+    EXPECT_EQ("gzip", res.get_header_value("Content-Encoding"));
+    EXPECT_EQ(gzipped, res.read_all());
+    EXPECT_FALSE(res.has_read_error());
+  });
+}
+
+TEST(StreamBodyEndTest, BodyEndingAtConnectionClose) {
+  // Neither Content-Length nor chunked: the body ends at the close
+  const char *close_delimited = "HTTP/1.1 200 OK\r\n"
+                                "Connection: close\r\n"
+                                "\r\n"
+                                "hello";
+  with_single_response(close_delimited, [](Client &cli) {
+    auto handle = cli.open_stream("GET", "/");
+    ASSERT_TRUE(handle.is_valid());
+    EXPECT_EQ("hello", read_all(handle));
+    EXPECT_FALSE(handle.has_read_error());
+  });
+
+  // A close before the end of the Content-Length is still an error
+  const char *short_content_length = "HTTP/1.1 200 OK\r\n"
+                                     "Content-Length: 10\r\n"
+                                     "\r\n"
+                                     "hello";
+  with_single_response(short_content_length, [](Client &cli) {
+    auto handle = cli.open_stream("GET", "/");
+    ASSERT_TRUE(handle.is_valid());
+    read_all(handle);
+    EXPECT_EQ(Error::ConnectionClosed, handle.get_read_error());
+  });
+
+  // So is a close before the last chunk
+  const char *short_chunked = "HTTP/1.1 200 OK\r\n"
+                              "Transfer-Encoding: chunked\r\n"
+                              "\r\n"
+                              "5\r\nhello\r\n";
+  with_single_response(short_chunked, [](Client &cli) {
+    auto handle = cli.open_stream("GET", "/");
+    ASSERT_TRUE(handle.is_valid());
+    read_all(handle);
+    EXPECT_TRUE(handle.has_read_error());
+  });
+}
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+// Serves `response` to one request, then closes with or without a close_notify
+template <typename Fn>
+static void with_single_tls_response(const std::string &response,
+                                     bool close_notify, Fn fn) {
+#ifndef _WIN32
+  signal(SIGPIPE, SIG_IGN);
+#endif
+
+  std::promise<int> port_promise;
+  auto port_future = port_promise.get_future();
+  auto server_thread = std::thread([&port_promise, response, close_notify] {
+    auto srv = ::socket(AF_INET, SOCK_STREAM, 0);
+    default_socket_options(srv);
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(0);
+    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (::bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 ||
+        ::listen(srv, 1) != 0) {
+      port_promise.set_value(-1);
+      detail::close_socket(srv);
+      return;
+    }
+    socklen_t addr_len = sizeof(addr);
+    ::getsockname(srv, reinterpret_cast<sockaddr *>(&addr), &addr_len);
+    port_promise.set_value(static_cast<int>(ntohs(addr.sin_port)));
+
+    auto cli = ::accept(srv, nullptr, nullptr);
+    if (cli != INVALID_SOCKET) {
+      auto ctx = tls::create_server_context();
+      tls::set_server_cert_file(ctx, SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE,
+                                nullptr);
+      auto session = tls::create_session(ctx, cli);
+      tls::TlsError err;
+      if (tls::accept_nonblocking(session, cli, 5, 0, &err)) {
+        // The request head first, so that closing the socket sends a FIN
+        // rather than an RST for the unread bytes.
+        std::string req;
+        char buf[256];
+        while (req.find("\r\n\r\n") == std::string::npos) {
+          auto n = tls::read(session, buf, sizeof(buf), err);
+          if (n <= 0) { break; }
+          req.append(buf, static_cast<size_t>(n));
+        }
+        size_t sent = 0;
+        while (sent < response.size()) {
+          auto n = tls::write(session, response.data() + sent,
+                              response.size() - sent, err);
+          if (n <= 0) { break; }
+          sent += static_cast<size_t>(n);
+        }
+        if (close_notify) { tls::shutdown(session, true); }
+      }
+      tls::free_session(session);
+      detail::close_socket(cli);
+      tls::free_context(ctx);
+    }
+    detail::close_socket(srv);
+  });
+  auto se = detail::scope_exit([&] { server_thread.join(); });
+
+  auto port = port_future.get();
+  ASSERT_GT(port, 0);
+  SSLClient cli("127.0.0.1", port);
+  cli.enable_server_certificate_verification(false);
+  fn(cli);
+}
+
+// RFC 8446 6.1: a close-delimited body is complete only after a close_notify
+TEST(SSLClientTest, UnframedBodyEndsOnlyAtCloseNotify) {
+  const std::string close_delimited = "HTTP/1.1 200 OK\r\n"
+                                      "Connection: close\r\n"
+                                      "\r\n"
+                                      "hello";
+  with_single_tls_response(close_delimited, true, [](SSLClient &cli) {
+    auto res = cli.Get("/");
+    ASSERT_TRUE(res) << to_string(res.error());
+    EXPECT_EQ("hello", res->body);
+  });
+
+  with_single_tls_response(close_delimited, false, [](SSLClient &cli) {
+    auto res = cli.Get("/");
+    ASSERT_FALSE(res);
+    EXPECT_EQ(Error::Read, res.error());
+  });
+
+  with_single_tls_response(close_delimited, false, [](SSLClient &cli) {
+    auto handle = cli.open_stream("GET", "/");
+    ASSERT_TRUE(handle.is_valid()) << to_string(handle.error);
+    read_all(handle);
+    EXPECT_TRUE(handle.has_read_error());
+  });
+
+  // A framed body ends where its framing says, with or without the alert
+  const std::string framed = "HTTP/1.1 200 OK\r\n"
+                             "Content-Length: 5\r\n"
+                             "Connection: close\r\n"
+                             "\r\n"
+                             "hello";
+  with_single_tls_response(framed, false, [](SSLClient &cli) {
+    auto res = cli.Get("/");
+    ASSERT_TRUE(res) << to_string(res.error());
+    EXPECT_EQ("hello", res->body);
+  });
+}
+#endif
+
+TEST(InterimResponseTest, SkippedWithTheirHeaderFields) {
+  const char *responses[] = {
+      "HTTP/1.1 103 Early Hints\r\n"
+      "Link: </style.css>; rel=preload\r\n"
+      "\r\n"
+      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+      "HTTP/1.1 100 Continue\r\n"
+      "X-Note: interim\r\n"
+      "\r\n"
+      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+  };
+
+  for (auto response : responses) {
+    with_single_response(response, [](Client &cli) {
+      auto res = cli.Get("/");
+      ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+      EXPECT_EQ(StatusCode::OK_200, res->status);
+      EXPECT_EQ("ok", res->body);
+    });
+  }
+}
+
+TEST(InterimResponseTest, OnlySoManyAreSkipped) {
+  const std::string interim = "HTTP/1.1 102 Processing\r\n\r\n";
+  const std::string final_response =
+      "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+  std::string interims;
+  for (auto i = 0; i < CPPHTTPLIB_INTERIM_RESPONSE_MAX_COUNT; i++) {
+    interims += interim;
+  }
+
+  with_single_response(interims + final_response, [](Client &cli) {
+    auto res = cli.Get("/");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ("ok", res->body);
+  });
+
+  with_single_response(interims + interim + final_response, [](Client &cli) {
+    auto res = cli.Get("/");
+    ASSERT_FALSE(res);
+    EXPECT_EQ(Error::Read, res.error());
+  });
+}
+
+TEST(ExpectContinueTest, EarlyFinalResponseClosesConnection) {
+#ifndef _WIN32
+  signal(SIGPIPE, SIG_IGN);
+#endif
+  // The server answers the head without asking for the body. Bytes it then
+  // reads on the connection would be taken for the body the request declared.
+  auto closed_by_client = false;
+  std::promise<int> port_promise;
+  auto server_thread = serve_single_response(
+      port_promise, "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n",
+      [&](socket_t sock) {
+        detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, 3, 0);
+        char buf[256];
+        closed_by_client = ::recv(sock, buf, sizeof(buf), 0) == 0;
+      });
+
+  Client cli("127.0.0.1", port_promise.get_future().get());
+  cli.set_keep_alive(true);
+  cli.set_read_timeout(1, 0);
+  // Long enough for the client to send Expect: 100-continue.
+  auto res = cli.Post("/upload", std::string(2048, 'B'), "text/plain");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
+  cli.Get("/second");
+
+  server_thread.join();
+  EXPECT_TRUE(closed_by_client);
+}
+
+TEST(InterimResponseTest, SkippedWhileWaitingForContinue) {
+  // Long enough for the client to send Expect: 100-continue
+  with_single_response(
+      "HTTP/1.1 103 Early Hints\r\n"
+      "Link: </style.css>; rel=preload\r\n"
+      "\r\n"
+      "HTTP/1.1 401 Unauthorized\r\n"
+      "Content-Length: 0\r\n\r\n",
+      [](Client &cli) {
+        cli.set_read_timeout(2, 0);
+        auto res = cli.Post("/upload", std::string(2048, 'B'), "text/plain");
+        ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+        EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
+      });
+}
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+TEST(ExpectContinueTest, AuthRetryAfterEarlyResponseUsesANewConnection) {
+#ifndef _WIN32
+  signal(SIGPIPE, SIG_IGN);
+#endif
+  auto reused = false;
+  std::promise<int> port_promise;
+  auto server_thread = serve_single_response(
+      port_promise,
+      "HTTP/1.1 401 Unauthorized\r\n"
+      "WWW-Authenticate: Digest realm=\"r\", nonce=\"n\", qop=\"auth\"\r\n"
+      "Content-Length: 0\r\n\r\n",
+      [&](socket_t sock) {
+        detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, 3, 0);
+        char buf[256];
+        reused = ::recv(sock, buf, sizeof(buf), 0) > 0;
+      });
+
+  Client cli("127.0.0.1", port_promise.get_future().get());
+  cli.set_keep_alive(true);
+  cli.set_digest_auth("user", "pass");
+  cli.set_read_timeout(1, 0);
+  cli.Post("/upload", std::string(2048, 'B'), "text/plain");
+
+  server_thread.join();
+  EXPECT_FALSE(reused);
+}
+
+TEST(ProxyConnectTest, OnlyAProxyAuthChallengeIsPassedOn) {
+  // Any other answer to CONNECT would read as the origin's response.
+  struct {
+    const char *response;
+    bool passed_on;
+  } cases[] = {
+      {"HTTP/1.1 201 Created\r\n"
+       "Set-Cookie: session=from-proxy\r\n"
+       "Content-Length: 0\r\n\r\n",
+       false},
+      {"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n", false},
+      {"HTTP/1.1 407 Proxy Authentication Required\r\n"
+       "Content-Length: 0\r\n\r\n",
+       true},
+  };
+
+  for (const auto &c : cases) {
+    std::promise<int> port_promise;
+    auto server_thread = serve_single_response(port_promise, c.response);
+    SSLClient cli("example.com", 443);
+    cli.set_proxy("127.0.0.1", port_promise.get_future().get());
+    auto res = cli.Get("/");
+    server_thread.join();
+
+    EXPECT_EQ(Error::ProxyConnection, res.error()) << c.response;
+    ASSERT_EQ(c.passed_on, static_cast<bool>(res)) << c.response;
+    if (res) {
+      EXPECT_EQ(StatusCode::ProxyAuthenticationRequired_407, res->status);
+    }
+  }
+}
+#endif
+
+// Records the client's error logger calls as "error METHOD path", or
+// "error null" for a call without a request
+static ErrorLogger record_errors(std::vector<std::string> &log) {
+  return [&log](const Error &err, const Request *req) {
+    log.push_back(to_string(err) + " " +
+                  (req ? req->method + " " + req->path : "null"));
+  };
+}
+
+// A failed request is reported once, with the request the caller made
+TEST(ClientErrorLoggerTest, CancelIsLoggedOnce) {
+  Server svr;
+  svr.Get("/big", [](const Request &, Response &res) {
+    res.set_content(std::string(100000, 'b'), "text/plain");
+  });
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  std::vector<std::string> log;
+  cli.set_error_logger(record_errors(log));
+  std::vector<std::string> expected{to_string(Error::Canceled) + " GET /big"};
+
+  cli.Get("/big", [](const char *, size_t) { return false; });
+  EXPECT_EQ(expected, log);
+
+  log.clear();
+  cli.Get("/big", [](size_t, size_t) { return false; });
+  EXPECT_EQ(expected, log);
+}
+
+TEST(ClientErrorLoggerTest, RedirectFailureIsLoggedWithTheCallersRequest) {
+  // Fails while the body is read
+  auto broken = [](const Request &, Response &res) {
+    res.set_content_provider(10, "text/plain",
+                             [](size_t, size_t, DataSink &) { return false; });
+  };
+  Server other;
+  other.Get("/broken", broken);
+  auto other_port = other.bind_to_any_port(HOST);
+  std::thread other_t([&]() { other.listen_after_bind(); });
+  auto other_se = detail::scope_exit([&] {
+    other.stop();
+    other_t.join();
+  });
+  other.wait_until_ready();
+
+  Server svr;
+  svr.Get("/broken", broken);
+  svr.Get("/same-origin",
+          [](const Request &, Response &res) { res.set_redirect("/broken"); });
+  svr.Get("/cross-origin", [&](const Request &, Response &res) {
+    res.set_redirect("http://" + std::string(HOST) + ":" +
+                     std::to_string(other_port) + "/broken");
+  });
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  cli.set_follow_location(true);
+  std::vector<std::string> log;
+  cli.set_error_logger(record_errors(log));
+
+  for (auto path : {"/same-origin", "/cross-origin"}) {
+    log.clear();
+    auto res = cli.Get(path);
+    ASSERT_FALSE(res);
+    EXPECT_EQ(std::vector<std::string>{to_string(res.error()) + " GET " + path},
+              log);
+  }
+}
+
+TEST(ClientErrorLoggerTest, StreamOpenFailureIsLoggedOnce) {
+  with_single_response("garbage\r\n\r\n", [](Client &cli) {
+    std::vector<std::string> log;
+    cli.set_error_logger(record_errors(log));
+    auto handle = cli.open_stream("GET", "/x");
+    EXPECT_FALSE(handle.is_valid());
+    EXPECT_EQ(std::vector<std::string>{to_string(handle.error) + " GET /x"},
+              log);
+  });
+}
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+TEST(ClientErrorLoggerTest, TlsSetupFailureIsLoggedOnce) {
+  // Not a TLS server, so the handshake fails. It waits for a request line in
+  // the handshake bytes, so a short read timeout lets it close quickly.
+  Server svr;
+  svr.set_read_timeout(0, 100000);
+  svr.Get("/x", [](const Request &, Response &res) {
+    res.set_content("x", "text/plain");
+  });
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  std::vector<std::string> log;
+
+  SSLClient cli(HOST, port);
+  cli.enable_server_certificate_verification(false);
+  cli.set_error_logger(record_errors(log));
+  auto res = cli.Get("/x");
+  ASSERT_FALSE(res);
+  EXPECT_EQ(std::vector<std::string>{to_string(res.error()) + " GET /x"}, log);
+
+  log.clear();
+  auto handle = cli.open_stream("GET", "/x");
+  EXPECT_FALSE(handle.is_valid());
+  EXPECT_EQ(std::vector<std::string>{to_string(handle.error) + " GET /x"}, log);
+
+  log.clear();
+  SSLClient no_ca(HOST, port);
+  no_ca.set_ca_cert_path("./no-such-ca.pem");
+  no_ca.set_error_logger(record_errors(log));
+  res = no_ca.Get("/x");
+  EXPECT_EQ(Error::SSLLoadingCerts, res.error());
+  EXPECT_EQ(std::vector<std::string>{to_string(res.error()) + " GET /x"}, log);
+}
+
+TEST(ClientErrorLoggerTest, ProxyConnectFailureIsLoggedOnce) {
+#ifndef _WIN32
+  signal(SIGPIPE, SIG_IGN);
+#endif
+  // Refused, answered with a challenge, or closed without an answer
+  for (auto response : {"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+                        "HTTP/1.1 407 Proxy Authentication Required\r\n"
+                        "Content-Length: 0\r\n\r\n",
+                        ""}) {
+    std::promise<int> port_promise;
+    auto server_thread = serve_single_response(port_promise, response);
+    SSLClient cli("example.com", 443);
+    cli.set_proxy("127.0.0.1", port_promise.get_future().get());
+    std::vector<std::string> log;
+    cli.set_error_logger(record_errors(log));
+    auto res = cli.Get("/");
+    server_thread.join();
+
+    EXPECT_EQ(std::vector<std::string>{to_string(res.error()) + " GET /"}, log)
+        << response;
+  }
+}
+#endif
+
+// RFC 9112 §6.3: a response that pairs a non-zero Content-Length with
+// Transfer-Encoding is framed ambiguously. Both read paths delimit its body by
+// the chunked coding and drop Content-Length, so a front-end that trusts
+// Content-Length would disagree about where the body ends (response
+// smuggling). The client must reject such a response.
+TEST(ClientResponseSmugglingTest, ContentLengthAndTransferEncodingRejected) {
+  for (const char *te : {"chunked", "gzip, chunked"}) {
+    auto response = std::string("HTTP/1.1 200 OK\r\n") +
+                    "Content-Length: 5\r\n" + "Transfer-Encoding: " + te +
+                    "\r\n" + "Connection: close\r\n" + "\r\n" +
+                    "5\r\nhello\r\n0\r\n\r\n";
+
+    with_single_response(response, [&](Client &cli) {
+      auto res = cli.Get("/");
+      EXPECT_FALSE(static_cast<bool>(res)) << te;
+      EXPECT_EQ(Error::Read, res.error()) << te;
+    });
+
+    with_single_response(response, [&](Client &cli) {
+      auto handle = cli.open_stream("GET", "/");
+      EXPECT_FALSE(handle.is_valid()) << te;
+      EXPECT_EQ(Error::Read, handle.error) << te;
+    });
+  }
+}
+
+// Unambiguous framing stays readable on both paths: chunked alone, and a final
+// coding other than chunked, whose body RFC 9112 §6.3 delimits by the server
+// closing the connection (unlike a request, which must be rejected).
+TEST(ClientResponseSmugglingTest, UnambiguousFramingAccepted) {
+  for (const char *response : {"HTTP/1.1 200 OK\r\n"
+                               "Transfer-Encoding: chunked\r\n"
+                               "Connection: close\r\n"
+                               "\r\n"
+                               "5\r\nhello\r\n0\r\n\r\n",
+                               "HTTP/1.1 200 OK\r\n"
+                               "Transfer-Encoding: gzip\r\n"
+                               "Connection: close\r\n"
+                               "\r\n"
+                               "hello"}) {
+    with_single_response(response, [&](Client &cli) {
+      auto res = cli.Get("/");
+      ASSERT_TRUE(static_cast<bool>(res)) << response;
+      EXPECT_EQ("hello", res->body);
+    });
+
+    with_single_response(response, [&](Client &cli) {
+      auto handle = cli.open_stream("GET", "/");
+      ASSERT_TRUE(handle.is_valid()) << response;
+      EXPECT_EQ("hello", read_all(handle));
+    });
+  }
+}
+
+// A response to HEAD, and a 204 or 304 response, carries no body, so its
+// framing headers describe nothing to read and must not be rejected.
+TEST(ClientResponseSmugglingTest, BodylessResponseNotRejected) {
+  const std::string framing = "Content-Length: 5\r\n"
+                              "Transfer-Encoding: chunked\r\n"
+                              "Connection: close\r\n"
+                              "\r\n";
+
+  with_single_response("HTTP/1.1 200 OK\r\n" + framing, [](Client &cli) {
+    EXPECT_TRUE(static_cast<bool>(cli.Head("/")));
+  });
+  with_single_response("HTTP/1.1 200 OK\r\n" + framing, [](Client &cli) {
+    EXPECT_TRUE(cli.open_stream("HEAD", "/").is_valid());
+  });
+
+  for (const char *status : {"204 No Content", "304 Not Modified"}) {
+    auto response = std::string("HTTP/1.1 ") + status + "\r\n" + framing;
+
+    with_single_response(response, [&](Client &cli) {
+      EXPECT_TRUE(static_cast<bool>(cli.Get("/"))) << status;
+    });
+    with_single_response(response, [&](Client &cli) {
+      EXPECT_TRUE(cli.open_stream("GET", "/").is_valid()) << status;
+    });
+  }
+}
+
+// RFC 9112 6.3: a response to HEAD, and a 204 or 304 response, ends with its
+// header section, so a stream opened on one has nothing to read, whatever
+// framing or coding headers it carries.
+TEST(ClientResponseSmugglingTest, BodylessResponseStreamEndsAtOnce) {
+  struct Case {
+    const char *method;
+    const char *status;
+  };
+  // A reader of the declared body reports an early close when nothing
+  // follows, and hands back what does.
+  struct Framing {
+    const char *headers;
+    const char *after;
+  };
+  for (const auto &c : {Case{"HEAD", "200 OK"}, Case{"GET", "204 No Content"},
+                        Case{"GET", "304 Not Modified"}}) {
+    for (const auto &f :
+         {Framing{"Content-Length: 5\r\n", ""},
+          Framing{"Content-Length: 5\r\n", "hello"},
+          Framing{"Transfer-Encoding: chunked\r\n", ""},
+          Framing{"Transfer-Encoding: chunked\r\n", "5\r\nhello\r\n0\r\n\r\n"},
+          // Not decoded, so a build without Brotli opens it too
+          Framing{"Content-Encoding: br\r\n", ""}}) {
+      auto response = std::string("HTTP/1.1 ") + c.status + "\r\n" + f.headers +
+                      "Connection: close\r\n"
+                      "\r\n" +
+                      f.after;
+      with_single_response(response, [&](Client &cli) {
+        auto handle = cli.open_stream(c.method, "/");
+        ASSERT_TRUE(handle.is_valid()) << c.method << ' ' << response;
+        EXPECT_EQ("", read_all(handle)) << c.method << ' ' << response;
+        EXPECT_FALSE(handle.has_read_error()) << c.method << ' ' << response;
+      });
+    }
+  }
+}
+
+// RFC 9112 6.1: Transfer-Encoding next to a Content-Length, or in an HTTP/1.0
+// response, is faulty framing, so the connection is not reused after it.
+TEST(ClientResponseSmugglingTest, FaultyTransferEncodingClosesConnection) {
+  for (const char *response : {"HTTP/1.1 200 OK\r\n"
+                               "Content-Length: 0\r\n"
+                               "Transfer-Encoding: chunked\r\n"
+                               "\r\n"
+                               "5\r\nhello\r\n0\r\n\r\n",
+                               "HTTP/1.0 200 Connection established\r\n"
+                               "Connection: keep-alive\r\n"
+                               "Transfer-Encoding: chunked\r\n"
+                               "\r\n"
+                               "5\r\nhello\r\n0\r\n\r\n"}) {
+    with_single_response(response, [&](Client &cli) {
+      cli.set_keep_alive(true);
+      auto res = cli.Get("/");
+      ASSERT_TRUE(res) << response;
+      EXPECT_EQ("hello", res->body);
+      EXPECT_FALSE(cli.is_socket_open()) << response;
+    });
+  }
+}
+
+// A payload max length of 0 means no limit, however the body is framed.
+TEST(PayloadMaxLengthZeroTest, ClientReadsChunkedAndUnframedResponse) {
+  for (const char *response : {"HTTP/1.1 200 OK\r\n"
+                               "Transfer-Encoding: chunked\r\n"
+                               "\r\n"
+                               "5\r\nhello\r\n0\r\n\r\n",
+                               "HTTP/1.1 200 OK\r\n"
+                               "Connection: close\r\n"
+                               "\r\n"
+                               "hello"}) {
+    with_single_response(response, [&](Client &cli) {
+      cli.set_payload_max_length(0);
+      auto res = cli.Get("/");
+      ASSERT_TRUE(res) << response;
+      EXPECT_EQ("hello", res->body) << response;
+    });
+  }
+}
+
+TEST(PayloadMaxLengthZeroTest, ServerReadsChunkedRequest) {
+  Server svr;
+  svr.set_payload_max_length(0);
+  svr.Post("/echo", [](const Request &req, Response &res) {
+    res.set_content(req.body, "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  auto res = cli.Post(
+      "/echo",
+      [](size_t /*offset*/, DataSink &sink) {
+        sink.write("hello", 5);
+        sink.done();
+        return true;
+      },
+      "text/plain");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("hello", res->body);
 }
 
 #ifdef CPPHTTPLIB_ZLIB_SUPPORT
@@ -15891,6 +24970,17 @@ TEST_F(OpenStreamTest, Gzip) {
                                 {{"Accept-Encoding", "gzip"}});
   EXPECT_EQ("gzip", handle.response->get_header_value("Content-Encoding"));
   EXPECT_EQ(100u * 1024u, read_all(handle).size());
+}
+
+TEST_F(OpenStreamTest, TrailersWithGzip) {
+  Client cli("127.0.0.1", port_);
+  auto handle =
+      cli.open_stream("GET", "/streamed-chunked-with-prohibited-trailer", {},
+                      {{"Accept-Encoding", "gzip"}});
+  ASSERT_TRUE(handle.is_valid());
+  EXPECT_EQ("gzip", handle.response->get_header_value("Content-Encoding"));
+  EXPECT_EQ("123456789", read_all(handle));
+  EXPECT_EQ("yes", handle.response->get_trailer_value("X-Allowed"));
 }
 #endif
 
@@ -16051,6 +25141,49 @@ TEST(SSLTest, ResponseBodyTerminatedByConnectionClose) {
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ(expected_body, res->body);
 }
+
+// Without Content-Length, the full buffer size reaches tls::read().
+TEST(SSLTest, ReadIntoBufferOverIntMax) {
+  if (sizeof(size_t) <= sizeof(int)) {
+    GTEST_SKIP() << "size_t cannot exceed INT_MAX here";
+  }
+
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+
+  svr.Get("/no-content-length", [&](const Request & /*req*/, Response &res) {
+    res.set_content_provider("text/plain",
+                             [&](size_t offset, DataSink &sink) -> bool {
+                               if (offset == 0) { sink.write("Hello", 5); }
+                               sink.done();
+                               return true;
+                             });
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  auto listen_thread = std::thread([&svr] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    listen_thread.join();
+  });
+  svr.wait_until_ready();
+
+  SSLClient cli(HOST, port);
+  cli.enable_server_certificate_verification(false);
+
+  auto handle = cli.open_stream("GET", "/no-content-length");
+  ASSERT_TRUE(handle.is_valid()) << to_string(handle.error);
+
+  const auto len = static_cast<size_t>((std::numeric_limits<int>::max)()) + 1;
+  std::unique_ptr<char[]> buf(new char[len]);
+  std::string body;
+  ssize_t n;
+  while ((n = handle.read(buf.get(), len)) > 0) {
+    body.append(buf.get(), static_cast<size_t>(n));
+  }
+  EXPECT_EQ(0, n);
+  EXPECT_EQ("Hello", body);
+}
 #endif // CPPHTTPLIB_SSL_ENABLED
 
 //==============================================================================
@@ -16134,7 +25267,7 @@ static void test_compression_parity(const std::string &original,
   // Non-streaming
   {
     auto res = cli.Get(path);
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::OK_200, res->status);
     EXPECT_EQ(original, res->body);
   }
@@ -16273,6 +25406,17 @@ TEST_F(StreamApiTest, GetWithParams) {
   ASSERT_TRUE(result.is_valid());
   EXPECT_TRUE(read_body(result).find("foo=bar") != std::string::npos);
 }
+
+#ifdef CPPHTTPLIB_ZLIB_SUPPORT
+TEST_F(StreamApiTest, GetCompressedWithNoPayloadLimit) {
+  httplib::Client cli(HOST, PORT);
+  cli.set_payload_max_length(0);
+  auto result = httplib::stream::Get(cli, "/hello");
+  ASSERT_TRUE(result.is_valid());
+  EXPECT_FALSE(result.get_header_value("Content-Encoding").empty());
+  EXPECT_EQ("Hello World!", read_body(result));
+}
+#endif
 
 TEST_F(StreamApiTest, GetConnectionError) {
   httplib::Client cli(HOST, 9999);
@@ -16668,6 +25812,16 @@ TEST(ETagTest, StaticFileETagAndIfNoneMatch) {
   ASSERT_TRUE(res5);
   EXPECT_EQ(304, res5->status);
 
+  // The ETag list split over several field lines: RFC 9110 Section 5.3 makes
+  // that equivalent to the single comma-separated list above, so the match on
+  // the second line must still be found.
+  Headers h6;
+  h6.emplace("If-None-Match", "W/\"other\"");
+  h6.emplace("If-None-Match", etag);
+  auto res6 = cli.Get("/static/etag_testfile.txt", h6);
+  ASSERT_TRUE(res6);
+  EXPECT_EQ(304, res6->status);
+
   svr.stop();
   t.join();
   std::remove(fname);
@@ -16686,7 +25840,7 @@ TEST(ETagTest, StaticFileETagIfNoneMatchStarNotFound) {
   // Send If-None-Match: * to a non-existent file
   Headers h = {{"If-None-Match", "*"}};
   auto res = cli.Get("/static/etag_testfile_notfound.txt", h);
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(404, res->status);
 
   svr.stop();
@@ -17219,231 +26373,6 @@ TEST(ETagTest, NegativeFileModificationTime) {
 }
 
 //==============================================================================
-// SSE Parsing Tests
-//==============================================================================
-
-class SSEParsingTest : public ::testing::Test {
-protected:
-  // Test helper that mimics SSE parsing behavior
-  static bool parse_sse_line(const std::string &line, sse::SSEMessage &msg,
-                             int &retry_ms) {
-    // Blank line signals end of event
-    if (line.empty() || line == "\r") { return true; }
-
-    // Lines starting with ':' are comments (ignored)
-    if (!line.empty() && line[0] == ':') { return false; }
-
-    // Find the colon separator
-    auto colon_pos = line.find(':');
-    if (colon_pos == std::string::npos) {
-      // Line with no colon is treated as field name with empty value
-      return false;
-    }
-
-    std::string field = line.substr(0, colon_pos);
-    std::string value;
-
-    // Value starts after colon, skip optional single space
-    if (colon_pos + 1 < line.size()) {
-      size_t value_start = colon_pos + 1;
-      if (line[value_start] == ' ') { value_start++; }
-      value = line.substr(value_start);
-      // Remove trailing \r if present
-      if (!value.empty() && value.back() == '\r') { value.pop_back(); }
-    }
-
-    // Handle known fields
-    if (field == "event") {
-      msg.event = value;
-    } else if (field == "data") {
-      // Multiple data lines are concatenated with newlines
-      if (!msg.data.empty()) { msg.data += "\n"; }
-      msg.data += value;
-    } else if (field == "id") {
-      // Empty id is valid (clears the last event ID)
-      msg.id = value;
-    } else if (field == "retry") {
-      // Parse retry interval in milliseconds
-      {
-        int v = 0;
-        auto res =
-            detail::from_chars(value.data(), value.data() + value.size(), v);
-        if (res.ec == std::errc{}) { retry_ms = v; }
-      }
-    }
-    // Unknown fields are ignored per SSE spec
-
-    return false;
-  }
-};
-
-// Test: Single-line data
-TEST_F(SSEParsingTest, SingleLineData) {
-  sse::SSEMessage msg;
-  int retry_ms = 3000;
-
-  EXPECT_FALSE(parse_sse_line("data: hello", msg, retry_ms));
-  EXPECT_EQ(msg.data, "hello");
-  EXPECT_EQ(msg.event, "message");
-
-  // Blank line ends event
-  EXPECT_TRUE(parse_sse_line("", msg, retry_ms));
-}
-
-// Test: Multi-line data
-TEST_F(SSEParsingTest, MultiLineData) {
-  sse::SSEMessage msg;
-  int retry_ms = 3000;
-
-  EXPECT_FALSE(parse_sse_line("data: line1", msg, retry_ms));
-  EXPECT_FALSE(parse_sse_line("data: line2", msg, retry_ms));
-  EXPECT_FALSE(parse_sse_line("data: line3", msg, retry_ms));
-  EXPECT_EQ(msg.data, "line1\nline2\nline3");
-}
-
-// Test: Custom event types
-TEST_F(SSEParsingTest, CustomEventType) {
-  sse::SSEMessage msg;
-  int retry_ms = 3000;
-
-  EXPECT_FALSE(parse_sse_line("event: update", msg, retry_ms));
-  EXPECT_FALSE(parse_sse_line("data: payload", msg, retry_ms));
-  EXPECT_EQ(msg.event, "update");
-  EXPECT_EQ(msg.data, "payload");
-}
-
-// Test: Event ID handling
-TEST_F(SSEParsingTest, EventIdHandling) {
-  sse::SSEMessage msg;
-  int retry_ms = 3000;
-
-  EXPECT_FALSE(parse_sse_line("id: 12345", msg, retry_ms));
-  EXPECT_FALSE(parse_sse_line("data: test", msg, retry_ms));
-  EXPECT_EQ(msg.id, "12345");
-}
-
-// Test: Empty event ID (clears last event ID)
-TEST_F(SSEParsingTest, EmptyEventId) {
-  sse::SSEMessage msg;
-  msg.id = "previous";
-  int retry_ms = 3000;
-
-  EXPECT_FALSE(parse_sse_line("id:", msg, retry_ms));
-  EXPECT_EQ(msg.id, "");
-}
-
-// Test: Retry field parsing
-TEST_F(SSEParsingTest, RetryFieldParsing) {
-  sse::SSEMessage msg;
-  int retry_ms = 3000;
-
-  EXPECT_FALSE(parse_sse_line("retry: 5000", msg, retry_ms));
-  EXPECT_EQ(retry_ms, 5000);
-}
-
-// Test: Invalid retry value
-TEST_F(SSEParsingTest, InvalidRetryValue) {
-  sse::SSEMessage msg;
-  int retry_ms = 3000;
-
-  EXPECT_FALSE(parse_sse_line("retry: invalid", msg, retry_ms));
-  EXPECT_EQ(retry_ms, 3000); // Unchanged
-}
-
-// Test: Comments (lines starting with :)
-TEST_F(SSEParsingTest, CommentsIgnored) {
-  sse::SSEMessage msg;
-  int retry_ms = 3000;
-
-  EXPECT_FALSE(parse_sse_line(": this is a comment", msg, retry_ms));
-  EXPECT_EQ(msg.data, "");
-  EXPECT_EQ(msg.event, "message");
-}
-
-// Test: Colon in value
-TEST_F(SSEParsingTest, ColonInValue) {
-  sse::SSEMessage msg;
-  int retry_ms = 3000;
-
-  EXPECT_FALSE(parse_sse_line("data: hello:world:test", msg, retry_ms));
-  EXPECT_EQ(msg.data, "hello:world:test");
-}
-
-// Test: Line with no colon (field name only)
-TEST_F(SSEParsingTest, FieldNameOnly) {
-  sse::SSEMessage msg;
-  int retry_ms = 3000;
-
-  // According to SSE spec, this is treated as field name with empty value
-  EXPECT_FALSE(parse_sse_line("data", msg, retry_ms));
-  // Since we don't recognize "data" without colon, data should be empty
-  EXPECT_EQ(msg.data, "");
-}
-
-// Test: Trailing \r handling
-TEST_F(SSEParsingTest, TrailingCarriageReturn) {
-  sse::SSEMessage msg;
-  int retry_ms = 3000;
-
-  EXPECT_FALSE(parse_sse_line("data: hello\r", msg, retry_ms));
-  EXPECT_EQ(msg.data, "hello");
-}
-
-// Test: Unknown fields ignored
-TEST_F(SSEParsingTest, UnknownFieldsIgnored) {
-  sse::SSEMessage msg;
-  int retry_ms = 3000;
-
-  EXPECT_FALSE(parse_sse_line("unknown: value", msg, retry_ms));
-  EXPECT_EQ(msg.data, "");
-  EXPECT_EQ(msg.event, "message");
-}
-
-// Test: Space after colon is optional
-TEST_F(SSEParsingTest, SpaceAfterColonOptional) {
-  sse::SSEMessage msg1, msg2;
-  int retry_ms = 3000;
-
-  EXPECT_FALSE(parse_sse_line("data: hello", msg1, retry_ms));
-  EXPECT_FALSE(parse_sse_line("data:hello", msg2, retry_ms));
-  EXPECT_EQ(msg1.data, "hello");
-  EXPECT_EQ(msg2.data, "hello");
-}
-
-// Test: SSEMessage clear
-TEST_F(SSEParsingTest, MessageClear) {
-  sse::SSEMessage msg;
-  msg.event = "custom";
-  msg.data = "some data";
-  msg.id = "123";
-
-  msg.clear();
-
-  EXPECT_EQ(msg.event, "message");
-  EXPECT_EQ(msg.data, "");
-  EXPECT_EQ(msg.id, "");
-}
-
-// Test: Complete event parsing
-TEST_F(SSEParsingTest, CompleteEventParsing) {
-  sse::SSEMessage msg;
-  int retry_ms = 3000;
-
-  EXPECT_FALSE(parse_sse_line("event: notification", msg, retry_ms));
-  EXPECT_FALSE(parse_sse_line("id: evt-42", msg, retry_ms));
-  EXPECT_FALSE(parse_sse_line("data: {\"type\":\"alert\"}", msg, retry_ms));
-  EXPECT_FALSE(parse_sse_line("retry: 1000", msg, retry_ms));
-
-  // Blank line ends event
-  EXPECT_TRUE(parse_sse_line("", msg, retry_ms));
-
-  EXPECT_EQ(msg.event, "notification");
-  EXPECT_EQ(msg.id, "evt-42");
-  EXPECT_EQ(msg.data, "{\"type\":\"alert\"}");
-  EXPECT_EQ(retry_ms, 1000);
-}
-
-//==============================================================================
 // Integration Tests with Server
 //==============================================================================
 
@@ -17537,6 +26466,284 @@ protected:
   int port_ = 0;
 };
 
+//==============================================================================
+// SSE Parsing Tests
+//==============================================================================
+
+class SSEParsingTest : public SSEIntegrationTest {
+protected:
+  // Feeds a raw event stream to SSEClient and returns the dispatched messages.
+  // A trailing sentinel event tells when the whole stream has been parsed.
+  std::vector<sse::SSEMessage> parse(const std::string &stream) {
+    auto body = stream + "event: end\ndata: end\n\n";
+    server_->Get("/parse", [body](const Request &, Response &res) {
+      res.set_content(body, "text/event-stream");
+    });
+    return collect("/parse");
+  }
+
+  // Runs SSEClient against path until an "end" event arrives and returns the
+  // messages dispatched before it
+  std::vector<sse::SSEMessage> collect(const std::string &path) {
+    Client client(HOST, get_port());
+    sse::SSEClient sse(client, path);
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::vector<sse::SSEMessage> messages;
+    auto done = false;
+
+    sse.on_message([&](const sse::SSEMessage &msg) {
+      std::lock_guard<std::mutex> lock(mutex);
+      // Ignore a replay from a reconnect that races with stop()
+      if (!done) { messages.push_back(msg); }
+    });
+    sse.on_event("end", [&](const sse::SSEMessage &) {
+      std::lock_guard<std::mutex> lock(mutex);
+      done = true;
+      cv.notify_all();
+    });
+    sse.set_reconnect_interval(100);
+    sse.start_async();
+
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      cv.wait_for(lock, std::chrono::seconds(5), [&] { return done; });
+    }
+    sse.stop();
+
+    EXPECT_TRUE(done);
+    return messages;
+  }
+};
+
+TEST_F(SSEParsingTest, SingleLineData) {
+  auto msgs = parse("data: hello\n\n");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].data, "hello");
+  EXPECT_EQ(msgs[0].event, "message");
+}
+
+TEST_F(SSEParsingTest, MultiLineData) {
+  auto msgs = parse("data: line1\ndata: line2\ndata: line3\n\n");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].data, "line1\nline2\nline3");
+}
+
+TEST_F(SSEParsingTest, CustomEventType) {
+  auto msgs = parse("event: update\ndata: payload\n\n");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].event, "update");
+  EXPECT_EQ(msgs[0].data, "payload");
+}
+
+TEST_F(SSEParsingTest, EventIdHandling) {
+  auto msgs = parse("id: 12345\ndata: test\n\n");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].id, "12345");
+}
+
+TEST_F(SSEParsingTest, EmptyEventId) {
+  auto msgs = parse("id:\ndata: test\n\n");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].id, "");
+}
+
+TEST_F(SSEParsingTest, CommentsIgnored) {
+  auto msgs = parse(": this is a comment\ndata: hello\n\n");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].data, "hello");
+  EXPECT_EQ(msgs[0].event, "message");
+}
+
+TEST_F(SSEParsingTest, ColonInValue) {
+  auto msgs = parse("data: hello:world:test\n\n");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].data, "hello:world:test");
+}
+
+TEST_F(SSEParsingTest, FieldNameOnly) {
+  // A line without a colon is a field name with an empty value
+  auto msgs = parse("data\n\n");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].data, "");
+}
+
+TEST_F(SSEParsingTest, TrailingCarriageReturn) {
+  auto msgs = parse("event: update\r\ndata: hello\r\n\r\n");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].event, "update");
+  EXPECT_EQ(msgs[0].data, "hello");
+}
+
+TEST_F(SSEParsingTest, FieldNameOnlyWithCarriageReturn) {
+  auto msgs = parse("data\r\n\r\n");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].data, "");
+}
+
+TEST_F(SSEParsingTest, CarriageReturnLineEnding) {
+  auto msgs = parse("event: update\rdata: hello\r\r");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].event, "update");
+  EXPECT_EQ(msgs[0].data, "hello");
+}
+
+TEST_F(SSEParsingTest, LineEndingSplitAcrossChunks) {
+  // Chunk boundaries fall inside every \r\n and right before the first one
+  std::vector<std::string> chunks = {"event: update", "\r", "\ndata: hello\r",
+                                     "\n\r", "\nevent: end\ndata: end\n\n"};
+  server_->Get("/split", [chunks](const Request &, Response &res) {
+    auto i = std::make_shared<size_t>(0);
+    res.set_chunked_content_provider(
+        "text/event-stream", [chunks, i](size_t /*offset*/, DataSink &sink) {
+          if (*i == chunks.size()) {
+            sink.done();
+          } else {
+            sink.write(chunks[*i].data(), chunks[*i].size());
+            (*i)++;
+          }
+          return true;
+        });
+  });
+
+  auto msgs = collect("/split");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].event, "update");
+  EXPECT_EQ(msgs[0].data, "hello");
+}
+
+TEST_F(SSEParsingTest, LeadingByteOrderMarkIgnored) {
+  // Only a BOM at the start of the stream is ignored
+  auto msgs = parse("\xEF\xBB\xBF"
+                    "data: first\n\n"
+                    "\xEF\xBB\xBF"
+                    "data: second\n\n");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].data, "first");
+}
+
+TEST_F(SSEParsingTest, UnknownFieldsIgnored) {
+  auto msgs = parse("unknown: value\ndata: hello\n\n");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].data, "hello");
+  EXPECT_EQ(msgs[0].event, "message");
+}
+
+TEST_F(SSEParsingTest, SpaceAfterColonOptional) {
+  auto msgs = parse("data: hello\n\ndata:hello\n\n");
+  ASSERT_EQ(msgs.size(), 2u);
+  EXPECT_EQ(msgs[0].data, "hello");
+  EXPECT_EQ(msgs[1].data, "hello");
+}
+
+TEST_F(SSEParsingTest, EventWithoutDataResetsEventType) {
+  // An event without data is not dispatched, and its type must not leak
+  // into the next event
+  auto msgs = parse("event: update\n\ndata: hello\n\n");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].event, "message");
+  EXPECT_EQ(msgs[0].data, "hello");
+}
+
+TEST_F(SSEParsingTest, EmptyEventTypeIsMessage) {
+  // Also when the empty field replaces an earlier type
+  auto msgs = parse("event:\ndata: a\n\nevent: update\nevent:\ndata: b\n\n");
+  ASSERT_EQ(msgs.size(), 2u);
+  EXPECT_EQ(msgs[0].event, "message");
+  EXPECT_EQ(msgs[1].event, "message");
+}
+
+TEST_F(SSEParsingTest, EventWithoutDataUpdatesLastEventId) {
+  // The first connection sends only an id; the second echoes back the
+  // Last-Event-ID it was reconnected with
+  std::atomic<int> connection_count{0};
+  server_->Get("/id-only", [&](const Request &req, Response &res) {
+    if (connection_count++ == 0) {
+      res.set_content("id: 42\n\n", "text/event-stream");
+    } else {
+      res.set_content("data: " + req.get_header_value("Last-Event-ID") +
+                          "\n\nevent: end\ndata: end\n\n",
+                      "text/event-stream");
+    }
+  });
+
+  auto msgs = collect("/id-only");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].data, "42");
+}
+
+TEST_F(SSEParsingTest, EmptyEventIdClearsLastEventId) {
+  // The first connection sets an id and then clears it with an empty one; the
+  // second reports whether it was reconnected with a Last-Event-ID
+  std::atomic<int> connection_count{0};
+  server_->Get("/id-clear", [&](const Request &req, Response &res) {
+    if (connection_count++ == 0) {
+      res.set_content("id: 1\ndata: first\n\nid:\ndata: second\n\n",
+                      "text/event-stream");
+    } else {
+      res.set_content(
+          std::string("data: ") +
+              (req.has_header("Last-Event-ID") ? "sent" : "not sent") +
+              "\n\nevent: end\ndata: end\n\n",
+          "text/event-stream");
+    }
+  });
+
+  auto msgs = collect("/id-clear");
+  ASSERT_EQ(msgs.size(), 3u);
+  EXPECT_EQ(msgs[0].id, "1");
+  EXPECT_EQ(msgs[1].id, "");
+  EXPECT_EQ(msgs[2].data, "not sent");
+}
+
+TEST_F(SSEParsingTest, UnsendableEventIdKeepsLastEventId) {
+  // The first connection sets an id and then sends ids that cannot be carried
+  // in a header; the second echoes back the Last-Event-ID it was reconnected
+  // with
+  std::atomic<int> connection_count{0};
+  server_->Get("/id-unsendable", [&](const Request &req, Response &res) {
+    if (connection_count++ == 0) {
+      res.set_content(std::string("id: 42\n\nid: a") + '\0' +
+                          "b\n\nid: \x01\n\nid:  7\n\nid: 7 \n\n",
+                      "text/event-stream");
+    } else {
+      res.set_content("data: " + req.get_header_value("Last-Event-ID") +
+                          "\n\nevent: end\ndata: end\n\n",
+                      "text/event-stream");
+    }
+  });
+
+  auto msgs = collect("/id-unsendable");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].data, "42");
+}
+
+TEST_F(SSEParsingTest, CompleteEventParsing) {
+  auto msgs = parse("event: notification\nid: evt-42\n"
+                    "data: {\"type\":\"alert\"}\nretry: 1000\n\n");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].event, "notification");
+  EXPECT_EQ(msgs[0].id, "evt-42");
+  EXPECT_EQ(msgs[0].data, "{\"type\":\"alert\"}");
+}
+
+TEST(SSEMessageTest, Clear) {
+  sse::SSEMessage msg;
+  msg.event = "custom";
+  msg.data = "some data";
+  msg.id = "123";
+
+  msg.clear();
+
+  EXPECT_EQ(msg.event, "message");
+  EXPECT_EQ(msg.data, "");
+  EXPECT_EQ(msg.id, "");
+}
+
+//==============================================================================
+// SSE Integration Tests
+//==============================================================================
+
 // Test: Successful connection and on_open callback
 TEST_F(SSEIntegrationTest, SuccessfulConnection) {
   // Add a simple endpoint that sends one event and closes
@@ -17576,6 +26783,69 @@ TEST_F(SSEIntegrationTest, SuccessfulConnection) {
 
   EXPECT_TRUE(open_called.load());
   EXPECT_TRUE(message_received.load());
+}
+
+TEST_F(SSEIntegrationTest, TooLongEventEndsTheConnection) {
+  // A data line that never ends.
+  server_->Get("/endless-line", [](const Request &, Response &res) {
+    res.set_chunked_content_provider(
+        "text/event-stream", [](size_t offset, DataSink &sink) {
+          if (offset == 0) { sink.write("data: ", 6); }
+          std::string chunk(64 * 1024, 'A');
+          return sink.write(chunk.data(), chunk.size());
+        });
+  });
+
+  Client client("localhost", get_port());
+  sse::SSEClient sse(client, "/endless-line");
+  std::atomic<bool> too_long{false};
+  sse.on_error([&](Error err) {
+    if (err == Error::ExceedMaxPayloadSize) { too_long = true; }
+  });
+  sse.set_max_reconnect_attempts(1);
+  sse.start_async();
+
+  for (int i = 0; i < 500 && !too_long; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  sse.stop();
+  EXPECT_TRUE(too_long);
+}
+
+TEST_F(SSEIntegrationTest, PayloadLimitDoesNotEndTheStream) {
+  // Far more in all than the client's payload limit below.
+  server_->Get("/many-events", [](const Request &, Response &res) {
+    res.set_chunked_content_provider(
+        "text/event-stream", [](size_t offset, DataSink &sink) {
+          if (offset == 0) {
+            std::string events;
+            for (int i = 0; i < 1000; i++) {
+              events += "data: message\n\n";
+            }
+            sink.write(events.data(), events.size());
+          }
+          return false;
+        });
+  });
+
+  Client client("localhost", get_port());
+  client.set_payload_max_length(1024);
+  sse::SSEClient sse(client, "/many-events");
+  std::atomic<int> messages{0};
+  std::atomic<bool> too_large{false};
+  sse.on_message([&](const sse::SSEMessage &) { messages++; });
+  sse.on_error([&](Error err) {
+    if (err == Error::ExceedMaxPayloadSize) { too_large = true; }
+  });
+  sse.set_max_reconnect_attempts(1);
+  sse.start_async();
+
+  for (int i = 0; i < 500 && messages < 1000; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  sse.stop();
+  EXPECT_GE(messages.load(), 1000);
+  EXPECT_FALSE(too_large);
 }
 
 // Test: on_message callback
@@ -17703,21 +26973,59 @@ TEST_F(SSEIntegrationTest, LastEventIdHeader) {
   EXPECT_EQ(sse.last_event_id(), "evt-123");
 }
 
+// Test: last_event_id() read from another thread while start_async() runs
+TEST_F(SSEIntegrationTest, LastEventIdWhileRunning) {
+  // Ids of every length up to 200, so the stored id keeps changing size
+  server_->Get("/many-ids", [](const Request &, Response &res) {
+    res.set_chunked_content_provider(
+        "text/event-stream", [](size_t offset, DataSink &sink) {
+          if (offset == 0) {
+            std::string events;
+            for (size_t i = 0; i < 2000; i++) {
+              events += "id: " + std::string(1 + i % 200, 'a') + "\n";
+              events += "data: x\n\n";
+            }
+            events += "id: end\ndata: x\n\n";
+            sink.write(events.data(), events.size());
+          }
+          return false;
+        });
+  });
+
+  Client client("localhost", get_port());
+  sse::SSEClient sse(client, "/many-ids");
+  // Wait out the rest of the test rather than replay the stream
+  sse.set_reconnect_interval(10000);
+  sse.set_max_reconnect_attempts(1);
+  sse.start_async();
+
+  auto well_formed = true;
+  std::string id;
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (id != "end" && std::chrono::steady_clock::now() < deadline) {
+    id = sse.last_event_id();
+    if (id != "end" && id.find_first_not_of('a') != std::string::npos) {
+      well_formed = false;
+    }
+  }
+  sse.stop();
+
+  EXPECT_TRUE(well_formed);
+  EXPECT_EQ(sse.last_event_id(), "end");
+}
+
 // Test: Manual stop
 TEST_F(SSEIntegrationTest, ManualStop) {
-  // Endpoint that sends one event and stays open briefly
-  std::atomic<bool> handler_running{true};
-
-  server_->Get("/stay-open", [&handler_running](const Request &,
-                                                Response &res) {
+  // Endpoint that sends one event and stays open briefly. The server outlives
+  // this test body, so the provider uses the fixture's flag, not a local.
+  server_->Get("/stay-open", [this](const Request &, Response &res) {
     res.set_chunked_content_provider(
-        "text/event-stream", [&handler_running](size_t offset, DataSink &sink) {
+        "text/event-stream", [this](size_t offset, DataSink &sink) {
           if (offset == 0) {
             std::string event = "data: connected\n\n";
             sink.write(event.data(), event.size());
           }
-          // Keep connection open while handler_running is true
-          for (int i = 0; i < 10 && handler_running.load(); ++i) {
+          for (int i = 0; i < 10 && !stop_server_.load(); ++i) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
           }
           return false;
@@ -17742,12 +27050,84 @@ TEST_F(SSEIntegrationTest, ManualStop) {
   EXPECT_TRUE(sse.is_connected());
 
   // Signal handler to stop
-  handler_running.store(false);
+  stop_server_.store(true);
 
   // Stop SSE client
   sse.stop();
   EXPECT_FALSE(sse.is_connected());
 }
+
+// Sends one event, then nothing until stop is set
+static Server::Handler idle_event_stream(std::atomic<bool> &stop) {
+  return [&stop](const Request &, Response &res) {
+    res.set_chunked_content_provider(
+        "text/event-stream", [&stop](size_t offset, DataSink &sink) {
+          if (offset == 0) {
+            std::string event = "data: hello\n\n";
+            sink.write(event.data(), event.size());
+          }
+          while (!stop.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          }
+          return false;
+        });
+  };
+}
+
+// Both stop() and the destructor end a read blocked on /idle-stream promptly
+static void check_stop_interrupts_blocked_read(Client &client) {
+  client.set_read_timeout(30, 0);
+
+  for (auto by_destructor : {false, true}) {
+    std::atomic<bool> received{false};
+    std::chrono::steady_clock::time_point start;
+    {
+      sse::SSEClient sse(client, "/idle-stream");
+      sse.on_message([&](const sse::SSEMessage &) { received.store(true); });
+      sse.start_async();
+
+      for (int i = 0; i < 500 && !received.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      ASSERT_TRUE(received.load());
+      // Let the client block in the next read
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+      start = std::chrono::steady_clock::now();
+      if (!by_destructor) { sse.stop(); }
+    }
+    EXPECT_LT(std::chrono::steady_clock::now() - start,
+              std::chrono::seconds(2));
+  }
+}
+
+TEST_F(SSEIntegrationTest, StopInterruptsBlockedRead) {
+  server_->Get("/idle-stream", idle_event_stream(stop_server_));
+
+  Client client("localhost", get_port());
+  check_stop_interrupts_blocked_read(client);
+}
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+TEST(SSEClientSSLTest, StopInterruptsBlockedRead) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  std::atomic<bool> done{false};
+  svr.Get("/idle-stream", idle_event_stream(done));
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    done.store(true);
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  Client client("https://localhost:" + std::to_string(port));
+  client.enable_server_certificate_verification(false);
+  check_stop_interrupts_blocked_read(client);
+}
+#endif
 
 // Test: SSEClient with custom headers
 TEST_F(SSEIntegrationTest, CustomHeaders) {
@@ -17852,6 +27232,45 @@ TEST_F(SSEIntegrationTest, MultiLineDataIntegration) {
   EXPECT_EQ(received_data, "line1\nline2\nline3");
 }
 
+TEST_F(SSEIntegrationTest, EmptyDataLines) {
+  server_->Get("/empty-data-lines", [](const Request &, Response &res) {
+    res.set_chunked_content_provider("text/event-stream", [](size_t offset,
+                                                             DataSink &sink) {
+      if (offset == 0) {
+        const std::string events = "data:\n\ndata:\ndata: hello\n\ndata\n\n";
+        sink.write(events.data(), events.size());
+      }
+      return false;
+    });
+  });
+
+  Client client("localhost", get_port());
+  sse::SSEClient sse(client, "/empty-data-lines");
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::vector<std::string> received;
+
+  sse.on_message([&](const sse::SSEMessage &msg) {
+    std::lock_guard<std::mutex> lock(mutex);
+    received.push_back(msg.data);
+    cv.notify_all();
+  });
+  sse.set_max_reconnect_attempts(1);
+  sse.start_async();
+
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait_for(lock, std::chrono::seconds(2),
+                [&] { return received.size() >= 3; });
+  }
+  sse.stop();
+
+  ASSERT_GE(received.size(), 3u);
+  EXPECT_EQ(received[0], "");
+  EXPECT_EQ(received[1], "\nhello");
+  EXPECT_EQ(received[2], "");
+}
+
 // Test: Auto-reconnect after server disconnection
 TEST_F(SSEIntegrationTest, AutoReconnectAfterDisconnect) {
   std::atomic<int> connection_count{0};
@@ -17890,6 +27309,118 @@ TEST_F(SSEIntegrationTest, AutoReconnectAfterDisconnect) {
   EXPECT_GE(connection_count.load(), 2);
   // Should have received messages from multiple connections
   EXPECT_GE(message_count.load(), 2);
+}
+
+TEST_F(SSEIntegrationTest, StreamEndingAtConnectionCloseIsNotAnError) {
+  std::atomic<int> connection_count{0};
+
+  // Neither Content-Length nor chunked: the close ends the stream
+  server_->Get("/close-delimited",
+               [&connection_count](const Request &, Response &res) {
+                 connection_count.fetch_add(1);
+                 res.set_content_provider(
+                     "text/event-stream", [](size_t offset, DataSink &sink) {
+                       if (offset == 0) {
+                         std::string event = "data: hello\n\n";
+                         sink.write(event.data(), event.size());
+                       } else {
+                         sink.done();
+                       }
+                       return true;
+                     });
+               });
+
+  Client client("localhost", get_port());
+  sse::SSEClient sse(client, "/close-delimited");
+
+  std::atomic<int> error_count{0};
+  sse.on_error([&error_count](Error) { error_count.fetch_add(1); });
+
+  sse.set_reconnect_interval(100);
+  sse.start_async();
+
+  for (int i = 0; i < 500 && connection_count.load() < 2; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  sse.stop();
+
+  // Reconnects as after any end of the stream, but reports no error
+  EXPECT_GE(connection_count.load(), 2);
+  EXPECT_EQ(0, error_count.load());
+}
+
+// Test: A retry field that is not all ASCII digits is ignored
+TEST_F(SSEIntegrationTest, NonDigitRetryFieldIgnored) {
+  std::atomic<int> connection_count{0};
+
+  server_->Get("/bad-retry",
+               [&connection_count](const Request &, Response &res) {
+                 connection_count.fetch_add(1);
+                 res.set_chunked_content_provider(
+                     "text/event-stream", [](size_t offset, DataSink &sink) {
+                       if (offset == 0) {
+                         std::string event = "retry: -1\ndata: hello\n\n";
+                         sink.write(event.data(), event.size());
+                       }
+                       return false;
+                     });
+               });
+
+  Client client("localhost", get_port());
+  sse::SSEClient sse(client, "/bad-retry");
+
+  sse.set_reconnect_interval(10000);
+  sse.start_async();
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  sse.stop();
+
+  EXPECT_EQ(connection_count.load(), 1);
+}
+
+// Test: A retry field of all ASCII digits sets the reconnection time
+TEST_F(SSEIntegrationTest, DigitRetryFieldApplied) {
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::vector<std::chrono::steady_clock::time_point> connected_at;
+
+  server_->Get("/zero-retry", [&](const Request &, Response &res) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      connected_at.push_back(std::chrono::steady_clock::now());
+      cv.notify_all();
+    }
+    res.set_chunked_content_provider(
+        "text/event-stream", [](size_t offset, DataSink &sink) {
+          if (offset == 0) {
+            std::string event = "retry: 0\ndata: hello\n\n";
+            sink.write(event.data(), event.size());
+          }
+          return false;
+        });
+  });
+
+  Client client("localhost", get_port());
+  sse::SSEClient sse(client, "/zero-retry");
+
+  sse.set_reconnect_interval(10000);
+  sse.start_async();
+
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait_for(lock, std::chrono::seconds(5),
+                [&] { return connected_at.size() >= 2; });
+  }
+  sse.stop();
+
+  // The server-supplied interval is applied, but never below 100ms, so
+  // "retry: 0" does not cause a busy reconnect loop
+  std::lock_guard<std::mutex> lock(mutex);
+  ASSERT_GE(connected_at.size(), 2u);
+  auto interval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         connected_at[1] - connected_at[0])
+                         .count();
+  EXPECT_GE(interval_ms, 100);
 }
 
 // Test: Last-Event-ID sent on reconnect
@@ -18096,7 +27627,7 @@ TEST(ZipBombProtectionTest, DecompressedSizeExceedsLimit) {
       cli.Post("/test", headers, compressed_data, "application/octet-stream");
 
   // Server should reject because decompressed size (8KB) exceeds limit (1KB)
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::PayloadTooLarge_413, res->status);
 }
 #endif
@@ -18178,8 +27709,7 @@ TEST(SSLClientServerTest, UpdateCertsSetsClientCAList) {
   ASSERT_TRUE(ssl_ctx != nullptr);
 
   STACK_OF(X509_NAME) *ca_list_before = SSL_CTX_get_client_CA_list(ssl_ctx);
-  int count_before = ca_list_before ? sk_X509_NAME_num(ca_list_before) : 0;
-  EXPECT_EQ(0, count_before);
+  EXPECT_TRUE(!ca_list_before || sk_X509_NAME_num(ca_list_before) == 0);
 
   // Now update with client CA (PEM string)
   std::string cert_pem, key_pem, ca_pem;
@@ -18194,7 +27724,7 @@ TEST(SSLClientServerTest, UpdateCertsSetsClientCAList) {
   // Now client CA list should be set
   STACK_OF(X509_NAME) *ca_list_after = SSL_CTX_get_client_CA_list(ssl_ctx);
   ASSERT_TRUE(ca_list_after != nullptr);
-  EXPECT_GT(sk_X509_NAME_num(ca_list_after), 0);
+  EXPECT_TRUE(sk_X509_NAME_num(ca_list_after) > 0);
 }
 
 TEST(SSLClientServerTest, FilePathConstructorSetsClientCAList) {
@@ -18208,7 +27738,7 @@ TEST(SSLClientServerTest, FilePathConstructorSetsClientCAList) {
 
   STACK_OF(X509_NAME) *ca_list = SSL_CTX_get_client_CA_list(ssl_ctx);
   ASSERT_TRUE(ca_list != nullptr);
-  EXPECT_GT(sk_X509_NAME_num(ca_list), 0);
+  EXPECT_TRUE(sk_X509_NAME_num(ca_list) > 0);
 }
 
 #endif
@@ -18248,9 +27778,10 @@ TEST(SSLClientServerTest, CustomizeServerSSLCtxMbedTLS) {
       if (mbedtls_x509_crt_parse_file(&own_cert, SERVER_CERT_FILE) != 0) {
         return false;
       }
-      // Load server private key
+      // Load server private key.
+      // Mbed TLS 3.x takes an RNG callback here; 2.x and 4.x do not.
       if (mbedtls_pk_parse_keyfile(&own_key, SERVER_PRIVATE_KEY_FILE, nullptr
-#if MBEDTLS_VERSION_MAJOR >= 3
+#if MBEDTLS_VERSION_MAJOR == 3
                                    ,
                                    mbedtls_ctr_drbg_random, nullptr
 #endif
@@ -18308,7 +27839,7 @@ TEST(SSLClientServerTest, CustomizeServerSSLCtxMbedTLS) {
   cli.set_connection_timeout(30);
 
   auto res = cli.Get("/test");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   ASSERT_EQ(StatusCode::OK_200, res->status);
 }
 
@@ -18339,7 +27870,7 @@ TEST(SSLClientServerTest, DestructWithLiveKeepAliveSessionMbedTLS) {
     cli.set_keep_alive(true);
 
     auto res = cli.Get("/test");
-    ASSERT_TRUE(res);
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     ASSERT_EQ(StatusCode::OK_200, res->status);
     // cli is destructed here with the keep-alive SSL session still open.
   }
@@ -18366,8 +27897,9 @@ TEST(WebSocketTest, RSVBitsMustBeZero) {
     ws::Opcode opcode;
     std::string payload;
     bool fin;
-    EXPECT_FALSE(ws::impl::read_websocket_frame(strm, opcode, payload, fin,
-                                                false, 1024));
+    EXPECT_EQ(
+        ws::impl::read_websocket_frame(strm, opcode, payload, fin, false, 1024),
+        ws::impl::FrameRead::Fail);
   }
 
   // RSV2 set (0x20)
@@ -18377,8 +27909,9 @@ TEST(WebSocketTest, RSVBitsMustBeZero) {
     ws::Opcode opcode;
     std::string payload;
     bool fin;
-    EXPECT_FALSE(ws::impl::read_websocket_frame(strm, opcode, payload, fin,
-                                                false, 1024));
+    EXPECT_EQ(
+        ws::impl::read_websocket_frame(strm, opcode, payload, fin, false, 1024),
+        ws::impl::FrameRead::Fail);
   }
 
   // RSV3 set (0x10)
@@ -18388,8 +27921,9 @@ TEST(WebSocketTest, RSVBitsMustBeZero) {
     ws::Opcode opcode;
     std::string payload;
     bool fin;
-    EXPECT_FALSE(ws::impl::read_websocket_frame(strm, opcode, payload, fin,
-                                                false, 1024));
+    EXPECT_EQ(
+        ws::impl::read_websocket_frame(strm, opcode, payload, fin, false, 1024),
+        ws::impl::FrameRead::Fail);
   }
 
   // No RSV bits set - should succeed
@@ -18399,8 +27933,9 @@ TEST(WebSocketTest, RSVBitsMustBeZero) {
     ws::Opcode opcode;
     std::string payload;
     bool fin;
-    EXPECT_TRUE(ws::impl::read_websocket_frame(strm, opcode, payload, fin,
-                                               false, 1024));
+    EXPECT_EQ(
+        ws::impl::read_websocket_frame(strm, opcode, payload, fin, false, 1024),
+        ws::impl::FrameRead::Ok);
     EXPECT_EQ(ws::Opcode::Text, opcode);
     EXPECT_EQ("Hello", payload);
     EXPECT_TRUE(fin);
@@ -18421,8 +27956,9 @@ TEST(WebSocketTest, ControlFrameValidation) {
     ws::Opcode opcode;
     std::string payload;
     bool fin;
-    EXPECT_FALSE(ws::impl::read_websocket_frame(strm, opcode, payload, fin,
-                                                false, 1024));
+    EXPECT_EQ(
+        ws::impl::read_websocket_frame(strm, opcode, payload, fin, false, 1024),
+        ws::impl::FrameRead::Fail);
   }
 
   // Close with FIN=0 - must be rejected
@@ -18435,8 +27971,9 @@ TEST(WebSocketTest, ControlFrameValidation) {
     ws::Opcode opcode;
     std::string payload;
     bool fin;
-    EXPECT_FALSE(ws::impl::read_websocket_frame(strm, opcode, payload, fin,
-                                                false, 1024));
+    EXPECT_EQ(
+        ws::impl::read_websocket_frame(strm, opcode, payload, fin, false, 1024),
+        ws::impl::FrameRead::Fail);
   }
 
   // Ping with payload_len=126 (extended length) - must be rejected
@@ -18452,8 +27989,9 @@ TEST(WebSocketTest, ControlFrameValidation) {
     ws::Opcode opcode;
     std::string payload;
     bool fin;
-    EXPECT_FALSE(ws::impl::read_websocket_frame(strm, opcode, payload, fin,
-                                                false, 1024));
+    EXPECT_EQ(
+        ws::impl::read_websocket_frame(strm, opcode, payload, fin, false, 1024),
+        ws::impl::FrameRead::Fail);
   }
 
   // Ping with FIN=1 and payload_len=125 - should succeed
@@ -18467,8 +28005,9 @@ TEST(WebSocketTest, ControlFrameValidation) {
     ws::Opcode opcode;
     std::string payload;
     bool fin;
-    EXPECT_TRUE(ws::impl::read_websocket_frame(strm, opcode, payload, fin,
-                                               false, 1024));
+    EXPECT_EQ(
+        ws::impl::read_websocket_frame(strm, opcode, payload, fin, false, 1024),
+        ws::impl::FrameRead::Ok);
     EXPECT_EQ(ws::Opcode::Ping, opcode);
     EXPECT_EQ(125u, payload.size());
     EXPECT_TRUE(fin);
@@ -18491,8 +28030,9 @@ TEST(WebSocketTest, PayloadLength64BitMSBMustBeZero) {
     ws::Opcode opcode;
     std::string payload;
     bool fin;
-    EXPECT_FALSE(ws::impl::read_websocket_frame(strm, opcode, payload, fin,
-                                                false, 1024));
+    EXPECT_EQ(
+        ws::impl::read_websocket_frame(strm, opcode, payload, fin, false, 1024),
+        ws::impl::FrameRead::Fail);
   }
 
   // MSB clear - should pass length parsing (will be rejected by max_len,
@@ -18509,8 +28049,9 @@ TEST(WebSocketTest, PayloadLength64BitMSBMustBeZero) {
     ws::Opcode opcode;
     std::string payload;
     bool fin;
-    EXPECT_TRUE(ws::impl::read_websocket_frame(strm, opcode, payload, fin,
-                                               false, 1024));
+    EXPECT_EQ(
+        ws::impl::read_websocket_frame(strm, opcode, payload, fin, false, 1024),
+        ws::impl::FrameRead::Ok);
     EXPECT_EQ(ws::Opcode::Text, opcode);
     EXPECT_EQ("abc", payload);
   }
@@ -18547,7 +28088,11 @@ TEST(WebSocketTest, ConnectAndDisconnect) {
   svr.wait_until_ready();
 
   ws::WebSocketClient client("ws://localhost:" + std::to_string(port) + "/ws");
-  ASSERT_TRUE(client.connect());
+  auto res = client.connect();
+  ASSERT_TRUE(res);
+  EXPECT_EQ(Error::Success, res.error());
+  EXPECT_EQ(StatusCode::SwitchingProtocol_101, res.status());
+  EXPECT_TRUE(res.has_header("Sec-WebSocket-Accept"));
   EXPECT_TRUE(client.is_open());
   client.close();
   EXPECT_FALSE(client.is_open());
@@ -18623,7 +28168,23 @@ TEST(WebSocketTest, UnsupportedScheme) {
 TEST(WebSocketTest, ConnectWhenInvalid) {
   ws::WebSocketClient ws("not a valid url");
   EXPECT_FALSE(ws.is_valid());
-  EXPECT_FALSE(ws.connect());
+  auto res = ws.connect();
+  EXPECT_FALSE(res);
+  EXPECT_EQ(Error::Connection, res.error());
+  EXPECT_EQ(-1, res.status());
+}
+
+TEST(WebSocketTest, ConnectRefusedReportsError) {
+  // Grab a port that is free, then close it again so nothing listens there
+  Server svr;
+  auto port = svr.bind_to_any_port(HOST);
+  svr.stop();
+
+  ws::WebSocketClient client("ws://localhost:" + std::to_string(port) + "/ws");
+  auto res = client.connect();
+  ASSERT_FALSE(res);
+  EXPECT_EQ(Error::Connection, res.error());
+  EXPECT_EQ(-1, res.status());
 }
 
 TEST(WebSocketTest, DefaultPort) {
@@ -18669,7 +28230,7 @@ TEST(WebSocketTest, SpecifyServerIPAddress_AnotherHostname) {
   auto wrong_ip = "192.0.2.1";
 
   ws::WebSocketClient client("ws://localhost:" + std::to_string(port) + "/ws");
-  client.set_hostname_addr_map({{another_host, wrong_ip}});
+  client.set_direct_hostname_addr_map({{another_host, wrong_ip}});
 
   ASSERT_TRUE(client.connect());
   EXPECT_TRUE(client.is_open());
@@ -18693,7 +28254,7 @@ TEST(WebSocketTest, SpecifyServerIPAddress_RealHostname) {
   auto wrong_ip = "192.0.2.1";
 
   ws::WebSocketClient client("ws://localhost:" + std::to_string(port) + "/ws");
-  client.set_hostname_addr_map({{"localhost", wrong_ip}});
+  client.set_direct_hostname_addr_map({{"localhost", wrong_ip}});
   client.set_connection_timeout(1);
   client.set_read_timeout(1);
   client.set_write_timeout(1);
@@ -18703,6 +28264,47 @@ TEST(WebSocketTest, SpecifyServerIPAddress_RealHostname) {
 
   svr.stop();
   t.join();
+}
+
+TEST(WebSocketTest, SpecifyServerIPAddress_HostnameAsAddrMapValue) {
+  // A mapped value that is not an IP literal must be resolved. HOST resolves
+  // from the hosts file, so this test needs no external DNS. "target.invalid"
+  // (RFC 6761) is only a map key and the Host header value.
+  auto host = "target.invalid";
+
+  Server svr;
+  std::string received_host;
+  svr.WebSocket("/ws", [&](const Request &req, ws::WebSocket &ws) {
+    received_host = req.get_header_value("Host");
+    std::string msg;
+    while (ws.read(msg)) {}
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+
+  // ASSERT_* below returns from the test body, which would leave t joinable
+  // and make ~thread call std::terminate.
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    if (t.joinable()) { t.join(); }
+  });
+
+  svr.wait_until_ready();
+
+  ws::WebSocketClient client("ws://" + std::string(host) + ":" +
+                             std::to_string(port) + "/ws");
+  client.set_direct_hostname_addr_map({{host, HOST}});
+
+  ASSERT_TRUE(client.connect());
+  EXPECT_TRUE(client.is_open());
+  client.close();
+
+  svr.stop();
+  t.join();
+
+  // The mapping only redirects the connection; the identity stays host_.
+  EXPECT_EQ(std::string(host) + ":" + std::to_string(port), received_host);
 }
 
 class WebSocketIntegrationTest : public ::testing::Test {
@@ -18774,6 +28376,18 @@ protected:
             if (p == "graphql-ws") { return p; }
           }
           return "";
+        });
+
+    server_->WebSocket(
+        "/ws-subprotocol-unoffered",
+        [](const Request &, ws::WebSocket &ws) {
+          std::string msg;
+          while (ws.read(msg)) {
+            ws.send(msg);
+          }
+        },
+        [](const std::vector<std::string> &) -> std::string {
+          return "admin";
         });
   }
 
@@ -18934,10 +28548,46 @@ TEST_F(WebSocketIntegrationTest, ReadTimeout) {
   client.set_read_timeout(1, 0); // 1 second
   ASSERT_TRUE(client.connect());
 
-  // Don't send anything — server echo handler waits for a message,
-  // so read() should time out and return false.
+  // Don't send anything — server echo handler waits for a message, so read()
+  // should time out. The connection survives it: nothing was consumed.
   std::string msg;
-  EXPECT_FALSE(client.read(msg));
+  EXPECT_EQ(client.read(msg), ws::Timeout);
+  EXPECT_TRUE(client.is_open());
+
+  // And it is still usable afterwards.
+  EXPECT_TRUE(client.send("after timeout"));
+  EXPECT_EQ(client.read(msg), ws::Text);
+  EXPECT_EQ(msg, "after timeout");
+}
+
+TEST_F(WebSocketIntegrationTest, ReadTimeoutLeavesMessageUntouched) {
+  ws::WebSocketClient client("ws://localhost:" + std::to_string(port_) +
+                             "/ws-echo");
+  client.set_read_timeout(1, 0);
+  ASSERT_TRUE(client.connect());
+
+  ASSERT_TRUE(client.send("first"));
+  std::string msg;
+  ASSERT_EQ(client.read(msg), ws::Text);
+  ASSERT_EQ(msg, "first");
+
+  // A timeout does not write to msg. This is why `while (ws.read(msg))` must
+  // not be used with a read timeout: it would reprocess the previous message.
+  EXPECT_EQ(client.read(msg), ws::Timeout);
+  EXPECT_EQ(msg, "first");
+}
+
+TEST_F(WebSocketIntegrationTest, ReadTimeoutSetAfterConnect) {
+  ws::WebSocketClient client("ws://localhost:" + std::to_string(port_) +
+                             "/ws-echo");
+  ASSERT_TRUE(client.connect());
+
+  // Setting it once the connection is open reaches the live stream, not just
+  // the seed for the next connect().
+  client.set_read_timeout(1, 0);
+  std::string msg;
+  EXPECT_EQ(client.read(msg), ws::Timeout);
+  EXPECT_TRUE(client.is_open());
 }
 
 TEST_F(WebSocketIntegrationTest, MaxPayloadExceeded) {
@@ -18978,7 +28628,10 @@ TEST_F(WebSocketIntegrationTest, MaxPayloadAtLimit) {
 TEST_F(WebSocketIntegrationTest, ConnectToInvalidPath) {
   ws::WebSocketClient client("ws://localhost:" + std::to_string(port_) +
                              "/nonexistent");
-  EXPECT_FALSE(client.connect());
+  auto res = client.connect();
+  EXPECT_FALSE(res);
+  EXPECT_EQ(Error::WebSocketHandshake, res.error());
+  EXPECT_EQ(StatusCode::NotFound_404, res.status());
   EXPECT_FALSE(client.is_open());
 }
 
@@ -19052,6 +28705,20 @@ TEST_F(WebSocketIntegrationTest, SubProtocolNegotiation) {
   client.close();
 }
 
+TEST_F(WebSocketIntegrationTest, SubProtocolSplitAcrossFieldLines) {
+  Headers headers;
+  headers.emplace("Sec-WebSocket-Protocol", "mqtt");
+  headers.emplace("Sec-WebSocket-Protocol", "graphql-ws");
+  ws::WebSocketClient client(
+      "ws://localhost:" + std::to_string(port_) + "/ws-subprotocol", headers);
+  ASSERT_TRUE(client.connect());
+
+  // The offer on the second field line counts too, so graphql-ws is selected
+  EXPECT_EQ("graphql-ws", client.subprotocol());
+
+  client.close();
+}
+
 TEST_F(WebSocketIntegrationTest, SubProtocolNoMatch) {
   Headers headers = {{"Sec-WebSocket-Protocol", "mqtt, wamp"}};
   ws::WebSocketClient client(
@@ -19059,6 +28726,18 @@ TEST_F(WebSocketIntegrationTest, SubProtocolNoMatch) {
   ASSERT_TRUE(client.connect());
 
   // Server should not have selected any subprotocol
+  EXPECT_TRUE(client.subprotocol().empty());
+
+  client.close();
+}
+
+TEST_F(WebSocketIntegrationTest, SubProtocolSelectorReturnsUnoffered) {
+  Headers headers = {{"Sec-WebSocket-Protocol", "chat"}};
+  ws::WebSocketClient client("ws://localhost:" + std::to_string(port_) +
+                                 "/ws-subprotocol-unoffered",
+                             headers);
+  ASSERT_TRUE(client.connect());
+
   EXPECT_TRUE(client.subprotocol().empty());
 
   client.close();
@@ -19097,6 +28776,87 @@ TEST_F(WebSocketIntegrationTest, SocketSettings) {
   client.close();
 }
 
+TEST_F(WebSocketIntegrationTest, ChronoTimeoutSetters) {
+  ws::WebSocketClient client("ws://localhost:" + std::to_string(port_) +
+                             "/ws-echo");
+  client.set_connection_timeout(std::chrono::seconds(3));
+  client.set_write_timeout(std::chrono::seconds(3));
+  // A sub-second remainder exercises the seconds/microseconds split.
+  client.set_read_timeout(std::chrono::milliseconds(1500));
+
+  ASSERT_TRUE(client.connect());
+
+  auto start = std::chrono::steady_clock::now();
+  std::string msg;
+  EXPECT_EQ(client.read(msg), ws::ReadResult::Timeout);
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - start)
+                     .count();
+  // Above 1s so that dropping the microseconds half of the split fails here.
+  // Ignoring the setter altogether would not reach this line at all: a client
+  // waits forever by default.
+  EXPECT_GE(elapsed, 1400);
+  EXPECT_LT(elapsed, 30000);
+}
+
+#ifndef _WIN32
+// A send() that times out after part of the data went out returns the count
+// written so far. Every byte of the frame must still be sent, or the peer reads
+// the next frame's header and payload as the rest of this one.
+TEST(WebSocketPartialWriteTest, FrameIsWrittenWhole) {
+  signal(SIGPIPE, SIG_IGN);
+
+  const std::string large(4 * 1024 * 1024, 'A');
+  std::atomic<bool> large_sent{false};
+  std::atomic<bool> small_sent{false};
+
+  Server svr;
+  svr.set_write_timeout(0, 500000);
+  svr.set_socket_options([](socket_t sock) {
+    int size = 8192;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF,
+               reinterpret_cast<const char *>(&size), sizeof(size));
+  });
+  svr.WebSocket("/ws", [&](const Request &, ws::WebSocket &ws) {
+    large_sent = ws.send(large.data(), large.size());
+    small_sent = ws.send("after");
+    std::string msg;
+    while (ws.read(msg)) {}
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  ws::WebSocketClient client("ws://" + std::string(HOST) + ":" +
+                             std::to_string(port) + "/ws");
+  client.set_read_timeout(5);
+  client.set_socket_options([](socket_t sock) {
+    int size = 8192;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
+               reinterpret_cast<const char *>(&size), sizeof(size));
+  });
+  ASSERT_TRUE(client.connect());
+
+  // Outlast the server's write timeout, then drain.
+  std::this_thread::sleep_for(std::chrono::milliseconds(750));
+
+  std::string msg;
+  EXPECT_EQ(ws::ReadResult::Binary, client.read(msg));
+  EXPECT_TRUE(msg == large);
+  EXPECT_EQ(ws::ReadResult::Text, client.read(msg));
+  EXPECT_EQ("after", msg);
+  EXPECT_TRUE(large_sent);
+  EXPECT_TRUE(small_sent);
+
+  client.close();
+}
+#endif
+
 TEST(WebSocketPreRoutingTest, RejectWithoutAuth) {
   Server svr;
 
@@ -19124,6 +28884,20 @@ TEST(WebSocketPreRoutingTest, RejectWithoutAuth) {
   ws::WebSocketClient client1("ws://localhost:" + std::to_string(port) + "/ws");
   EXPECT_FALSE(client1.connect());
 
+  // The rejection is framed like any other HTTP response
+  {
+    Client cli("localhost", port);
+    Headers headers = {{"Upgrade", "websocket"},
+                       {"Connection", "Upgrade"},
+                       {"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="},
+                       {"Sec-WebSocket-Version", "13"}};
+    auto res = cli.Get("/ws", headers);
+    ASSERT_TRUE(res);
+    EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
+    EXPECT_EQ("12", res->get_header_value("Content-Length"));
+    EXPECT_EQ("Unauthorized", res->body);
+  }
+
   // With Authorization header - should succeed
   Headers headers = {{"Authorization", "Bearer token123"}};
   ws::WebSocketClient client2("ws://localhost:" + std::to_string(port) + "/ws",
@@ -19137,6 +28911,436 @@ TEST(WebSocketPreRoutingTest, RejectWithoutAuth) {
 
   svr.stop();
   t.join();
+}
+
+TEST(WebSocketPreRoutingTest, RunsOnceForUnmatchedUpgrade) {
+  Server svr;
+
+  std::atomic<int> pre_routing_calls{0};
+  std::atomic<int> pre_request_calls{0};
+  svr.set_pre_routing_handler([&](const Request &req, Response &res) {
+    pre_routing_calls++;
+    if (req.path == "/handled") {
+      res.set_content("handled", "text/plain");
+      return Server::HandlerResponse::Handled;
+    }
+    return Server::HandlerResponse::Unhandled;
+  });
+  svr.set_pre_request_handler([&](const Request &, Response &) {
+    pre_request_calls++;
+    return Server::HandlerResponse::Unhandled;
+  });
+
+  svr.Get("/http", [](const Request &, Response &res) {
+    res.set_content("http", "text/plain");
+  });
+  svr.WebSocket("/ws",
+                [](const Request &, ws::WebSocket &ws) { ws.send("ws"); });
+
+  auto port = svr.bind_to_any_port("localhost");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  Headers upgrade = {{"Upgrade", "websocket"},
+                     {"Connection", "Upgrade"},
+                     {"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="},
+                     {"Sec-WebSocket-Version", "13"}};
+
+  auto get = [&](const char *path) {
+    pre_routing_calls = 0;
+    return Client("localhost", port).Get(path, upgrade);
+  };
+
+  // No WebSocket route, but an HTTP one
+  auto res = get("/http");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("http", res->body);
+  EXPECT_EQ(1, pre_routing_calls);
+  EXPECT_EQ(1, pre_request_calls);
+
+  // No route at all
+  res = get("/none");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::NotFound_404, res->status);
+  EXPECT_EQ(1, pre_routing_calls);
+
+  // Answered by the pre-routing handler
+  res = get("/handled");
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+  EXPECT_EQ("handled", res->body);
+  EXPECT_EQ(1, pre_routing_calls);
+
+  // A WebSocket route
+  pre_routing_calls = 0;
+  pre_request_calls = 0;
+  {
+    ws::WebSocketClient client("ws://localhost:" + std::to_string(port) +
+                               "/ws");
+    ASSERT_TRUE(client.connect());
+    std::string msg;
+    ASSERT_TRUE(client.read(msg));
+    EXPECT_EQ("ws", msg);
+    client.close();
+  }
+  EXPECT_EQ(1, pre_routing_calls);
+  EXPECT_EQ(1, pre_request_calls);
+}
+
+// An upgrade request answered by a hook leaves its body unread, so that body
+// must not be served as the next request on the connection.
+TEST(WebSocketPreRoutingTest, AnsweredUpgradeBodyIsNotNextRequest) {
+  Server svr;
+
+  svr.set_pre_routing_handler([](const Request &req, Response &res) {
+    if (req.path == "/pre-routing") {
+      res.set_content("pre-routing", "text/plain");
+      return Server::HandlerResponse::Handled;
+    }
+    return Server::HandlerResponse::Unhandled;
+  });
+  svr.set_pre_request_handler([](const Request &req, Response &res) {
+    if (req.matched_route == "/pre-request") {
+      res.set_content("pre-request", "text/plain");
+      return Server::HandlerResponse::Handled;
+    }
+    return Server::HandlerResponse::Unhandled;
+  });
+
+  svr.Get("/smuggled", [](const Request &, Response &res) {
+    res.set_content("smuggled", "text/plain");
+  });
+  svr.WebSocket("/pre-request",
+                [](const Request &, ws::WebSocket &ws) { ws.send("ws"); });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  const std::string body = "GET /smuggled HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+  for (auto path : {"/pre-routing", "/pre-request"}) {
+    std::string req = std::string("GET ") + path +
+                      " HTTP/1.1\r\n"
+                      "Host: localhost\r\n"
+                      "Upgrade: websocket\r\n"
+                      "Connection: Upgrade\r\n"
+                      "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                      "Sec-WebSocket-Version: 13\r\n"
+                      "Content-Length: " +
+                      std::to_string(body.size()) + "\r\n\r\n" + body;
+
+    std::string res;
+    ASSERT_TRUE(send_request(5, req, &res, port));
+    EXPECT_EQ(0u, res.find("HTTP/1.1 200 OK\r\n")) << path;
+    EXPECT_NE(std::string::npos, res.find("Connection: close\r\n")) << path;
+    // Only one response, and the body was not served as a request
+    EXPECT_EQ(std::string::npos, res.find("HTTP/1.1", 1)) << path;
+  }
+}
+
+TEST(WebSocketPreRequestTest, RejectWithoutAuth) {
+  Server svr;
+
+  std::atomic<int> pre_request_calls{0};
+  std::atomic<bool> route_matched{false};
+  svr.set_pre_request_handler([&](const Request &req, Response &res) {
+    pre_request_calls++;
+    if (req.matched_route == "/ws/:id") { route_matched = true; }
+    if (req.get_header_value("Authorization") != "Bearer token123") {
+      res.status = StatusCode::Unauthorized_401;
+      res.set_content("Unauthorized", "text/plain");
+      return Server::HandlerResponse::Handled;
+    }
+    return Server::HandlerResponse::Unhandled;
+  });
+
+  std::atomic<bool> handler_called{false};
+  svr.WebSocket("/ws/:id", [&](const Request &req, ws::WebSocket &ws) {
+    handler_called = true;
+    ws.send(req.matched_route + " " + req.path_params.at("id"));
+  });
+
+  auto port = svr.bind_to_any_port("localhost");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  svr.wait_until_ready();
+
+  // Without Authorization header - should be rejected before upgrade
+  ws::WebSocketClient client1("ws://localhost:" + std::to_string(port) +
+                              "/ws/1");
+  EXPECT_FALSE(client1.connect());
+  EXPECT_FALSE(handler_called);
+  EXPECT_EQ(1, pre_request_calls);
+  EXPECT_TRUE(route_matched);
+
+  // The rejection is an ordinary HTTP response, not a protocol switch
+  {
+    Client cli("localhost", port);
+    Headers headers = {{"Upgrade", "websocket"},
+                       {"Connection", "Upgrade"},
+                       {"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="},
+                       {"Sec-WebSocket-Version", "13"}};
+    auto res = cli.Get("/ws/1", headers);
+    ASSERT_TRUE(res);
+    EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
+    EXPECT_EQ("12", res->get_header_value("Content-Length"));
+    EXPECT_EQ("Unauthorized", res->body);
+  }
+  EXPECT_FALSE(handler_called);
+
+  // With Authorization header - should succeed
+  Headers headers = {{"Authorization", "Bearer token123"}};
+  ws::WebSocketClient client2(
+      "ws://localhost:" + std::to_string(port) + "/ws/2", headers);
+  ASSERT_TRUE(client2.connect());
+  std::string msg;
+  ASSERT_TRUE(client2.read(msg));
+  EXPECT_EQ("/ws/:id 2", msg);
+  EXPECT_TRUE(handler_called);
+  client2.close();
+
+  svr.stop();
+  t.join();
+}
+
+#ifndef CPPHTTPLIB_NO_EXCEPTIONS
+static Headers websocket_upgrade_headers() {
+  return {{"Upgrade", "websocket"},
+          {"Connection", "Upgrade"},
+          {"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="},
+          {"Sec-WebSocket-Version", "13"},
+          {"Sec-WebSocket-Protocol", "chat"}};
+}
+
+TEST(WebSocketExceptionTest, HooksBeforeUpgradeReachExceptionHandler) {
+  Server svr;
+  svr.set_pre_routing_handler([](const Request &req, Response &) {
+    if (req.path == "/pre-routing") { throw std::runtime_error(req.path); }
+    return Server::HandlerResponse::Unhandled;
+  });
+  svr.set_pre_request_handler([](const Request &req, Response &) {
+    if (req.path == "/pre-request") { throw std::runtime_error(req.path); }
+    return Server::HandlerResponse::Unhandled;
+  });
+  svr.set_exception_handler(
+      [](const Request &, Response &res, std::exception_ptr ep) {
+        try {
+          std::rethrow_exception(ep);
+        } catch (std::exception &e) { res.set_content(e.what(), "text/plain"); }
+      });
+
+  auto handler = [](const Request &, ws::WebSocket &) {};
+  svr.WebSocket("/pre-routing", handler);
+  svr.WebSocket("/pre-request", handler);
+  svr.WebSocket("/sub-protocol", handler,
+                [](const std::vector<std::string> &) -> std::string {
+                  throw std::runtime_error("/sub-protocol");
+                });
+
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_GT(port, 0);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  for (auto path : {"/pre-routing", "/pre-request", "/sub-protocol"}) {
+    auto res = cli.Get(path, websocket_upgrade_headers());
+    if (!res) {
+      ADD_FAILURE() << path << ": " << to_string(res.error());
+      continue;
+    }
+    EXPECT_EQ(StatusCode::InternalServerError_500, res->status) << path;
+    EXPECT_EQ(path, res->body);
+  }
+}
+
+TEST(WebSocketExceptionTest, HookBeforeUpgradeWithoutExceptionHandler) {
+  Server svr;
+  svr.set_pre_routing_handler(
+      [](const Request &, Response &) -> Server::HandlerResponse {
+        throw std::runtime_error("pre-routing");
+      });
+  svr.WebSocket("/ws", [](const Request &, ws::WebSocket &) {});
+
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_GT(port, 0);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  Client cli(HOST, port);
+  auto res = cli.Get("/ws", websocket_upgrade_headers());
+  ASSERT_TRUE(res) << to_string(res.error());
+  EXPECT_EQ(StatusCode::InternalServerError_500, res->status);
+}
+#endif
+
+TEST(WebSocketServerTimeoutTest, HandlerSendsWhileNothingArrives) {
+  Server svr;
+
+  svr.WebSocket("/ws", [](const Request &, ws::WebSocket &ws) {
+    // A read timeout is how a handler gets control back. Without it, a handler
+    // parked in read() can never write on the connection it is reading.
+    ws.set_read_timeout(std::chrono::milliseconds(100));
+    std::string msg;
+    while (ws.is_open()) {
+      auto r = ws.read(msg);
+      if (r == httplib::ws::Timeout) {
+        ws.send("tick");
+        continue;
+      }
+      if (r == httplib::ws::Fail) { break; }
+      ws.send(msg);
+    }
+  });
+
+  auto port = svr.bind_to_any_port("localhost");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  svr.wait_until_ready();
+
+  ws::WebSocketClient client("ws://localhost:" + std::to_string(port) + "/ws");
+  client.set_read_timeout(10, 0); // fail rather than hang if no tick arrives
+  ASSERT_TRUE(client.connect());
+
+  // The client sends nothing, so anything it receives came out of the
+  // handler's timeout path.
+  std::string msg;
+  ASSERT_EQ(client.read(msg), ws::Text);
+  EXPECT_EQ("tick", msg);
+
+  client.close();
+  svr.stop();
+  t.join();
+}
+
+// Stream::read may return fewer bytes than asked for. This is that contract at
+// its worst -- one byte per call -- which is what a frame header straddling a
+// read buffer's boundary looks like to the frame parser.
+class WsByteAtATimeStream : public Stream {
+public:
+  explicit WsByteAtATimeStream(std::string data) : data_(std::move(data)) {}
+  bool is_readable() const override { return true; }
+  bool wait_readable() const override { return true; }
+  bool wait_writable() const override { return true; }
+  ssize_t read(char *ptr, size_t size) override {
+    if (size == 0 || pos_ >= data_.size()) { return 0; }
+    *ptr = data_[pos_++];
+    return 1;
+  }
+  ssize_t write(const char *, size_t size) override {
+    return static_cast<ssize_t>(size);
+  }
+  void get_remote_ip_and_port(std::string &ip, int &port) const override {
+    ip = "127.0.0.1";
+    port = 0;
+  }
+  void get_local_ip_and_port(std::string &ip, int &port) const override {
+    ip = "127.0.0.1";
+    port = 0;
+  }
+  socket_t socket() const override { return INVALID_SOCKET; }
+  time_t duration() const override { return 0; }
+
+private:
+  std::string data_;
+  size_t pos_ = 0;
+};
+
+TEST(WebSocketFrameTest, MultiByteFieldsSplitAcrossReads) {
+  // The payload uses the 16-bit extended length, so the header, the length
+  // and the mask key are all multi-byte fields here. Each used to be read
+  // with a single read() call, which fails as soon as one is split. The
+  // payload is also a little over one read chunk, so it is read in two.
+  std::string body;
+  for (size_t i = 0; i < CPPHTTPLIB_RECV_BUFSIZ + 3; i++) {
+    body += static_cast<char>(i % 251);
+  }
+  const uint8_t mask[4] = {0x0a, 0x0b, 0x0c, 0x0d};
+
+  std::string frame;
+  frame += static_cast<char>(0x81);       // FIN + Text
+  frame += static_cast<char>(0x80 | 126); // masked, 16-bit length follows
+  frame += static_cast<char>(body.size() >> 8);
+  frame += static_cast<char>(body.size() & 0xff);
+  for (size_t i = 0; i < 4; i++) {
+    frame += static_cast<char>(mask[i]);
+  }
+  for (size_t i = 0; i < body.size(); i++) {
+    frame += static_cast<char>(body[i] ^ mask[i % 4]);
+  }
+
+  WsByteAtATimeStream strm(frame);
+  ws::Opcode opcode;
+  std::string payload;
+  bool fin = false;
+  ASSERT_EQ(ws::impl::read_websocket_frame(strm, opcode, payload, fin,
+                                           /*expect_masked=*/true, body.size()),
+            ws::impl::FrameRead::Ok);
+  EXPECT_TRUE(fin);
+  EXPECT_EQ(opcode, ws::Opcode::Text);
+  EXPECT_EQ(payload, body);
+}
+
+TEST(WebSocketFrameTest, ZeroMaxLenMeansNoLimit) {
+  std::string body(2000, 'x');
+  std::string frame;
+  frame += static_cast<char>(0x82); // FIN + Binary
+  frame += static_cast<char>(126);  // 16-bit length follows
+  frame += static_cast<char>(body.size() >> 8);
+  frame += static_cast<char>(body.size() & 0xff);
+  frame += body;
+
+  detail::BufferStream strm;
+  strm.write(frame.data(), frame.size());
+  ws::Opcode opcode;
+  std::string payload;
+  bool fin;
+  EXPECT_EQ(
+      ws::impl::read_websocket_frame(strm, opcode, payload, fin, false, 0),
+      ws::impl::FrameRead::Ok);
+  EXPECT_EQ(body, payload);
+}
+
+TEST(WebSocketFrameTest, PayloadGrowsOnlyAsItArrives) {
+  // The header announces the largest payload allowed, and only 3 bytes of it
+  // ever arrive.
+  uint64_t len = CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH;
+  std::string frame;
+  frame += static_cast<char>(0x82); // FIN + Binary
+  frame += static_cast<char>(127);  // 64-bit length follows
+  for (int shift = 56; shift >= 0; shift -= 8) {
+    frame += static_cast<char>((len >> shift) & 0xff);
+  }
+  frame += "abc";
+
+  detail::BufferStream strm;
+  strm.write(frame.data(), frame.size());
+  ws::Opcode opcode;
+  std::string payload;
+  bool fin;
+  EXPECT_EQ(
+      ws::impl::read_websocket_frame(strm, opcode, payload, fin, false,
+                                     CPPHTTPLIB_WEBSOCKET_MAX_PAYLOAD_LENGTH),
+      ws::impl::FrameRead::Fail);
+  EXPECT_LT(payload.capacity(), 2 * CPPHTTPLIB_RECV_BUFSIZ);
 }
 
 TEST(WebSocketTest, QueryStringInHandshake) {
@@ -19184,7 +29388,335 @@ TEST(WebSocketTest, QueryStringInHandshake) {
   t.join();
 }
 
-TEST(WebSocketTest, HostHeaderInHandshake) {
+// Run a handshake against a throwaway server and hand the request the server
+// received back to the caller, so tests can assert on the headers the client
+// actually put on the wire.
+static void capture_websocket_handshake_request(
+    const Headers &client_headers,
+    std::function<void(const Request &, int port)> verify) {
+  Server svr;
+
+  std::mutex mtx;
+  Request received;
+
+  svr.WebSocket("/ws", [&](const Request &req, ws::WebSocket &ws) {
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      received = req;
+    }
+    std::string msg;
+    while (ws.read(msg)) {
+      ws.send(msg);
+    }
+  });
+
+  auto port = svr.bind_to_any_port("localhost");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  ws::WebSocketClient client("ws://localhost:" + std::to_string(port) + "/ws",
+                             client_headers);
+  ASSERT_TRUE(client.connect());
+  ASSERT_TRUE(client.send("hello"));
+  std::string msg;
+  ASSERT_TRUE(client.read(msg));
+  client.close();
+
+  {
+    std::lock_guard<std::mutex> lock(mtx);
+    verify(received, port);
+  }
+}
+
+TEST(WebSocketTest, DefaultHeadersInHandshake) {
+  capture_websocket_handshake_request({}, [](const Request &req, int port) {
+    // Non-default port must be present in the Host header. Default ports
+    // (80/443) are omitted; that logic is covered by
+    // MakeHostAndPortStringTest.
+    EXPECT_EQ("localhost:" + std::to_string(port),
+              req.get_header_value("Host"));
+    EXPECT_EQ(std::string("cpp-httplib/") + CPPHTTPLIB_VERSION,
+              req.get_header_value("User-Agent"));
+    EXPECT_FALSE(req.has_header("Accept"));
+    EXPECT_FALSE(req.has_header("Accept-Encoding"));
+    EXPECT_FALSE(req.has_header("Content-Length"));
+  });
+}
+
+TEST(WebSocketTest, UserHeadersOverrideGeneratedOnesInHandshake) {
+  capture_websocket_handshake_request(
+      {{"Host", "example.com"},
+       {"User-Agent", "custom-agent"},
+       {"X-Custom", "value"}},
+      [](const Request &req, int) {
+        EXPECT_EQ("example.com", req.get_header_value("Host"));
+        EXPECT_EQ(1U, req.get_header_value_count("Host"));
+        EXPECT_EQ("custom-agent", req.get_header_value("User-Agent"));
+        EXPECT_EQ(1U, req.get_header_value_count("User-Agent"));
+        EXPECT_EQ("value", req.get_header_value("X-Custom"));
+      });
+}
+
+TEST(WebSocketTest, MandatoryHeadersInHandshakeAreEnforced) {
+  capture_websocket_handshake_request(
+      {{"Upgrade", "bogus"},
+       {"Connection", "close"},
+       {"Sec-WebSocket-Key", "AAAAAAAAAAAAAAAAAAAAAA=="},
+       {"Sec-WebSocket-Version", "8"}},
+      [](const Request &req, int) {
+        EXPECT_EQ("websocket", req.get_header_value("Upgrade"));
+        EXPECT_EQ(1U, req.get_header_value_count("Upgrade"));
+        EXPECT_EQ("Upgrade", req.get_header_value("Connection"));
+        EXPECT_EQ(1U, req.get_header_value_count("Connection"));
+        EXPECT_EQ("13", req.get_header_value("Sec-WebSocket-Version"));
+        EXPECT_EQ(1U, req.get_header_value_count("Sec-WebSocket-Version"));
+        EXPECT_EQ(1U, req.get_header_value_count("Sec-WebSocket-Key"));
+        EXPECT_NE("AAAAAAAAAAAAAAAAAAAAAA==",
+                  req.get_header_value("Sec-WebSocket-Key"));
+      });
+}
+
+TEST(WebSocketTest, InvalidHeaderInHandshakeWritesNothing) {
+  // A header the client refuses to send must abort the handshake before any
+  // part of it reaches the wire; a lone request line would otherwise sit in
+  // the peer's buffer as a truncated request.
+  auto srv = ::socket(AF_INET, SOCK_STREAM, 0);
+  ASSERT_NE(INVALID_SOCKET, srv);
+  auto se_srv = detail::scope_exit([&] { detail::close_socket(srv); });
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = 0; // ephemeral, so parallel shards don't collide
+  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  ASSERT_EQ(0, ::bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
+  ASSERT_EQ(0, ::listen(srv, 1));
+
+  sockaddr_in bound{};
+  socklen_t bound_len = sizeof(bound);
+  ASSERT_EQ(
+      0, ::getsockname(srv, reinterpret_cast<sockaddr *>(&bound), &bound_len));
+  auto port = ntohs(bound.sin_port);
+
+  ssize_t received = -1;
+  std::thread t([&] {
+    // Bound every blocking call so a regression fails the test with a bad
+    // value instead of hanging the suite.
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(srv, &rfds);
+    timeval tv{5, 0};
+    if (::select(static_cast<int>(srv + 1), &rfds, nullptr, nullptr, &tv) <=
+        0) {
+      return;
+    }
+
+    sockaddr_in cli_addr{};
+    socklen_t cli_len = sizeof(cli_addr);
+    auto cli = ::accept(srv, reinterpret_cast<sockaddr *>(&cli_addr), &cli_len);
+    if (cli == INVALID_SOCKET) { return; }
+    auto se_cli = detail::scope_exit([&] { detail::close_socket(cli); });
+
+    detail::set_socket_opt_time(cli, SOL_SOCKET, SO_RCVTIMEO, 5, 0);
+    char buf[4096];
+    received = ::recv(cli, buf, sizeof(buf), 0);
+  });
+  // The CR/LF makes the value invalid, so check_and_write_headers rejects it.
+  // connect() has already shut the socket down by the time it returns false,
+  // so the peer sees EOF without waiting for the client to be destroyed.
+  ws::WebSocketClient client("ws://127.0.0.1:" + std::to_string(port) + "/ws",
+                             {{"X-Bad", "a\r\nInjected: 1"}});
+  EXPECT_FALSE(client.connect());
+
+  t.join();
+
+  // 0 means the peer saw a clean EOF without a single byte of the handshake.
+  EXPECT_EQ(0, received);
+}
+
+TEST(WebSocketTest, ConnectionHeaderNeedsCompleteUpgradeToken) {
+  // RFC 6455 4.2.1: Connection is a token list, so a value that merely
+  // contains "upgrade" as a substring is a different token and must not
+  // start a WebSocket handshake.
+  auto make_request = [](const std::vector<std::string> &connection_values) {
+    Request req;
+    req.method = "GET";
+    req.headers.emplace("Upgrade", "websocket");
+    for (const auto &value : connection_values) {
+      req.headers.emplace("Connection", value);
+    }
+    req.headers.emplace("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    req.headers.emplace("Sec-WebSocket-Version", "13");
+    return req;
+  };
+
+  EXPECT_TRUE(detail::is_websocket_upgrade(make_request({"Upgrade"})));
+  EXPECT_TRUE(detail::is_websocket_upgrade(make_request({"upgrade"})));
+  EXPECT_TRUE(
+      detail::is_websocket_upgrade(make_request({"keep-alive, Upgrade"})));
+  EXPECT_TRUE(
+      detail::is_websocket_upgrade(make_request({"Upgrade , keep-alive"})));
+  EXPECT_TRUE(
+      detail::is_websocket_upgrade(make_request({"keep-alive", "Upgrade"})));
+
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"notupgrade"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"upgrade-not"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"xupgrade"})));
+  EXPECT_FALSE(
+      detail::is_websocket_upgrade(make_request({"keep-alive, notupgrade"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"close"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({})));
+}
+
+TEST(WebSocketTest, UpgradeHeaderNeedsCompleteWebsocketToken) {
+  // RFC 9110 7.8 defines Upgrade as a comma-separated list of protocols and
+  // asks recipients to match each protocol-name case-insensitively, and RFC
+  // 6455 4.2.1 asks for a header field containing the value "websocket". A
+  // client naming websocket alongside another protocol, or on a second field
+  // line, is offering websocket; a value that merely contains "websocket" as a
+  // substring is a different protocol name and is not.
+  auto make_request = [](const std::vector<std::string> &upgrade_values) {
+    Request req;
+    req.method = "GET";
+    for (const auto &value : upgrade_values) {
+      req.headers.emplace("Upgrade", value);
+    }
+    req.headers.emplace("Connection", "Upgrade");
+    req.headers.emplace("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==");
+    req.headers.emplace("Sec-WebSocket-Version", "13");
+    return req;
+  };
+
+  EXPECT_TRUE(detail::is_websocket_upgrade(make_request({"websocket"})));
+  EXPECT_TRUE(detail::is_websocket_upgrade(make_request({"WebSocket"})));
+  EXPECT_TRUE(
+      detail::is_websocket_upgrade(make_request({"websocket, HTTP/3.0"})));
+  EXPECT_TRUE(
+      detail::is_websocket_upgrade(make_request({"HTTP/3.0 , websocket"})));
+  EXPECT_TRUE(
+      detail::is_websocket_upgrade(make_request({"HTTP/3.0", "websocket"})));
+
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"notwebsocket"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"websocket-2"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"xwebsocket"})));
+  EXPECT_FALSE(
+      detail::is_websocket_upgrade(make_request({"HTTP/3.0, notwebsocket"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({"h2c"})));
+  EXPECT_FALSE(detail::is_websocket_upgrade(make_request({})));
+}
+
+TEST(WebSocketTest, ServerRejectsHandshakeWithoutUpgradeToken) {
+  Server svr;
+  svr.WebSocket("/ws", [](const Request &, ws::WebSocket &) {});
+
+  auto port = svr.bind_to_any_port("localhost");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  Headers headers = {{"Upgrade", "websocket"},
+                     {"Connection", "notupgrade"},
+                     {"Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="},
+                     {"Sec-WebSocket-Version", "13"}};
+
+  Client cli("localhost", port);
+  auto res = cli.Get("/ws", headers);
+
+  // The route exists only as a WebSocket route, so a request that fails the
+  // handshake check falls through to ordinary routing.
+  ASSERT_TRUE(res);
+  EXPECT_EQ(StatusCode::NotFound_404, res->status);
+}
+
+TEST(WebSocketTest, ClientRejectsResponseWithoutUpgradeToken) {
+  // The peer answers 101 with a correct Sec-WebSocket-Accept, so the
+  // Connection value is the only thing left for the client to reject.
+  Server svr;
+  svr.Get("/ws", [](const Request &req, Response &res) {
+    res.status = StatusCode::SwitchingProtocol_101;
+    res.set_header("Upgrade", "websocket");
+    res.set_header("Connection", "notupgrade");
+    res.set_header("Sec-WebSocket-Accept",
+                   detail::websocket_accept_key(
+                       req.get_header_value("Sec-WebSocket-Key")));
+  });
+
+  auto port = svr.bind_to_any_port("localhost");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  ws::WebSocketClient client("ws://localhost:" + std::to_string(port) + "/ws");
+
+  auto res = client.connect();
+  EXPECT_FALSE(res);
+  EXPECT_EQ(Error::WebSocketHandshake, res.error());
+  EXPECT_FALSE(client.is_open());
+}
+
+TEST(WebSocketTest, ClientRejectsUnofferedSubprotocol) {
+  Server svr;
+  svr.Get("/ws", [](const Request &req, Response &res) {
+    res.status = StatusCode::SwitchingProtocol_101;
+    res.set_header("Upgrade", "websocket");
+    res.set_header("Connection", "Upgrade");
+    res.set_header("Sec-WebSocket-Accept",
+                   detail::websocket_accept_key(
+                       req.get_header_value("Sec-WebSocket-Key")));
+    res.set_header("Sec-WebSocket-Protocol", "admin");
+  });
+
+  auto port = svr.bind_to_any_port("localhost");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  const auto url = "ws://localhost:" + std::to_string(port) + "/ws";
+
+  // Server selects a subprotocol the client never offered
+  {
+    Headers headers = {{"Sec-WebSocket-Protocol", "chat"}};
+    ws::WebSocketClient client(url, headers);
+
+    auto res = client.connect();
+    EXPECT_FALSE(res);
+    EXPECT_EQ(Error::WebSocketHandshake, res.error());
+    EXPECT_FALSE(client.is_open());
+    EXPECT_TRUE(client.subprotocol().empty());
+  }
+
+  // Client offered none but the server named one anyway
+  {
+    ws::WebSocketClient client(url);
+
+    auto res = client.connect();
+    EXPECT_FALSE(res);
+    EXPECT_EQ(Error::WebSocketHandshake, res.error());
+    EXPECT_FALSE(client.is_open());
+    EXPECT_TRUE(client.subprotocol().empty());
+  }
+}
+
+TEST(WebSocketTest, HostHeaderOverUnixSocket) {
+  // The socket path doubles as the URL host, so it must not contain '/'.
+  const char *shard = getenv("GTEST_SHARD_INDEX");
+  const std::string sock_path =
+      shard ? std::string("httplib-ws-") + shard + ".sock"
+            : std::string("httplib-ws.sock");
+  std::remove(sock_path.c_str());
+
   Server svr;
 
   std::mutex mtx;
@@ -19200,14 +29732,19 @@ TEST(WebSocketTest, HostHeaderInHandshake) {
       ws.send(msg);
     }
   });
+  svr.set_address_family(AF_UNIX);
 
-  auto port = svr.bind_to_any_port("localhost");
-  std::thread t([&]() { svr.listen_after_bind(); });
+  std::thread t([&]() { ASSERT_TRUE(svr.listen(sock_path, 80)); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    std::remove(sock_path.c_str());
+  });
   svr.wait_until_ready();
 
-  ws::WebSocketClient client("ws://localhost:" + std::to_string(port) + "/ws");
+  ws::WebSocketClient client("ws://" + sock_path + "/ws");
+  client.set_address_family(AF_UNIX);
   ASSERT_TRUE(client.connect());
-  // Round-trip ensures the handler has run and captured the request.
   ASSERT_TRUE(client.send("hello"));
   std::string msg;
   ASSERT_TRUE(client.read(msg));
@@ -19215,14 +29752,393 @@ TEST(WebSocketTest, HostHeaderInHandshake) {
 
   {
     std::lock_guard<std::mutex> lock(mtx);
-    // Non-default port must be present in the Host header. Default ports
-    // (80/443) are omitted; that logic is covered by
-    // MakeHostAndPortStringTest.
-    EXPECT_EQ("localhost:" + std::to_string(port), received_host);
+    // There is no host:port for a Unix socket, so the same "localhost"
+    // placeholder the HTTP client uses is expected.
+    EXPECT_EQ("localhost", received_host);
+  }
+}
+
+// Two threads must never parse WebSocket frames from the same stream.
+// close() used to read the peer's Close reply with its own frame read, so it
+// raced a reader thread that was in the middle of a payload: the payload loop
+// in read_websocket_frame() keeps reading until payload_len bytes are in hand,
+// so bytes taken by close() were replaced with bytes from further along the
+// stream. The message kept its length and silently changed content.
+//
+// The raw peer below sends a frame header plus part of the payload, waits for
+// the handler to call close(), and only then sends the rest. Whichever thread
+// would win the race for those bytes, the message must arrive intact, because
+// close() must not touch the stream while read() owns it.
+TEST(WebSocketTest, CloseDoesNotStealBytesFromConcurrentRead) {
+#ifndef _WIN32
+  signal(SIGPIPE, SIG_IGN);
+#endif
+
+  const size_t payload_len = 120; // fits the 7-bit length field
+  const size_t prefix_len = 8;
+  const int attempts = 8;
+
+  std::string expected(payload_len, '\0');
+  for (size_t i = 0; i < payload_len; i++) {
+    expected[i] = static_cast<char>('a' + i % 26);
   }
 
-  svr.stop();
-  t.join();
+  std::atomic<bool> peer_stalled{false};
+  std::atomic<bool> handler_done{false};
+  std::mutex received_mutex;
+  std::vector<std::string> received;
+
+  // Bound every wait, so a regression fails the test instead of hanging the
+  // suite.
+  auto wait_for = [](const std::atomic<bool> &flag) {
+    for (int i = 0; i < 500 && !flag; i++) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  };
+
+  Server svr;
+  svr.set_websocket_ping_interval(0);
+  svr.WebSocket("/ws", [&](const Request &, ws::WebSocket &ws) {
+    std::thread reader([&]() {
+      std::string msg;
+      while (ws.read(msg)) {
+        std::lock_guard<std::mutex> guard(received_mutex);
+        received.push_back(msg);
+      }
+    });
+
+    // Wait until the peer stalls mid-payload, so the reader thread is parked
+    // inside read_websocket_frame() when close() runs.
+    wait_for(peer_stalled);
+    ws.close();
+    reader.join();
+    handler_done = true;
+  });
+
+  auto port = svr.bind_to_any_port("127.0.0.1");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  auto send_bytes = [](socket_t s, const std::string &data) {
+#ifdef _WIN32
+    auto n = ::send(s, data.data(), static_cast<int>(data.size()), 0);
+#else
+    auto n = ::send(s, data.data(), data.size(), 0);
+#endif
+    return n == static_cast<decltype(n)>(data.size());
+  };
+
+  // Frame header with an all-zero mask key, so the payload goes out verbatim.
+  // Every length used here fits the 7-bit length field.
+  auto masked_header = [](uint8_t first_byte, size_t len) {
+    std::string h;
+    h += static_cast<char>(first_byte);
+    h += static_cast<char>(0x80 | len); // masked, 7-bit length
+    h.append(4, '\0');                  // mask key
+    return h;
+  };
+
+  for (int attempt = 0; attempt < attempts; attempt++) {
+    peer_stalled = false;
+    handler_done = false;
+
+    auto sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    ASSERT_NE(INVALID_SOCKET, sock) << "attempt " << attempt;
+    auto se_sock = detail::scope_exit([&] {
+      if (sock != INVALID_SOCKET) { detail::close_socket(sock); }
+    });
+    detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, 5, 0);
+    detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO, 5, 0);
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    ASSERT_EQ(
+        0, ::connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)))
+        << "attempt " << attempt;
+
+    ASSERT_TRUE(send_bytes(sock,
+                           "GET /ws HTTP/1.1\r\n"
+                           "Host: 127.0.0.1\r\n"
+                           "Upgrade: websocket\r\n"
+                           "Connection: Upgrade\r\n"
+                           "Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n"
+                           "Sec-WebSocket-Version: 13\r\n"
+                           "\r\n"))
+        << "attempt " << attempt;
+
+    std::string response;
+    while (response.find("\r\n\r\n") == std::string::npos) {
+      char buf[512];
+      auto n = ::recv(sock, buf, static_cast<int>(sizeof(buf)), 0);
+      if (n <= 0) { break; }
+      response.append(buf, static_cast<size_t>(n));
+    }
+    ASSERT_NE(std::string::npos, response.find(" 101 "))
+        << "attempt " << attempt;
+
+    // Send the header of a Binary message but only the first prefix_len bytes
+    // of its payload, leaving the reader thread stalled inside the payload.
+    ASSERT_TRUE(send_bytes(sock, masked_header(0x82, payload_len) +
+                                     expected.substr(0, prefix_len)))
+        << "attempt " << attempt;
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    peer_stalled = true;
+    // Let close() send its Close frame and park in its own read before the
+    // rest of the payload arrives, so both threads are waiting for it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    std::string close_frame = masked_header(0x88, 2); // FIN + Close
+    close_frame += static_cast<char>(0x03);           // status 1000
+    close_frame += static_cast<char>(0xE8);
+    ASSERT_TRUE(send_bytes(sock, expected.substr(prefix_len) + close_frame))
+        << "attempt " << attempt;
+
+    // Closing the peer releases the reader thread even on the buggy path,
+    // where it waits for bytes another thread already consumed.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    detail::close_socket(sock);
+    sock = INVALID_SOCKET;
+
+    wait_for(handler_done);
+    ASSERT_TRUE(handler_done) << "attempt " << attempt;
+  }
+
+  std::lock_guard<std::mutex> guard(received_mutex);
+  EXPECT_EQ(static_cast<size_t>(attempts), received.size())
+      << "a message in flight when close() ran was dropped";
+  for (size_t i = 0; i < received.size(); i++) {
+    EXPECT_EQ(expected, received[i]) << "message " << i;
+  }
+}
+
+// Connects to 127.0.0.1:port and completes a WebSocket handshake for path,
+// returning the socket, or INVALID_SOCKET.
+static socket_t connect_raw_websocket(int port, const std::string &path) {
+  auto sock = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (sock == INVALID_SOCKET) { return sock; }
+  detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, 5, 0);
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(port));
+  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  std::string req = "GET " + path +
+                    " HTTP/1.1\r\n"
+                    "Host: 127.0.0.1\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n"
+                    "Sec-WebSocket-Version: 13\r\n"
+                    "\r\n";
+  std::string res;
+  if (::connect(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == 0 &&
+      detail::send_socket(sock, req.data(), req.size(), 0) ==
+          static_cast<ssize_t>(req.size())) {
+    char c;
+    while (res.find("\r\n\r\n") == std::string::npos &&
+           ::recv(sock, &c, 1, 0) == 1) {
+      res += c;
+    }
+  }
+  if (res.find(" 101 ") == std::string::npos) {
+    detail::close_socket(sock);
+    return INVALID_SOCKET;
+  }
+  return sock;
+}
+
+// A client frame with an all-zero mask key, so the payload goes out verbatim.
+// The payload must fit the 7-bit length field.
+static std::string masked_frame(uint8_t first_byte,
+                                const std::string &payload) {
+  std::string f;
+  f += static_cast<char>(first_byte);
+  f += static_cast<char>(0x80 | payload.size());
+  f.append(4, '\0');
+  return f + payload;
+}
+
+TEST(WebSocketTest, AssemblesFragmentsAroundAPing) {
+  std::atomic<bool> done{false};
+  std::string received;
+
+  Server svr;
+  svr.set_websocket_ping_interval(0);
+  svr.WebSocket("/ws", [&](const Request &, ws::WebSocket &ws) {
+    std::string msg;
+    if (ws.read(msg) == ws::Binary) { received = msg; }
+    done = true;
+  });
+
+  auto port = svr.bind_to_any_port("127.0.0.1");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  auto sock = connect_raw_websocket(port, "/ws");
+  ASSERT_NE(INVALID_SOCKET, sock);
+  auto se_sock = detail::scope_exit([&] { detail::close_socket(sock); });
+
+  auto frames = masked_frame(0x02, "Hel") + // Binary, more to come
+                masked_frame(0x89, "p") +   // FIN + Ping
+                masked_frame(0x80, "lo");   // FIN + Continuation
+  detail::send_socket(sock, frames.data(), frames.size(), 0);
+
+  for (int i = 0; i < 500 && !done; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(done);
+  EXPECT_EQ("Hello", received);
+
+  // The Ping between the fragments is answered with a Pong.
+  char pong[3];
+  ASSERT_EQ(3, ::recv(sock, pong, sizeof(pong), MSG_WAITALL));
+  EXPECT_EQ(std::string("\x8a\x01p", 3), std::string(pong, 3));
+}
+
+TEST(WebSocketTest, NegativePingIntervalSendsNoPings) {
+  Server svr;
+  svr.set_websocket_ping_interval(-1);
+  svr.WebSocket("/ws", [&](const Request &, ws::WebSocket &ws) {
+    std::string msg;
+    while (ws.read(msg)) {}
+  });
+
+  auto port = svr.bind_to_any_port("127.0.0.1");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  auto sock = connect_raw_websocket(port, "/ws");
+  ASSERT_NE(INVALID_SOCKET, sock);
+  auto se_sock = detail::scope_exit([&] { detail::close_socket(sock); });
+
+  // Nothing comes while the client stays quiet.
+  detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO, 0, 300000);
+  char c;
+  EXPECT_EQ(-1, ::recv(sock, &c, 1, 0));
+}
+
+// The client's heartbeat gives up on a peer that leaves its pings unanswered,
+// and that has to end a read() already waiting on the peer, on every platform.
+static void check_pong_timeout_ends_read(Server &svr, const char *scheme) {
+  // The peer sends no pings, and its handler never calls read(), which is
+  // where pongs are written.
+  std::mutex mutex;
+  std::condition_variable cv;
+  auto release = false;
+  svr.set_websocket_ping_interval(0);
+  svr.WebSocket("/ws", [&](const Request &, ws::WebSocket &) {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait(lock, [&] { return release; });
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      release = true;
+    }
+    cv.notify_all();
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  ws::WebSocketClient client(std::string(scheme) +
+                             "://localhost:" + std::to_string(port) + "/ws");
+#ifdef CPPHTTPLIB_SSL_ENABLED
+  client.enable_server_certificate_verification(false);
+#endif
+  // A ping a second, given up on after two go unanswered: about 3s
+  client.set_websocket_ping_interval(1);
+  client.set_websocket_max_missed_pongs(2);
+  // Well past that, so that a read the timeout ends instead stands out
+  client.set_read_timeout(10);
+  ASSERT_TRUE(client.connect());
+
+  auto start = std::chrono::steady_clock::now();
+  std::string msg;
+  EXPECT_EQ(ws::Fail, client.read(msg));
+  EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count(),
+            6000);
+  EXPECT_FALSE(client.is_open());
+}
+
+TEST(WebSocketTest, PongTimeoutEndsABlockedRead) {
+  Server svr;
+  check_pong_timeout_ends_read(svr, "ws");
+}
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+TEST(WebSocketTest, PongTimeoutEndsABlockedReadOverTLS) {
+  SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
+  ASSERT_TRUE(svr.is_valid());
+  check_pong_timeout_ends_read(svr, "wss");
+}
+#endif
+
+TEST(WebSocketTest, AnswersAMalformedCloseWithProtocolError) {
+  Server svr;
+  svr.set_websocket_ping_interval(0);
+  svr.WebSocket("/ws", [&](const Request &, ws::WebSocket &ws) {
+    std::string msg;
+    while (ws.read(msg)) {}
+  });
+
+  auto port = svr.bind_to_any_port("127.0.0.1");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  // Each Close payload and the reply it should get: an echo when valid, 1002
+  // otherwise.
+  std::vector<std::pair<std::string, std::string>> cases = {
+      {std::string("\x03\xe8") + "bye", std::string("\x03\xe8") + "bye"},
+      {std::string("\x03"), std::string("\x03\xea")},         // 1 byte
+      {std::string("\x03\xed"), std::string("\x03\xea")},     // 1005
+      {std::string("\x03\xe8\xff"), std::string("\x03\xea")}, // bad UTF-8
+  };
+  // Also between the fragments of a message.
+  for (const auto &prefix : {std::string(), masked_frame(0x02, "a")}) {
+    for (const auto &c : cases) {
+      auto sock = connect_raw_websocket(port, "/ws");
+      ASSERT_NE(INVALID_SOCKET, sock);
+      auto frames = prefix + masked_frame(0x88, c.first);
+      detail::send_socket(sock, frames.data(), frames.size(), 0);
+
+      std::string reply;
+      char buf[256];
+      while (reply.size() < 2 + c.second.size()) {
+        auto n = ::recv(sock, buf, sizeof(buf), 0);
+        if (n <= 0) { break; }
+        reply.append(buf, static_cast<size_t>(n));
+      }
+      detail::close_socket(sock);
+      EXPECT_EQ(std::string("\x88") + static_cast<char>(c.second.size()) +
+                    c.second,
+                reply);
+    }
+  }
 }
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
@@ -19256,6 +30172,37 @@ protected:
   std::thread server_thread_;
   int port_ = 0;
 };
+
+TEST_F(WebSocketSSLIntegrationTest, VerifiersDecide) {
+  auto url = "wss://localhost:" + std::to_string(port_) + "/ws-echo";
+  {
+    ws::WebSocketClient client(url);
+    client.enable_server_certificate_verification(false);
+    auto calls = 0;
+    client.set_server_certificate_verifier([&](const tls::VerifyContext &) {
+      calls++;
+      return false;
+    });
+    EXPECT_FALSE(client.connect());
+    EXPECT_GT(calls, 0);
+  }
+  {
+    ws::WebSocketClient client(url);
+    client.enable_server_certificate_verification(false);
+    client.set_session_verifier([](tls::session_t) {
+      return SSLVerifierResponse::CertificateRejected;
+    });
+    EXPECT_FALSE(client.connect());
+  }
+  {
+    ws::WebSocketClient client(url);
+    client.enable_server_certificate_verification(false);
+    client.set_session_verifier([](tls::session_t) {
+      return SSLVerifierResponse::CertificateAccepted;
+    });
+    EXPECT_TRUE(client.connect());
+  }
+}
 
 TEST_F(WebSocketSSLIntegrationTest, TextEcho) {
   ws::WebSocketClient client("wss://localhost:" + std::to_string(port_) +
@@ -19386,6 +30333,32 @@ TEST_F(WebSocketSSLCATest, WrongCustomCaFailsVerification) {
   read_file(CLIENT_CA_CERT_FILE, cert);
   client.load_ca_cert_store(cert.c_str(), cert.size());
 
+  auto res = client.connect();
+  ASSERT_FALSE(res);
+  EXPECT_EQ(Error::SSLServerVerification, res.error());
+  EXPECT_EQ(-1, res.status());
+  EXPECT_NE(0u, res.ssl_backend_error());
+}
+
+// The same CA as a file path rather than PEM in memory
+TEST_F(WebSocketSSLCATest, SetCaCertPathVerifiesServer) {
+  ws::WebSocketClient client(url());
+  client.set_ca_cert_path(SERVER_CERT2_FILE);
+
+  ASSERT_TRUE(client.connect());
+  ASSERT_TRUE(client.send("hello"));
+  std::string msg;
+  EXPECT_EQ(ws::Text, client.read(msg));
+  EXPECT_EQ("hello", msg);
+  client.close();
+}
+
+// ...and a CA file that does not cover the server still fails, so it is the
+// path above that decides the outcome
+TEST_F(WebSocketSSLCATest, WrongCaCertPathFailsVerification) {
+  ws::WebSocketClient client(url());
+  client.set_ca_cert_path(CLIENT_CA_CERT_FILE);
+
   ASSERT_FALSE(client.connect());
 }
 
@@ -19439,6 +30412,205 @@ TEST(WebSocketSSLVerifyTest, TrustedChainWrongIdentityFails) {
 
   ASSERT_FALSE(client.connect());
 }
+
+// The tests above all connect to an IP literal, for which RFC 6066 forbids
+// SNI, so nothing binds the host name to the TLS session. These bind the
+// server to "localhost" instead, the only shape that exercises the SNI and
+// hostname-verification path with certificate verification left enabled.
+class WebSocketSSLDnsHostTest : public ::testing::Test {
+protected:
+  void Start(const char *cert_file) {
+    server_ = httplib::detail::make_unique<SSLServer>(cert_file,
+                                                      SERVER_PRIVATE_KEY_FILE);
+    ASSERT_TRUE(server_->is_valid());
+    server_->WebSocket("/echo", [](const Request &, ws::WebSocket &ws) {
+      std::string msg;
+      while (ws.read(msg)) {
+        ws.send(msg);
+      }
+    });
+    port_ = server_->bind_to_any_port("localhost");
+    server_thread_ = std::thread([this]() { server_->listen_after_bind(); });
+    server_->wait_until_ready();
+  }
+
+  void TearDown() override {
+    if (server_) { server_->stop(); }
+    if (server_thread_.joinable()) { server_thread_.join(); }
+  }
+
+  std::string url() const {
+    return "wss://localhost:" + std::to_string(port_) + "/echo";
+  }
+
+  std::unique_ptr<SSLServer> server_;
+  std::thread server_thread_;
+  int port_ = 0;
+};
+
+// cert2 carries a DNS:localhost SAN, so both the chain and the identity check
+// out and the connection is usable
+TEST_F(WebSocketSSLDnsHostTest, TrustedChainMatchingNameVerifies) {
+  Start(SERVER_CERT2_FILE);
+
+  ws::WebSocketClient client(url());
+  client.set_ca_cert_path(SERVER_CERT2_FILE);
+
+  ASSERT_TRUE(client.connect());
+  ASSERT_TRUE(client.send("hello"));
+  std::string msg;
+  EXPECT_EQ(ws::Text, client.read(msg));
+  EXPECT_EQ("hello", msg);
+  client.close();
+}
+
+// cert.pem has a CN but no SAN, so trusting it as a CA satisfies the chain
+// while the identity check must still reject "localhost"
+TEST_F(WebSocketSSLDnsHostTest, TrustedChainWrongNameFails) {
+  Start(SERVER_CERT_FILE);
+
+  ws::WebSocketClient client(url());
+  client.set_ca_cert_path(SERVER_CERT_FILE);
+
+  auto res = client.connect();
+  ASSERT_FALSE(res);
+  EXPECT_EQ(Error::SSLServerHostnameVerification, res.error());
+  EXPECT_EQ(-1, res.status());
+}
+
+// Same setup as TrustedChainWrongNameFails, but with hostname verification
+// disabled: the chain is still checked, only the identity check is skipped
+TEST_F(WebSocketSSLDnsHostTest, HostnameVerificationDisabledAcceptsWrongName) {
+  Start(SERVER_CERT_FILE);
+
+  ws::WebSocketClient client(url());
+  client.set_ca_cert_path(SERVER_CERT_FILE);
+  client.enable_server_hostname_verification(false);
+
+  ASSERT_TRUE(client.connect());
+  ASSERT_TRUE(client.send("hello"));
+  std::string msg;
+  EXPECT_EQ(ws::Text, client.read(msg));
+  EXPECT_EQ("hello", msg);
+  client.close();
+}
+
+// A CA that did not sign the server certificate fails the chain, even though
+// the name would match
+TEST_F(WebSocketSSLDnsHostTest, UntrustedChainFails) {
+  Start(SERVER_CERT2_FILE);
+
+  ws::WebSocketClient client(url());
+  client.set_ca_cert_path(CLIENT_CA_CERT_FILE);
+
+  ASSERT_FALSE(client.connect());
+}
+
+// With verification disabled, neither the chain nor the name is checked
+TEST_F(WebSocketSSLDnsHostTest, VerificationDisabledAcceptsAnyName) {
+  Start(SERVER_CERT_FILE);
+
+  ws::WebSocketClient client(url());
+  client.enable_server_certificate_verification(false);
+
+  ASSERT_TRUE(client.connect());
+  ASSERT_TRUE(client.send("hello"));
+  std::string msg;
+  EXPECT_EQ(ws::Text, client.read(msg));
+  EXPECT_EQ("hello", msg);
+  client.close();
+}
+
+class WebSocketSSLPemMemoryTest : public ::testing::Test {
+protected:
+  void SetUp() override {
+    server_ = httplib::detail::make_unique<SSLServer>(
+        SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE, CLIENT_CA_CERT_FILE);
+    ASSERT_TRUE(server_->is_valid());
+    server_->WebSocket("/ws-echo", [](const Request &, ws::WebSocket &ws) {
+      std::string msg;
+      while (ws.read(msg)) {
+        ws.send(msg);
+      }
+    });
+    port_ = server_->bind_to_any_port("localhost");
+    server_thread_ = std::thread([this]() { server_->listen_after_bind(); });
+    server_->wait_until_ready();
+  }
+
+  void TearDown() override {
+    server_->stop();
+    if (server_thread_.joinable()) { server_thread_.join(); }
+  }
+
+  std::string url() const {
+    return "wss://localhost:" + std::to_string(port_) + "/ws-echo";
+  }
+
+  void ConnectWithClientCert(const std::string &client_cert_file,
+                             const std::string &client_private_key_file,
+                             const char *private_key_password) {
+    std::string cert_pem, key_pem;
+    read_file(client_cert_file, cert_pem);
+    read_file(client_private_key_file, key_pem);
+
+    ws::WebSocketClient::PemMemory pem = {cert_pem.c_str(), cert_pem.size(),
+                                          key_pem.c_str(), key_pem.size(),
+                                          private_key_password};
+    ConnectWithPem(pem);
+  }
+
+  void ConnectWithPem(const ws::WebSocketClient::PemMemory &pem) {
+    ws::WebSocketClient client(url(), pem);
+    ASSERT_TRUE(client.is_valid());
+    client.enable_server_certificate_verification(false);
+
+    ASSERT_TRUE(client.connect());
+    ASSERT_TRUE(client.send("hello"));
+    std::string msg;
+    EXPECT_EQ(ws::Text, client.read(msg));
+    EXPECT_EQ("hello", msg);
+    client.close();
+  }
+
+  std::unique_ptr<SSLServer> server_;
+  std::thread server_thread_;
+  int port_ = 0;
+};
+
+TEST_F(WebSocketSSLPemMemoryTest, ClientCertAccepted) {
+  ConnectWithClientCert(CLIENT_CERT_FILE, CLIENT_PRIVATE_KEY_FILE, nullptr);
+}
+
+// Control for the tests above: the fixture's server really does require a
+// client certificate, so it is the PEM the constructor installed that decides
+// the outcome.
+TEST_F(WebSocketSSLPemMemoryTest, NoClientCertRejected) {
+  ws::WebSocketClient client(url());
+  ASSERT_TRUE(client.is_valid());
+  client.enable_server_certificate_verification(false);
+
+  EXPECT_FALSE(client.connect());
+}
+
+TEST_F(WebSocketSSLPemMemoryTest, EncryptedClientCertAccepted) {
+  ConnectWithClientCert(CLIENT_ENCRYPTED_CERT_FILE,
+                        CLIENT_ENCRYPTED_PRIVATE_KEY_FILE,
+                        CLIENT_ENCRYPTED_PRIVATE_KEY_PASS);
+}
+
+// The PemMemory lengths are honoured, so the PEM needs no NUL terminator
+TEST_F(WebSocketSSLPemMemoryTest, ExactSizeBuffersAccepted) {
+  std::string cert_pem, key_pem;
+  read_file(CLIENT_CERT_FILE, cert_pem);
+  read_file(CLIENT_PRIVATE_KEY_FILE, key_pem);
+  std::vector<char> cert(cert_pem.begin(), cert_pem.end());
+  std::vector<char> key(key_pem.begin(), key_pem.end());
+
+  ws::WebSocketClient::PemMemory pem = {cert.data(), cert.size(), key.data(),
+                                        key.size(), nullptr};
+  ConnectWithPem(pem);
+}
 #endif
 
 #if !defined(_WIN32)
@@ -19489,19 +30661,20 @@ TEST(SymlinkTest, SymlinkEscapeFromBaseDirectory) {
 
   // Symlink pointing outside base dir should be blocked
   auto res = cli.Get("/escape/secret.txt");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::Forbidden_403, res->status);
 }
 #endif
 
-TEST(RequestSmugglingTest, UnconsumedGETBodyOnFileHandler) {
-  // A GET request with Content-Length to a static file handler must have its
-  // body drained before the keep-alive connection is reused. Otherwise the
-  // unread body bytes are interpreted as the next HTTP request.
-  //
-  // The body is sent AFTER receiving the first response (as in the original
-  // PoC) so that the stream_line_reader cannot buffer it together with the
-  // headers of the first request.
+// Sends `outer_head` (with every "{len}" replaced by the length of an embedded
+// "GET /smuggled" request), reads the first response, and only then sends the
+// embedded request as the body. Returns how many times /smuggled ran.
+//
+// The body is sent AFTER receiving the first response (as in the original
+// PoC) so that the stream_line_reader cannot buffer it together with the
+// headers of the first request.
+static int count_smuggled_requests(const std::string &outer_head,
+                                   std::string &first_response) {
   Server svr;
   svr.set_mount_point("/", "./www");
 
@@ -19509,6 +30682,9 @@ TEST(RequestSmugglingTest, UnconsumedGETBodyOnFileHandler) {
   svr.Get("/smuggled", [&](const Request &, Response &res) {
     smuggled_count++;
     res.set_content("oops", "text/plain");
+  });
+  svr.Post("/post", [&](const Request &req, Response &res) {
+    res.set_content(req.body, "text/plain");
   });
 
   auto port = svr.bind_to_any_port("localhost");
@@ -19525,28 +30701,28 @@ TEST(RequestSmugglingTest, UnconsumedGETBodyOnFileHandler) {
       /*connection_timeout_sec=*/2, 0,
       /*read_timeout_sec=*/2, 0,
       /*write_timeout_sec=*/2, 0, std::string(), error);
-  ASSERT_NE(INVALID_SOCKET, sock);
+  EXPECT_NE(INVALID_SOCKET, sock);
+  if (sock == INVALID_SOCKET) { return -1; }
   auto sock_se = detail::scope_exit([&] { detail::close_socket(sock); });
 
-  // The "smuggled" request will be sent as the body of the outer GET
+  // The "smuggled" request will be sent as the body of the outer request
   std::string smuggled = "GET /smuggled HTTP/1.1\r\n"
                          "Host: localhost\r\n"
                          "Connection: close\r\n"
                          "\r\n";
 
+  auto head = outer_head;
+  auto len = std::to_string(smuggled.size());
+  for (auto pos = head.find("{len}"); pos != std::string::npos;
+       pos = head.find("{len}", pos + len.size())) {
+    head.replace(pos, 5, len);
+  }
+
   // Step 1: Send only the outer request headers (no body yet)
-  std::string outer_headers = "GET /file HTTP/1.1\r\n"
-                              "Host: localhost\r\n"
-                              "Content-Length: " +
-                              std::to_string(smuggled.size()) +
-                              "\r\n"
-                              "\r\n";
+  auto sent = detail::send_socket(sock, head.data(), head.size(), 0);
+  EXPECT_EQ(static_cast<ssize_t>(head.size()), sent);
 
-  auto sent = send(sock, outer_headers.data(), outer_headers.size(), 0);
-  ASSERT_EQ(static_cast<ssize_t>(outer_headers.size()), sent);
-
-  // Step 2: Read the first response (server serves file without reading body)
-  std::string first_response;
+  // Step 2: Read the first response
   char buf[4096];
   for (;;) {
     auto n = recv(sock, buf, sizeof(buf), 0);
@@ -19568,23 +30744,221 @@ TEST(RequestSmugglingTest, UnconsumedGETBodyOnFileHandler) {
       }
     }
   }
-  ASSERT_TRUE(first_response.find("HTTP/1.1 200") != std::string::npos);
 
-  // Step 3: Now send the body, which looks like a new HTTP request.
-  // On a vulnerable server the keep-alive loop reads this as a second request.
-  sent = send(sock, smuggled.data(), smuggled.size(), 0);
-  ASSERT_EQ(static_cast<ssize_t>(smuggled.size()), sent);
+  // Step 3: Now send the body, which looks like a new HTTP request. On a
+  // vulnerable server the keep-alive loop reads this as a second request. The
+  // server may already have closed the connection, so the result is ignored.
+  detail::send_socket(sock, smuggled.data(), smuggled.size(), 0);
 
-  // Step 4: Try to read a second response (should NOT exist after fix)
-  std::string second_response;
+  // Half-close so that a server which drained the body sees EOF and closes,
+  // instead of the read below waiting for the read timeout.
+#ifdef _WIN32
+  ::shutdown(sock, SD_SEND);
+#else
+  ::shutdown(sock, SHUT_WR);
+#endif
+
+  // Step 4: Read until the server closes the connection
   for (;;) {
     auto n = recv(sock, buf, sizeof(buf), 0);
     if (n <= 0) break;
-    second_response.append(buf, static_cast<size_t>(n));
   }
 
-  // The smuggled request must NOT have been processed
-  EXPECT_EQ(0, smuggled_count.load());
+  return smuggled_count.load();
+}
+
+TEST(RequestSmugglingTest, UnconsumedGETBodyOnFileHandler) {
+  // A GET request with Content-Length to a static file handler must have its
+  // body drained before the keep-alive connection is reused. Otherwise the
+  // unread body bytes are interpreted as the next HTTP request.
+  std::string first_response;
+  EXPECT_EQ(0, count_smuggled_requests("GET /file HTTP/1.1\r\n"
+                                       "Host: localhost\r\n"
+                                       "Content-Length: {len}\r\n"
+                                       "\r\n",
+                                       first_response));
+  EXPECT_EQ(0u, first_response.find("HTTP/1.1 200"));
+}
+
+TEST(RequestSmugglingTest, InvalidContentLengthRejected) {
+  // RFC 9112 §6.3: a Content-Length that is not a valid decimal length must
+  // be answered with 400 and the connection closed. Treating it as "no body"
+  // leaves the body to be parsed as the next request.
+  const char *values[] = {"{len}, {len}", "+{len}", "0x2e", "", " {len}x"};
+  const char *targets[] = {
+      "GET /file",      // handler that never reads the body
+      "GET /not-found", // no handler matches (404)
+      "POST /post",     // handler that reads the body
+  };
+  for (auto target : targets) {
+    for (auto value : values) {
+      std::string first_response;
+      EXPECT_EQ(0, count_smuggled_requests(std::string(target) +
+                                               " HTTP/1.1\r\n"
+                                               "Host: localhost\r\n"
+                                               "Content-Length: " +
+                                               value + "\r\n\r\n",
+                                           first_response))
+          << target << " with Content-Length: " << value;
+      EXPECT_EQ(0u, first_response.find("HTTP/1.1 400"))
+          << target << " with Content-Length: " << value;
+    }
+  }
+}
+
+TEST(RequestSmugglingTest, RejectedRequestLineClosesConnection) {
+  // A 400 for an unparseable request line leaves the rest of the message
+  // unread, so the connection must be closed rather than reused.
+  std::string first_response;
+  EXPECT_EQ(0, count_smuggled_requests("FOO /file HTTP/1.1\r\n"
+                                       "Host: localhost\r\n"
+                                       "Content-Length: {len}\r\n"
+                                       "\r\n",
+                                       first_response));
+  EXPECT_EQ(0u, first_response.find("HTTP/1.1 400"));
+}
+
+TEST(RequestSmugglingTest, RejectedHeadersCloseConnection) {
+  // Same as above for a header block that fails to parse.
+  std::string first_response;
+  EXPECT_EQ(0, count_smuggled_requests("GET /file HTTP/1.1\r\n"
+                                       "Host: localhost\r\n"
+                                       "Bad Header\r\n"
+                                       "Content-Length: {len}\r\n"
+                                       "\r\n",
+                                       first_response));
+  EXPECT_EQ(0u, first_response.find("HTTP/1.1 400"));
+}
+
+TEST(RequestSmugglingTest, ErrorResponseClosesConnection) {
+  // RFC 9112 §9.6: an error response carries "Connection: close", so the
+  // server must not read another request on that connection, even when the
+  // request had no body to drain.
+  std::string first_response;
+  EXPECT_EQ(0, count_smuggled_requests("GET /not-found HTTP/1.1\r\n"
+                                       "Host: localhost\r\n"
+                                       "\r\n",
+                                       first_response));
+  EXPECT_EQ(0u, first_response.find("HTTP/1.1 404"));
+  EXPECT_NE(std::string::npos, first_response.find("Connection: close"));
+}
+
+TEST(RequestSmugglingTest, AbortedContentReaderClosesConnection) {
+  // A content reader that stops early leaves the stream inside the body.
+  // Draining the whole Content-Length from there, or reading the body again,
+  // reads into the next request, and whatever follows is parsed as a request
+  // of its own.
+  Server svr;
+  std::atomic<int> smuggled_count(0);
+  svr.Get("/smuggled", [&](const Request &, Response &) { smuggled_count++; });
+  svr.Post("/upload", [](const Request &req, Response &res,
+                         const ContentReader &content_reader) {
+    // Stop at the last chunk, so the whole body has been read however it
+    // arrives.
+    auto length = req.get_header_value_u64("Content-Length");
+    size_t total = 0;
+    auto consumed = content_reader([&](const char *, size_t n) {
+      total += n;
+      return total < length;
+    });
+    EXPECT_FALSE(consumed);
+    if (req.has_param("retry")) {
+      EXPECT_FALSE(content_reader([](const char *, size_t) { return true; }));
+    }
+    // Replace the 400 the aborted read set, which would close the connection.
+    res.set_redirect("/done");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  // A front end sees the second request as a POST whose body is the GET. The
+  // first body is as long as the POST's headers, so draining it again reads
+  // exactly those and leaves the GET to be parsed next.
+  std::string inner = "GET /smuggled HTTP/1.1\r\n"
+                      "Host: localhost\r\n"
+                      "\r\n";
+  std::string second_head = "POST /post HTTP/1.1\r\n"
+                            "Host: localhost\r\n"
+                            "Content-Length: " +
+                            std::to_string(inner.size()) +
+                            "\r\n"
+                            "\r\n";
+  for (auto target : {"/upload", "/upload?retry"}) {
+    smuggled_count = 0;
+    std::string request = "POST " + std::string(target) +
+                          " HTTP/1.1\r\n"
+                          "Host: localhost\r\n"
+                          "Content-Length: " +
+                          std::to_string(second_head.size()) +
+                          "\r\n"
+                          "\r\n" +
+                          std::string(second_head.size(), 'A') + second_head +
+                          inner;
+
+    std::string response;
+    ASSERT_TRUE(send_request(2, request, &response, port)) << target;
+
+    EXPECT_EQ(0u, response.find("HTTP/1.1 302")) << target;
+    EXPECT_NE(std::string::npos, response.find("Connection: close")) << target;
+    EXPECT_EQ(std::string::npos, response.find("HTTP/1.1", 1)) << target;
+    EXPECT_EQ(0, smuggled_count.load()) << target;
+  }
+}
+
+// An error response closes the connection anyway, so the body is left unread
+// with a redirect, such as one to a login page.
+static void serve_redirects(Server &svr,
+                            const std::function<void(int)> &client) {
+  svr.set_pre_routing_handler([](const Request &, Response &res) {
+    res.set_redirect("/login");
+    return Server::HandlerResponse::Handled;
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_GT(port, 0);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  client(port);
+}
+
+TEST(UnreadBodyDrainTest, LongerThanTheLimitClosesTheConnection) {
+  Server svr;
+  serve_redirects(svr, [](int port) {
+    auto body = std::string(CPPHTTPLIB_UNREAD_PAYLOAD_MAX_LENGTH + 1, 'x');
+    auto req = "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: " +
+               std::to_string(body.size()) + "\r\n\r\n" + body +
+               "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    std::string resp;
+    ASSERT_TRUE(send_request(1, req, &resp, port));
+    ASSERT_EQ(0u, resp.find("HTTP/1.1 302"));
+    EXPECT_EQ(std::string::npos, resp.find("HTTP/1.1", 1));
+  });
+}
+
+TEST(UnreadBodyDrainTest, SlowerThanTheReadTimeoutClosesTheConnection) {
+  Server svr;
+  svr.set_read_timeout(0, 200000);
+  serve_redirects(svr, [](int port) {
+    // A byte every 100 ms keeps each read within the read timeout, but not the
+    // body as a whole, so the server closes and the bytes sent after that fail.
+    std::vector<std::string> parts{"POST / HTTP/1.1\r\nHost: localhost\r\n"
+                                   "Content-Length: 10\r\n\r\n"};
+    parts.resize(11, "x");
+    EXPECT_FALSE(send_request_in_parts(1, parts, nullptr, port));
+  });
 }
 
 TEST(RequestSmugglingTest, ContentLengthAndTransferEncodingRejected) {
@@ -19636,6 +31010,87 @@ TEST(RequestSmugglingTest, ContentLengthAndTransferEncodingRejected) {
   }
 }
 
+TEST(RequestSmugglingTest, NonFinalChunkedTransferEncodingRejected) {
+  Server svr;
+  svr.Post("/test", [&](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  thread t = thread([&] { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  // RFC 9112 6.3: when chunked is not the final transfer coding the body
+  // length cannot be determined, so the server must answer 400 and close
+  // rather than treat the request as bodyless and leave the body in the
+  // socket for the next request to pick up.
+  for (const auto &transfer_encoding : {"gzip", "chunked, gzip"}) {
+    auto req = std::string("POST /test HTTP/1.1\r\n") + "Host: localhost\r\n" +
+               "Transfer-Encoding: " + transfer_encoding + "\r\n" + "\r\n";
+
+    std::string response;
+    ASSERT_TRUE(send_request(1, req, &response));
+    EXPECT_EQ("HTTP/1.1 400 Bad Request",
+              response.substr(0, response.find("\r\n")))
+        << transfer_encoding;
+  }
+
+  // RFC 9110 5.3: the codings may also be split across several
+  // Transfer-Encoding lines, which combine in the order they were received.
+  // "chunked" followed by "gzip" therefore ends in gzip and must be rejected
+  // just like the single-line "chunked, gzip" above.
+  {
+    auto req = "POST /test HTTP/1.1\r\n"
+               "Host: localhost\r\n"
+               "Transfer-Encoding: chunked\r\n"
+               "Transfer-Encoding: gzip\r\n"
+               "\r\n"
+               "0\r\n\r\n";
+
+    std::string response;
+    ASSERT_TRUE(send_request(1, req, &response));
+    EXPECT_EQ("HTTP/1.1 400 Bad Request",
+              response.substr(0, response.find("\r\n")));
+  }
+}
+
+TEST(RequestSmugglingTest, TransferEncodingOtherThanChunkedNotImplemented) {
+  Server svr;
+  svr.Post("/test", [&](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  ASSERT_GT(port, 0);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+  svr.wait_until_ready();
+
+  for (auto transfer_encoding :
+       {"Transfer-Encoding: gzip, chunked\r\n",
+        "Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
+        "Transfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n"}) {
+    auto req = std::string("POST /test HTTP/1.1\r\nHost: localhost\r\n") +
+               transfer_encoding + "\r\n0\r\n\r\n";
+
+    std::string response;
+    ASSERT_TRUE(send_request(1, req, &response, port)) << transfer_encoding;
+    EXPECT_EQ("HTTP/1.1 501 Not Implemented",
+              response.substr(0, response.find("\r\n")))
+        << transfer_encoding;
+    EXPECT_NE(std::string::npos, response.find("Connection: close"))
+        << transfer_encoding;
+  }
+}
+
 // Regression for issue #2450: a DELETE without Content-Length on a
 // keep-alive connection must not let the post-response drain consume the
 // next request's bytes.
@@ -19667,7 +31122,7 @@ TEST(KeepAliveTest, DeleteWithoutContentLengthDoesNotEatNextRequest) {
 
   auto send_request_and_read_response = [&](const std::string &req,
                                             std::string &out) -> bool {
-    auto sent = send(sock, req.data(), req.size(), 0);
+    auto sent = detail::send_socket(sock, req.data(), req.size(), 0);
     if (sent != static_cast<ssize_t>(req.size())) { return false; }
     char buf[4096];
     for (;;) {
@@ -19694,6 +31149,55 @@ TEST(KeepAliveTest, DeleteWithoutContentLengthDoesNotEatNextRequest) {
   EXPECT_NE(std::string::npos, resp2.find("HTTP/1.1 204"));
 
   EXPECT_EQ(2, delete_count.load());
+}
+
+TEST(KeepAliveTest, UnconsumedChunkedBodyIsNotDrainedWhenResponseCloses) {
+  Server svr;
+  svr.Post("/ingest", [&](const Request &, Response &res,
+                          const ContentReader &content_reader) {
+    auto consumed = content_reader([](const char *, size_t) { return false; });
+    EXPECT_FALSE(consumed);
+    res.status = StatusCode::Conflict_409;
+    res.set_header("Connection", "close");
+  });
+
+  auto port = svr.bind_to_any_port(HOST);
+  thread t = thread([&] { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  auto error = Error::Success;
+  auto sock = detail::create_client_socket(
+      HOST, "", port, AF_UNSPEC, false, false, nullptr,
+      /*connection_timeout_sec=*/2, 0,
+      /*read_timeout_sec=*/1, 0,
+      /*write_timeout_sec=*/2, 0, std::string(), error);
+  ASSERT_NE(INVALID_SOCKET, sock);
+  auto sock_se = detail::scope_exit([&] { detail::close_socket(sock); });
+
+  std::string request = "POST /ingest HTTP/1.1\r\n"
+                        "Host: localhost\r\n"
+                        "Transfer-Encoding: chunked\r\n"
+                        "\r\n"
+                        "4\r\n"
+                        "data\r\n";
+  auto sent = detail::send_socket(sock, request.data(), request.size(), 0);
+  ASSERT_EQ(static_cast<ssize_t>(request.size()), sent);
+
+  std::string response;
+  ssize_t received = 0;
+  do {
+    char buf[4096];
+    received = recv(sock, buf, sizeof(buf), 0);
+    if (received > 0) { response.append(buf, static_cast<size_t>(received)); }
+  } while (received > 0);
+
+  EXPECT_NE(std::string::npos, response.find("HTTP/1.1 409 Conflict"));
+  EXPECT_NE(std::string::npos, response.find("Connection: close"));
+  EXPECT_EQ(0, received);
 }
 
 namespace no_proxy_test {
@@ -19779,7 +31283,7 @@ private:
 inline std::unique_ptr<Client> make_client(const std::string &host,
                                            ProxyAndTargetServers &s) {
   auto cli = detail::make_unique<Client>(host, s.target_port());
-  cli->set_hostname_addr_map({{host, "127.0.0.1"}});
+  cli->set_direct_hostname_addr_map({{host, "127.0.0.1"}});
   cli->set_proxy("127.0.0.1", s.proxy_port());
   return cli;
 }
@@ -19789,13 +31293,90 @@ inline std::unique_ptr<Client> make_client(const std::string &host,
 using no_proxy_test::make_client;
 using no_proxy_test::ProxyAndTargetServers;
 
+// A stream request carries the credentials a buffered request does
+TEST(StreamRequestHeadTest, SendsTheClientsCredentials) {
+  no_proxy_test::ScopedServer origin;
+  origin.svr().Get("/x", [](const Request &req, Response &res) {
+    res.set_content(req.get_header_value("Authorization"), "text/plain");
+  });
+  origin.listen();
+
+  Client cli("127.0.0.1", origin.port());
+  cli.set_basic_auth("user", "pass");
+  auto handle = cli.open_stream("GET", "/x");
+  ASSERT_TRUE(handle.is_valid());
+  EXPECT_EQ("Basic dXNlcjpwYXNz", read_all(handle));
+
+  Client bearer("127.0.0.1", origin.port());
+  bearer.set_bearer_token_auth("tok");
+  auto handle2 = bearer.open_stream("GET", "/x");
+  ASSERT_TRUE(handle2.is_valid());
+  EXPECT_EQ("Bearer tok", read_all(handle2));
+}
+
+// A plain HTTP proxy reads the target in absolute-form (RFC 9112 3.2.2) and
+// takes its own credentials, as for a buffered request
+TEST(StreamRequestHeadTest, GoesThroughAPlainHttpProxy) {
+  std::string target, authz, proxy_authz;
+  no_proxy_test::ScopedServer proxy;
+  proxy.svr().Get(".*", [&](const Request &req, Response &res) {
+    target = req.target;
+    authz = req.get_header_value("Authorization");
+    proxy_authz = req.get_header_value("Proxy-Authorization");
+    res.set_content("ok", "text/plain");
+  });
+  proxy.listen();
+
+  Client cli("origin.example", 8080);
+  cli.set_proxy("127.0.0.1", proxy.port());
+  cli.set_proxy_basic_auth("puser", "ppass");
+  cli.set_basic_auth("user", "pass");
+  auto handle = cli.open_stream("GET", "/x");
+  ASSERT_TRUE(handle.is_valid());
+  EXPECT_EQ("ok", read_all(handle));
+
+  EXPECT_EQ("http://origin.example:8080/x", target);
+  EXPECT_EQ("Basic dXNlcjpwYXNz", authz);
+  EXPECT_EQ("Basic cHVzZXI6cHBhc3M=", proxy_authz);
+}
+
+// In absolute-form the path follows the authority, so a path that does not
+// begin with '/' would make the proxy connect to another host
+TEST(ProxyAbsoluteFormTest, PathMustNotExtendTheAuthority) {
+  std::vector<std::string> targets;
+  no_proxy_test::ScopedServer proxy;
+  proxy.svr().Get(".*", [&](const Request &req, Response &res) {
+    targets.push_back(req.target);
+    res.set_content("ok", "text/plain");
+  });
+  proxy.listen();
+
+  Client cli("origin.example", 8080);
+  cli.set_proxy("127.0.0.1", proxy.port());
+  cli.set_basic_auth("user", "pass");
+
+  for (const auto &path : {"@evil.example/x", ".evil.example/x", ":81/x"}) {
+    auto res = cli.Get(path);
+    EXPECT_FALSE(res) << path;
+
+    auto handle = cli.open_stream("GET", path);
+    EXPECT_FALSE(handle.is_valid()) << path;
+  }
+  EXPECT_TRUE(targets.empty());
+
+  auto res = cli.Get("/x");
+  ASSERT_TRUE(res);
+  ASSERT_EQ(1u, targets.size());
+  EXPECT_EQ("http://origin.example:8080/x", targets[0]);
+}
+
 TEST(NoProxyTest, ExactHostnameBypasses) {
   ProxyAndTargetServers s;
   auto cli = make_client("example.com", s);
   cli->set_no_proxy({"example.com"});
 
   auto res = cli->Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -19806,7 +31387,7 @@ TEST(NoProxyTest, SubdomainBypasses) {
   cli->set_no_proxy({"example.com"});
 
   auto res = cli->Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -19821,7 +31402,7 @@ TEST(NoProxyTest, EvilExampleDoesNotMatchExample) {
   cli->set_no_proxy({"example.com"});
 
   auto res = cli->Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_GE(s.proxy_hits(), 1);
   EXPECT_EQ(0, s.target_hits());
 }
@@ -19832,7 +31413,7 @@ TEST(NoProxyTest, ExampleDotEvilDoesNotMatchExample) {
   cli->set_no_proxy({"example.com"});
 
   auto res = cli->Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_GE(s.proxy_hits(), 1);
   EXPECT_EQ(0, s.target_hits());
 }
@@ -19843,7 +31424,7 @@ TEST(NoProxyTest, LeadingDotPatternMatchesBareDomain) {
   cli->set_no_proxy({".example.com"});
 
   auto res = cli->Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -19854,7 +31435,7 @@ TEST(NoProxyTest, CaseInsensitiveHostname) {
   cli->set_no_proxy({"EXAMPLE.com"});
 
   auto res = cli->Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -19865,7 +31446,7 @@ TEST(NoProxyTest, TrailingDotIsNormalized) {
   cli->set_no_proxy({"example.com"});
 
   auto res = cli->Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -19880,7 +31461,7 @@ TEST(NoProxyTest, TrailingDotOnEntryIsNormalized) {
   cli->set_no_proxy({"example.com."});
 
   auto res = cli->Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -19891,7 +31472,7 @@ TEST(NoProxyTest, WildcardBypassesEverything) {
   cli->set_no_proxy({"*"});
 
   auto res = cli->Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -19903,7 +31484,7 @@ TEST(NoProxyTest, IPv4LiteralExactMatch) {
   cli.set_no_proxy({"127.0.0.1"});
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -19911,12 +31492,12 @@ TEST(NoProxyTest, IPv4LiteralExactMatch) {
 TEST(NoProxyTest, IPv6LiteralExactMatchAcrossEquivalentForms) {
   ProxyAndTargetServers s;
   Client cli("0:0:0:0:0:0:0:1", s.target_port());
-  cli.set_hostname_addr_map({{"0:0:0:0:0:0:0:1", "127.0.0.1"}});
+  cli.set_direct_hostname_addr_map({{"0:0:0:0:0:0:0:1", "127.0.0.1"}});
   cli.set_proxy("127.0.0.1", s.proxy_port());
   cli.set_no_proxy({"::1"});
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -19928,12 +31509,12 @@ TEST(NoProxyTest, BareIPv6LiteralMatchesIPv6Cidr) {
   // host as a hostname and miss the match.
   ProxyAndTargetServers s;
   Client cli("fe80::1", s.target_port());
-  cli.set_hostname_addr_map({{"fe80::1", "127.0.0.1"}});
+  cli.set_direct_hostname_addr_map({{"fe80::1", "127.0.0.1"}});
   cli.set_proxy("127.0.0.1", s.proxy_port());
   cli.set_no_proxy({"fe80::/10"});
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -19941,12 +31522,12 @@ TEST(NoProxyTest, BareIPv6LiteralMatchesIPv6Cidr) {
 TEST(NoProxyTest, BracketedIPv6EntryAccepted) {
   ProxyAndTargetServers s;
   Client cli("::1", s.target_port());
-  cli.set_hostname_addr_map({{"::1", "127.0.0.1"}});
+  cli.set_direct_hostname_addr_map({{"::1", "127.0.0.1"}});
   cli.set_proxy("127.0.0.1", s.proxy_port());
   cli.set_no_proxy({"[::1]"});
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -19954,12 +31535,12 @@ TEST(NoProxyTest, BracketedIPv6EntryAccepted) {
 TEST(NoProxyTest, BracketedIPv6CidrEntryAccepted) {
   ProxyAndTargetServers s;
   Client cli("fe80::1", s.target_port());
-  cli.set_hostname_addr_map({{"fe80::1", "127.0.0.1"}});
+  cli.set_direct_hostname_addr_map({{"fe80::1", "127.0.0.1"}});
   cli.set_proxy("127.0.0.1", s.proxy_port());
   cli.set_no_proxy({"[fe80::]/10"});
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -19970,12 +31551,12 @@ TEST(NoProxyTest, IPv4MappedIPv6IsNotCrossMatchedAgainstIPv4Entry) {
   // tricks via address-family conversion.
   ProxyAndTargetServers s;
   Client cli("::ffff:127.0.0.1", s.target_port());
-  cli.set_hostname_addr_map({{"::ffff:127.0.0.1", "127.0.0.1"}});
+  cli.set_direct_hostname_addr_map({{"::ffff:127.0.0.1", "127.0.0.1"}});
   cli.set_proxy("127.0.0.1", s.proxy_port());
   cli.set_no_proxy({"127.0.0.1"});
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_GE(s.proxy_hits(), 1);
   EXPECT_EQ(0, s.target_hits());
 }
@@ -19987,7 +31568,7 @@ TEST(NoProxyTest, IPv4CidrMatch) {
   cli.set_no_proxy({"127.0.0.0/8"});
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -19999,7 +31580,7 @@ TEST(NoProxyTest, IPv4CidrNonMatch) {
   cli.set_no_proxy({"10.0.0.0/8"});
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_GE(s.proxy_hits(), 1);
   EXPECT_EQ(0, s.target_hits());
 }
@@ -20013,7 +31594,7 @@ TEST(NoProxyTest, IPv4CidrPrefixZeroMatchesAll) {
   cli.set_no_proxy({"0.0.0.0/0"});
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -20025,7 +31606,7 @@ TEST(NoProxyTest, IPv4CidrSingleHostNoSlash) {
   cli.set_no_proxy({"127.0.0.1"});
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -20037,7 +31618,7 @@ TEST(NoProxyTest, MalformedCidrPrefixIsDropped) {
   cli.set_no_proxy({"127.0.0.0/33"});
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_GE(s.proxy_hits(), 1);
   EXPECT_EQ(0, s.target_hits());
 }
@@ -20050,7 +31631,7 @@ TEST(NoProxyTest, TrailingSlashCidrIsRejected) {
   cli.set_no_proxy({"127.0.0.1/"});
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_GE(s.proxy_hits(), 1);
   EXPECT_EQ(0, s.target_hits());
 }
@@ -20062,7 +31643,7 @@ TEST(NoProxyTest, ProxyAuthorizationSuppressedWhenBypassed) {
   cli->set_no_proxy({"internal.corp"});
 
   auto res = cli->Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(1, s.target_hits());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_FALSE(s.last_had_proxy_authz())
@@ -20076,9 +31657,42 @@ TEST(NoProxyTest, ProxyAuthorizationSentWhenNotBypassed) {
   cli->set_no_proxy({"internal.corp"}); // does not match
 
   auto res = cli->Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_GE(s.proxy_hits(), 1);
   EXPECT_TRUE(s.last_had_proxy_authz());
+}
+
+TEST(NoProxyTest, ProxyAuthorizationSentWithOneEmptyCredential) {
+  std::atomic<int> hits{0};
+  std::atomic<int> hits_with_authz{0};
+
+  no_proxy_test::ScopedServer proxy_mock;
+  proxy_mock.svr().Get(".*", [&](const Request &req, Response &res) {
+    hits++;
+    if (req.has_header("Proxy-Authorization")) { hits_with_authz++; }
+    if (req.target.find("/redir") != std::string::npos) {
+      res.set_redirect("http://other.example/landed");
+    } else {
+      res.set_content("via-proxy", "text/plain");
+    }
+  });
+  proxy_mock.listen();
+
+  for (const auto &c : {std::make_pair("u", ""), std::make_pair("", "p")}) {
+    hits = 0;
+    hits_with_authz = 0;
+
+    Client cli("public.example", 80);
+    cli.set_proxy("127.0.0.1", proxy_mock.port());
+    cli.set_proxy_basic_auth(c.first, c.second);
+    cli.set_follow_location(true);
+
+    // The redirect to another host goes through the proxy as well
+    auto res = cli.Get("/redir");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(2, hits.load());
+    EXPECT_EQ(2, hits_with_authz.load());
+  }
 }
 
 TEST(NoProxyTest, EmptyNoProxyKeepsProxyOn) {
@@ -20086,7 +31700,7 @@ TEST(NoProxyTest, EmptyNoProxyKeepsProxyOn) {
   auto cli = make_client("anything.test", s);
 
   auto res = cli->Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_GE(s.proxy_hits(), 1);
   EXPECT_EQ(0, s.target_hits());
 }
@@ -20097,7 +31711,7 @@ TEST(NoProxyTest, PortSpecificEntryRejected) {
   cli->set_no_proxy({"example.com:8080"});
 
   auto res = cli->Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_GE(s.proxy_hits(), 1);
   EXPECT_EQ(0, s.target_hits());
 }
@@ -20108,7 +31722,7 @@ TEST(NoProxyTest, EmptyAndWhitespaceEntriesDropped) {
   cli->set_no_proxy({"", "   ", "\t"});
 
   auto res = cli->Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_GE(s.proxy_hits(), 1);
   EXPECT_EQ(0, s.target_hits());
 }
@@ -20124,7 +31738,7 @@ TEST(NoProxyTest, ValidEntryWithSurroundingWhitespaceStillMatches) {
   cli.set_no_proxy({"  127.0.0.0/8  "});
 
   auto res = cli.Get("/");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(0, s.proxy_hits());
   EXPECT_EQ(1, s.target_hits());
 }
@@ -20153,14 +31767,14 @@ TEST(NoProxyTest, RedirectToBypassedHostStripsProxyAndProxyAuth) {
   target.listen();
 
   Client cli("public.example", target.port());
-  cli.set_hostname_addr_map({{"public.example", "127.0.0.1"}});
+  cli.set_direct_hostname_addr_map({{"public.example", "127.0.0.1"}});
   cli.set_proxy("127.0.0.1", proxy_mock.port());
   cli.set_proxy_basic_auth("u", "p");
   cli.set_no_proxy({"127.0.0.1"});
   cli.set_follow_location(true);
 
   auto res = cli.Get("/redir");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_GE(proxy_hits.load(), 1);
   EXPECT_GE(target_hits.load(), 1);
   EXPECT_FALSE(target_saw_authz.load());
@@ -20189,13 +31803,13 @@ TEST(NoProxyTest, BypassedTargetReturning407DoesNotLeakProxyDigestCredentials) {
   // if it doesn't, the test still routes "via proxy" to the same server and
   // the Proxy-Authorization assertion below catches the leak.
   Client cli("evil.example", target.port());
-  cli.set_hostname_addr_map({{"evil.example", "127.0.0.1"}});
+  cli.set_direct_hostname_addr_map({{"evil.example", "127.0.0.1"}});
   cli.set_proxy("127.0.0.1", target.port());
   cli.set_proxy_digest_auth("proxy-user", "proxy-pass");
   cli.set_no_proxy({"evil.example"});
 
   auto res = cli.Get("/x");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::ProxyAuthenticationRequired_407, res->status);
   EXPECT_EQ(1, target_hits.load());
   EXPECT_FALSE(target_saw_proxy_authz.load());
@@ -20240,13 +31854,13 @@ TEST(NoProxyTest, MultiHopRedirectThroughBypassedHostKeepsProxy) {
   bypass_server.listen();
 
   Client cli("public.example", public_port);
-  cli.set_hostname_addr_map({{"public.example", "127.0.0.1"}});
+  cli.set_direct_hostname_addr_map({{"public.example", "127.0.0.1"}});
   cli.set_proxy("127.0.0.1", proxy_mock.port());
   cli.set_no_proxy({"127.0.0.1"});
   cli.set_follow_location(true);
 
   auto res = cli.Get("/start");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::OK_200, res->status);
   EXPECT_EQ("c-via-proxy", res->body);
   EXPECT_GE(proxy_hits.load(), 2);
@@ -20274,7 +31888,7 @@ TEST(NoProxyTest, KeepAliveSocketInvalidatedOnSetNoProxy) {
   target.listen();
 
   Client cli("public.example", target.port());
-  cli.set_hostname_addr_map({{"public.example", "127.0.0.1"}});
+  cli.set_direct_hostname_addr_map({{"public.example", "127.0.0.1"}});
   cli.set_proxy("127.0.0.1", proxy_mock.port());
   cli.set_keep_alive(true);
 
@@ -20293,7 +31907,158 @@ TEST(NoProxyTest, KeepAliveSocketInvalidatedOnSetNoProxy) {
   EXPECT_EQ(1, target_hits.load());
 }
 
-#if defined(CPPHTTPLIB_SSL_ENABLED) && !defined(_WIN32)
+// Forward declarations (see the base64_encode note).
+namespace httplib {
+namespace detail {
+ssize_t select_read(socket_t sock, time_t sec, time_t usec);
+int shutdown_socket(socket_t sock) noexcept;
+} // namespace detail
+} // namespace httplib
+
+namespace proxy_tunnel_test {
+
+const char *const kTunnelEstablished =
+    "HTTP/1.1 200 Connection established\r\n\r\n";
+
+// Answers the head of a CONNECT request; a 200 opens the tunnel.
+using ConnectReply = std::function<std::string(const std::string &head)>;
+
+// Accepts CONNECT on 127.0.0.1, answers it with `reply` (200 by default) and,
+// once tunnelled, byte-forwards to 127.0.0.1:forward_port.
+class ScopedConnectProxy {
+public:
+  explicit ScopedConnectProxy(int forward_port, ConnectReply reply = nullptr)
+      : forward_port_(forward_port), reply_(std::move(reply)) {
+    listen_sock_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_sock_ == INVALID_SOCKET) { return; }
+    auto a = loopback(0);
+    auto addr = reinterpret_cast<sockaddr *>(&a);
+    socklen_t alen = sizeof(a);
+    if (::bind(listen_sock_, addr, sizeof(a)) != 0 ||
+        ::getsockname(listen_sock_, addr, &alen) != 0 ||
+        ::listen(listen_sock_, 4) != 0) {
+      return;
+    }
+    port_ = ntohs(a.sin_port);
+    th_ = std::thread([this] { run(); });
+  }
+
+  ~ScopedConnectProxy() {
+    if (th_.joinable()) {
+      stop_ = true;
+      auto wake = connect_to(port_);
+      th_.join();
+      if (wake != INVALID_SOCKET) { detail::close_socket(wake); }
+    }
+    if (listen_sock_ != INVALID_SOCKET) { detail::close_socket(listen_sock_); }
+  }
+
+  int port() const { return port_; }
+  int connect_hits() const { return connect_hits_.load(); }
+  // Head of the last CONNECT request, as the proxy saw it on the wire.
+  std::string connect_request() const {
+    std::lock_guard<std::mutex> lock(connect_request_mutex_);
+    return connect_request_;
+  }
+
+private:
+  static sockaddr_in loopback(int port) {
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons(static_cast<unsigned short>(port));
+    return a;
+  }
+
+  static socket_t connect_to(int port) {
+    auto sock = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET) { return sock; }
+    auto a = loopback(port);
+    if (::connect(sock, reinterpret_cast<sockaddr *>(&a), sizeof(a)) != 0) {
+      detail::close_socket(sock);
+      return INVALID_SOCKET;
+    }
+    return sock;
+  }
+
+  static bool send_all(socket_t sock, const char *data, size_t size) {
+    while (size > 0) {
+      auto n = detail::send_socket(sock, data, size, 0);
+      if (n <= 0) { return false; }
+      data += n;
+      size -= static_cast<size_t>(n);
+    }
+    return true;
+  }
+
+  void run() {
+    for (;;) {
+      auto client = ::accept(listen_sock_, nullptr, nullptr);
+      if (stop_) {
+        if (client != INVALID_SOCKET) { detail::close_socket(client); }
+        return;
+      }
+      if (client == INVALID_SOCKET) { continue; }
+      serve(client);
+      detail::close_socket(client);
+    }
+  }
+
+  void serve(socket_t client) {
+    std::string head;
+    char buf[2048];
+    while (head.find("\r\n\r\n") == std::string::npos) {
+      if (detail::select_read(client, 5, 0) <= 0) { return; }
+      auto n = detail::read_socket(client, buf, sizeof(buf), 0);
+      if (n <= 0) { return; }
+      head.append(buf, static_cast<size_t>(n));
+    }
+    if (head.compare(0, 8, "CONNECT ") != 0) { return; }
+    connect_hits_++;
+    {
+      std::lock_guard<std::mutex> lock(connect_request_mutex_);
+      connect_request_ = head;
+    }
+
+    auto res = reply_ ? reply_(head) : std::string(kTunnelEstablished);
+    if (!send_all(client, res.data(), res.size()) ||
+        res.compare(0, 12, "HTTP/1.1 200") != 0) {
+      return;
+    }
+
+    auto origin = connect_to(forward_port_);
+    if (origin == INVALID_SOCKET) { return; }
+
+    // When either side stops, shut both down so the other pump returns too.
+    auto pump = [&](socket_t from, socket_t to) {
+      char b[8192];
+      for (;;) {
+        auto n = detail::read_socket(from, b, sizeof(b), 0);
+        if (n <= 0 || !send_all(to, b, static_cast<size_t>(n))) { break; }
+      }
+      detail::shutdown_socket(client);
+      detail::shutdown_socket(origin);
+    };
+    std::thread up([&] { pump(client, origin); });
+    pump(origin, client);
+    up.join();
+    detail::close_socket(origin);
+  }
+
+  int forward_port_;
+  ConnectReply reply_;
+  socket_t listen_sock_ = INVALID_SOCKET;
+  int port_ = 0;
+  std::thread th_;
+  std::atomic<bool> stop_{false};
+  std::atomic<int> connect_hits_{0};
+  mutable std::mutex connect_request_mutex_;
+  std::string connect_request_;
+};
+
+} // namespace proxy_tunnel_test
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
 namespace proxy_tunnel_test {
 
 // SSLServer counterpart to no_proxy_test::ScopedServer.
@@ -20319,120 +32084,103 @@ private:
   int port_ = 0;
 };
 
-// Accepts CONNECT, replies 200, byte-forwards to forward_port.
-class ScopedConnectProxy {
-public:
-  explicit ScopedConnectProxy(int forward_port) : forward_port_(forward_port) {
-    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0) { return; }
-    int yes = 1;
-    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    sockaddr_in a{};
-    a.sin_family = AF_INET;
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port = 0;
-    if (::bind(listen_fd_, reinterpret_cast<sockaddr *>(&a), sizeof(a)) != 0) {
-      return;
-    }
-    socklen_t alen = sizeof(a);
-    if (::getsockname(listen_fd_, reinterpret_cast<sockaddr *>(&a), &alen) !=
-        0) {
-      return;
-    }
-    port_ = ntohs(a.sin_port);
-    if (::listen(listen_fd_, 1) != 0) { return; }
-    th_ = std::thread([this] { run(); });
+// Sends one request through the CONNECT proxy to the TLS origin with a
+// credential configured for each hop, and checks that each credential reaches
+// only the hop it was configured for: the proxy's on the CONNECT request, the
+// origin's (every header in origin_headers) on the tunnelled request.
+void CredentialsStayWithTheirHop(
+    const std::function<void(SSLClient &)> &set_credentials,
+    const std::string &scheme,
+    const std::vector<std::string> &origin_headers = {"Authorization"},
+    bool stream = false) {
+  std::atomic<int> origin_hits{0};
+  std::atomic<bool> origin_saw_proxy_authz{false};
+  std::atomic<bool> origin_saw_headers{false};
+
+  ScopedSSLServer origin;
+  origin.svr().Get(".*", [&](const Request &req, Response &res) {
+    origin_hits++;
+    origin_saw_proxy_authz = req.has_header("Proxy-Authorization");
+    origin_saw_headers =
+        std::all_of(origin_headers.begin(), origin_headers.end(),
+                    [&](const std::string &h) { return req.has_header(h); });
+    res.set_content("ok", "text/plain");
+  });
+  origin.listen();
+
+  ScopedConnectProxy proxy(origin.port());
+  ASSERT_NE(0, proxy.port());
+
+  // Pinned to 127.0.0.1 for the same reason as the test below.
+  SSLClient cli("127.0.0.1", origin.port());
+  cli.enable_server_certificate_verification(false);
+  cli.set_proxy("127.0.0.1", proxy.port());
+  set_credentials(cli);
+
+  if (stream) {
+    auto handle = cli.open_stream("GET", "/x");
+    ASSERT_TRUE(handle.is_valid()) << "Error: " << to_string(handle.error);
+    EXPECT_EQ(StatusCode::OK_200, handle.response->status);
+  } else {
+    auto res = cli.Get("/x");
+    ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+    EXPECT_EQ(StatusCode::OK_200, res->status);
   }
+  EXPECT_EQ(1, origin_hits.load());
+  EXPECT_EQ(1, proxy.connect_hits());
 
-  ~ScopedConnectProxy() {
-    stop_ = true;
-    if (listen_fd_ >= 0) {
-      ::shutdown(listen_fd_, SHUT_RDWR);
-      ::close(listen_fd_);
-    }
-    if (th_.joinable()) { th_.join(); }
+  EXPECT_TRUE(origin_saw_headers.load());
+  EXPECT_FALSE(origin_saw_proxy_authz.load())
+      << "Proxy-Authorization must not be sent inside the tunnel";
+
+  auto connect_req = proxy.connect_request();
+  EXPECT_NE(std::string::npos,
+            connect_req.find("\r\nProxy-Authorization: " + scheme + " "));
+  for (const auto &h : origin_headers) {
+    EXPECT_EQ(std::string::npos, connect_req.find("\r\n" + h + ": "))
+        << h << " must not be sent to the proxy on CONNECT";
   }
-
-  int port() const { return port_; }
-  int connect_hits() const { return connect_hits_.load(); }
-
-private:
-  void run() {
-    while (!stop_.load()) {
-      fd_set rfds;
-      FD_ZERO(&rfds);
-      FD_SET(listen_fd_, &rfds);
-      timeval tv{0, 100 * 1000};
-      int sel = ::select(listen_fd_ + 1, &rfds, nullptr, nullptr, &tv);
-      if (sel <= 0) { continue; }
-
-      int client_fd = ::accept(listen_fd_, nullptr, nullptr);
-      if (client_fd < 0) { continue; }
-
-      std::string req;
-      char buf[2048];
-      while (req.find("\r\n\r\n") == std::string::npos) {
-        ssize_t n = ::recv(client_fd, buf, sizeof(buf), 0);
-        if (n <= 0) { break; }
-        req.append(buf, static_cast<size_t>(n));
-      }
-      if (req.compare(0, 7, "CONNECT") != 0) {
-        ::close(client_fd);
-        continue;
-      }
-      connect_hits_++;
-
-      const char *ok = "HTTP/1.1 200 Connection established\r\n\r\n";
-      ::send(client_fd, ok, std::strlen(ok), 0);
-
-      int origin_fd = ::socket(AF_INET, SOCK_STREAM, 0);
-      sockaddr_in o{};
-      o.sin_family = AF_INET;
-      o.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-      o.sin_port = htons(static_cast<unsigned short>(forward_port_));
-      if (::connect(origin_fd, reinterpret_cast<sockaddr *>(&o), sizeof(o)) !=
-          0) {
-        ::close(client_fd);
-        ::close(origin_fd);
-        continue;
-      }
-
-      auto forward = [](int from, int to) {
-        char b[8192];
-        for (;;) {
-          ssize_t n = ::recv(from, b, sizeof(b), 0);
-          if (n <= 0) { break; }
-          ssize_t off = 0;
-          while (off < n) {
-            ssize_t s = ::send(to, b + off, static_cast<size_t>(n - off), 0);
-            if (s <= 0) {
-              off = n;
-              break;
-            }
-            off += s;
-          }
-        }
-        ::shutdown(to, SHUT_WR);
-      };
-
-      std::thread t1([&] { forward(client_fd, origin_fd); });
-      std::thread t2([&] { forward(origin_fd, client_fd); });
-      t1.join();
-      t2.join();
-      ::close(client_fd);
-      ::close(origin_fd);
-    }
-  }
-
-  int forward_port_ = -1;
-  int listen_fd_ = -1;
-  int port_ = 0;
-  std::thread th_;
-  std::atomic<bool> stop_{false};
-  std::atomic<int> connect_hits_{0};
-};
+}
 
 } // namespace proxy_tunnel_test
+
+TEST(ProxyTunnelTest, BasicCredentialsStayWithTheirHop) {
+  proxy_tunnel_test::CredentialsStayWithTheirHop(
+      [](SSLClient &cli) {
+        cli.set_proxy_basic_auth("proxy-user", "proxy-pass");
+        cli.set_basic_auth("origin-user", "origin-pass");
+      },
+      "Basic");
+}
+
+TEST(ProxyTunnelTest, StreamCredentialsStayWithTheirHop) {
+  proxy_tunnel_test::CredentialsStayWithTheirHop(
+      [](SSLClient &cli) {
+        cli.set_proxy_basic_auth("proxy-user", "proxy-pass");
+        cli.set_basic_auth("origin-user", "origin-pass");
+      },
+      "Basic", {"Authorization"}, true);
+}
+
+TEST(ProxyTunnelTest, BearerCredentialsStayWithTheirHop) {
+  proxy_tunnel_test::CredentialsStayWithTheirHop(
+      [](SSLClient &cli) {
+        cli.set_proxy_bearer_token_auth("proxy-token");
+        cli.set_bearer_token_auth("origin-token");
+      },
+      "Bearer");
+}
+
+TEST(ProxyTunnelTest, DefaultHeadersStayOffConnect) {
+  proxy_tunnel_test::CredentialsStayWithTheirHop(
+      [](SSLClient &cli) {
+        cli.set_proxy_basic_auth("proxy-user", "proxy-pass");
+        cli.set_default_headers({{"Authorization", "Bearer origin-token"},
+                                 {"Cookie", "sid=origin-session"},
+                                 {"X-Api-Key", "origin-key"}});
+      },
+      "Basic", {"Authorization", "Cookie", "X-Api-Key"});
+}
 
 TEST(ProxyTunnelTest, OriginReturning407InsideTunnelDoesNotLeakProxyDigest) {
   // Origin inside a CONNECT tunnel replying 407 must not trigger the digest
@@ -20456,16 +32204,564 @@ TEST(ProxyTunnelTest, OriginReturning407InsideTunnelDoesNotLeakProxyDigest) {
   proxy_tunnel_test::ScopedConnectProxy proxy(origin.port());
   ASSERT_NE(0, proxy.port());
 
-  SSLClient cli(HOST, origin.port());
+  // Pin to 127.0.0.1: the proxy listens on 127.0.0.1 only, while "localhost"
+  // may resolve to ::1 first. A concurrent test (e.g. another gtest shard)
+  // holding ::1 with the same ephemeral port number would hijack the CONNECT
+  // and answer with its own status, making this test flaky.
+  SSLClient cli("127.0.0.1", origin.port());
   cli.enable_server_certificate_verification(false);
-  cli.set_proxy(HOST, proxy.port());
+  cli.set_proxy("127.0.0.1", proxy.port());
   cli.set_proxy_digest_auth("proxy-user", "proxy-pass");
 
   auto res = cli.Get("/x");
-  ASSERT_TRUE(res);
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
   EXPECT_EQ(StatusCode::ProxyAuthenticationRequired_407, res->status);
   EXPECT_EQ(1, origin_hits.load());
   EXPECT_FALSE(origin_saw_proxy_authz.load());
+  EXPECT_EQ(1, proxy.connect_hits());
+}
+
+TEST(ProxyTunnelTest, ConnectTargetFollowsTunnelHostnameAddrMap) {
+  std::string origin_sni;
+  std::string origin_host;
+
+  proxy_tunnel_test::ScopedSSLServer origin;
+  origin.svr().Get(".*", [&](const Request &req, Response &res) {
+    origin_sni = req.sni();
+    origin_host = req.get_header_value("Host");
+    res.set_content("ok", "text/plain");
+  });
+  origin.listen();
+
+  proxy_tunnel_test::ScopedConnectProxy proxy(origin.port());
+  ASSERT_NE(0, proxy.port());
+
+  SSLClient cli("origin.example", origin.port());
+  cli.enable_server_certificate_verification(false);
+  cli.set_tunnel_hostname_addr_map({{"origin.example", "127.0.0.1"}});
+  cli.set_proxy("127.0.0.1", proxy.port());
+
+  auto res = cli.Get("/x");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+
+  auto port = std::to_string(origin.port());
+  auto target = "127.0.0.1:" + port;
+  auto connect_req = proxy.connect_request();
+  EXPECT_EQ(1, proxy.connect_hits());
+  EXPECT_EQ(0u, connect_req.find("CONNECT " + target + " HTTP/1.1\r\n"));
+  EXPECT_NE(std::string::npos,
+            connect_req.find("\r\nHost: " + target + "\r\n"));
+  EXPECT_EQ("origin.example", origin_sni);
+  EXPECT_EQ("origin.example:" + port, origin_host);
+}
+
+TEST(ProxyTunnelTest, DigestRetryConnectTargetFollowsTunnelHostnameAddrMap) {
+  proxy_tunnel_test::ScopedSSLServer origin;
+  origin.svr().Get(".*", [&](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+  origin.listen();
+
+  proxy_tunnel_test::ScopedConnectProxy proxy(
+      origin.port(), [](const std::string &head) -> std::string {
+        if (head.find(
+                "\r\nProxy-Authorization: Digest username=\"proxy-user\"") !=
+            std::string::npos) {
+          return proxy_tunnel_test::kTunnelEstablished;
+        }
+        return "HTTP/1.1 407 Proxy Authentication Required\r\n"
+               "Proxy-Authenticate: Digest realm=\"proxy\", qop=\"auth\", "
+               "nonce=\"abc\", algorithm=MD5\r\n"
+               "Content-Length: 0\r\n\r\n";
+      });
+  ASSERT_NE(0, proxy.port());
+
+  SSLClient cli("origin.example", origin.port());
+  cli.enable_server_certificate_verification(false);
+  cli.set_tunnel_hostname_addr_map({{"origin.example", "127.0.0.1"}});
+  cli.set_proxy("127.0.0.1", proxy.port());
+  cli.set_proxy_digest_auth("proxy-user", "proxy-pass");
+
+  auto res = cli.Get("/x");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+
+  // The retried CONNECT is the one the proxy saw last.
+  auto target = "127.0.0.1:" + std::to_string(origin.port());
+  auto connect_req = proxy.connect_request();
+  EXPECT_EQ(2, proxy.connect_hits());
+  EXPECT_EQ(0u, connect_req.find("CONNECT " + target + " HTTP/1.1\r\n"));
+  EXPECT_NE(std::string::npos,
+            connect_req.find("\r\nHost: " + target + "\r\n"));
+}
+
+TEST(ProxyTunnelTest, DirectHostnameAddrMapLeavesConnectTarget) {
+  proxy_tunnel_test::ScopedSSLServer origin;
+  origin.svr().Get(".*", [&](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+  origin.listen();
+
+  proxy_tunnel_test::ScopedConnectProxy proxy(origin.port());
+  ASSERT_NE(0, proxy.port());
+
+  SSLClient cli("origin.example", origin.port());
+  cli.enable_server_certificate_verification(false);
+  cli.set_direct_hostname_addr_map({{"origin.example", "127.0.0.1"}});
+  cli.set_proxy("127.0.0.1", proxy.port());
+
+  auto res = cli.Get("/x");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ(StatusCode::OK_200, res->status);
+
+  auto target = "origin.example:" + std::to_string(origin.port());
+  auto connect_req = proxy.connect_request();
+  EXPECT_EQ(0u, connect_req.find("CONNECT " + target + " HTTP/1.1\r\n"));
+  EXPECT_NE(std::string::npos,
+            connect_req.find("\r\nHost: " + target + "\r\n"));
+}
+
+TEST(ProxyTunnelTest, RedirectKeepsTunnelHostnameAddrMap) {
+  proxy_tunnel_test::ScopedSSLServer origin;
+  auto port = std::to_string(origin.port());
+  origin.svr().Get("/x", [&](const Request &, Response &res) {
+    res.set_redirect("https://next.example:" + port + "/y");
+  });
+  origin.svr().Get("/y", [](const Request &, Response &res) {
+    res.set_content("ok", "text/plain");
+  });
+  origin.listen();
+
+  proxy_tunnel_test::ScopedConnectProxy proxy(origin.port());
+  ASSERT_NE(0, proxy.port());
+
+  SSLClient cli("origin.example", origin.port());
+  cli.enable_server_certificate_verification(false);
+  cli.set_tunnel_hostname_addr_map(
+      {{"origin.example", "127.0.0.1"}, {"next.example", "127.0.0.1"}});
+  cli.set_proxy("127.0.0.1", proxy.port());
+  cli.set_follow_location(true);
+
+  auto res = cli.Get("/x");
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  EXPECT_EQ("ok", res->body);
+
+  // The last CONNECT is the redirect client's.
+  ASSERT_EQ(2, proxy.connect_hits());
+  auto target = "127.0.0.1:" + port;
+  auto connect_req = proxy.connect_request();
+  EXPECT_EQ(0u, connect_req.find("CONNECT " + target + " HTTP/1.1\r\n"));
+  EXPECT_NE(std::string::npos,
+            connect_req.find("\r\nHost: " + target + "\r\n"));
+}
+#endif
+
+namespace proxy_tunnel_test {
+
+// Tunnels only a CONNECT carrying `expected` as its Proxy-Authorization;
+// anything else gets a 407 with `challenge`.
+ConnectReply require_proxy_auth(const std::string &expected,
+                                const std::string &challenge) {
+  return [=](const std::string &head) -> std::string {
+    if (head.find("\r\nProxy-Authorization: " + expected + "\r\n") !=
+        std::string::npos) {
+      return kTunnelEstablished;
+    }
+    return "HTTP/1.1 407 Proxy Authentication Required\r\n"
+           "Proxy-Authenticate: " +
+           challenge + "\r\nContent-Length: 0\r\n\r\n";
+  };
+}
+
+// Reports the Authorization and Proxy-Authorization headers of the upgrade
+// request, then echoes.
+void report_auth_then_echo(const Request &req, ws::WebSocket &ws) {
+  ws.send(
+      "authorization:" + req.get_header_value("Authorization") +
+      "|proxy-authorization:" + req.get_header_value("Proxy-Authorization"));
+  std::string msg;
+  while (ws.read(msg)) {
+    ws.send(msg);
+  }
+}
+
+// A WebSocket origin on 127.0.0.1 serving report_auth_then_echo at /ws.
+class ScopedWebSocketOrigin {
+public:
+  ScopedWebSocketOrigin() {
+    server_.svr().WebSocket("/ws", report_auth_then_echo);
+    server_.listen();
+  }
+
+  int port() const { return server_.port(); }
+  // Pinned to 127.0.0.1, the only address the proxy forwards to.
+  std::string url() const {
+    return "ws://127.0.0.1:" + std::to_string(port()) + "/ws";
+  }
+
+private:
+  no_proxy_test::ScopedServer server_;
+};
+
+// Connects through a proxy that requires `proxy_authz`, with `origin_authz`
+// passed as a constructor header, and checks that each reaches only its hop.
+void WebSocketCredentialsStayWithTheirHop(
+    const std::function<void(ws::WebSocketClient &)> &set_proxy_credentials,
+    const std::string &proxy_authz, const std::string &origin_authz) {
+  ScopedWebSocketOrigin origin;
+  ScopedConnectProxy proxy(
+      origin.port(), require_proxy_auth(proxy_authz, "Basic realm=\"proxy\""));
+  ASSERT_NE(0, proxy.port());
+
+  ws::WebSocketClient client(origin.url(), {{"Authorization", origin_authz}});
+  client.set_proxy("127.0.0.1", proxy.port());
+  set_proxy_credentials(client);
+  auto res = client.connect();
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+
+  std::string msg;
+  ASSERT_TRUE(client.read(msg));
+  EXPECT_EQ("authorization:" + origin_authz + "|proxy-authorization:", msg);
+  client.close();
+
+  EXPECT_EQ(1, proxy.connect_hits());
+  EXPECT_EQ(std::string::npos,
+            proxy.connect_request().find("\r\nAuthorization: "))
+      << "origin credentials must not be sent to the proxy";
+}
+
+// Like WebSocketCredentialsStayWithTheirHop(), but with the setters.
+void WebSocketSetterCredentialsStayWithTheirHop(
+    const std::function<void(ws::WebSocketClient &)> &set_credentials,
+    const std::string &proxy_authz, const std::string &origin_authz) {
+  ScopedWebSocketOrigin origin;
+  ScopedConnectProxy proxy(
+      origin.port(), require_proxy_auth(proxy_authz, "Basic realm=\"proxy\""));
+  ASSERT_NE(0, proxy.port());
+
+  ws::WebSocketClient client(origin.url());
+  client.set_proxy("127.0.0.1", proxy.port());
+  set_credentials(client);
+  auto res = client.connect();
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+
+  std::string msg;
+  ASSERT_TRUE(client.read(msg));
+  EXPECT_EQ("authorization:" + origin_authz + "|proxy-authorization:", msg);
+  client.close();
+
+  EXPECT_EQ(1, proxy.connect_hits());
+  EXPECT_EQ(std::string::npos,
+            proxy.connect_request().find("\r\nAuthorization: "))
+      << "origin credentials must not be sent to the proxy";
+}
+
+} // namespace proxy_tunnel_test
+
+namespace {
+
+// Connects `client` and returns the Authorization header its upgrade
+// request carried, or "<failed>" when the connection could not be opened.
+std::string websocket_authorization(ws::WebSocketClient &client) {
+  if (!client.connect()) { return "<failed>"; }
+  std::string msg;
+  if (!client.read(msg)) { return "<failed>"; }
+  client.close();
+  auto prefix = std::string("authorization:");
+  auto end = msg.find("|proxy-authorization:");
+  return msg.substr(prefix.size(), end - prefix.size());
+}
+
+} // namespace
+
+TEST(WebSocketClientAuthTest, BasicAuth) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  ws::WebSocketClient client(origin.url());
+  client.set_basic_auth("user", "pass");
+  EXPECT_EQ("Basic " + detail::base64_encode("user:pass"),
+            websocket_authorization(client));
+}
+
+TEST(WebSocketClientAuthTest, BasicAuthWithEmptyPasswordIsSent) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  ws::WebSocketClient client(origin.url());
+  client.set_basic_auth("user", "");
+  EXPECT_EQ("Basic " + detail::base64_encode("user:"),
+            websocket_authorization(client));
+}
+
+TEST(WebSocketClientAuthTest, BearerTokenAuth) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  ws::WebSocketClient client(origin.url());
+  client.set_bearer_token_auth("token123");
+  EXPECT_EQ("Bearer token123", websocket_authorization(client));
+}
+
+TEST(WebSocketClientAuthTest, BasicAuthWinsOverBearerToken) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  ws::WebSocketClient client(origin.url());
+  client.set_bearer_token_auth("token123");
+  client.set_basic_auth("user", "pass");
+  EXPECT_EQ("Basic " + detail::base64_encode("user:pass"),
+            websocket_authorization(client));
+}
+
+TEST(WebSocketClientAuthTest, ConstructorHeaderWinsOverSetter) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  ws::WebSocketClient client(origin.url(),
+                             {{"Authorization", "Bearer from-header"}});
+  client.set_bearer_token_auth("from-setter");
+  client.set_basic_auth("user", "pass");
+  EXPECT_EQ("Bearer from-header", websocket_authorization(client));
+}
+
+TEST(WebSocketClientAuthTest, CredentialsApplyOnReconnect) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  ws::WebSocketClient client(origin.url());
+  EXPECT_EQ("", websocket_authorization(client));
+
+  client.set_bearer_token_auth("first");
+  EXPECT_EQ("Bearer first", websocket_authorization(client));
+
+  client.set_bearer_token_auth("second");
+  EXPECT_EQ("Bearer second", websocket_authorization(client));
+
+  client.set_bearer_token_auth("");
+  EXPECT_EQ("", websocket_authorization(client));
+}
+
+TEST(WebSocketProxyTest, TunnelsThroughConnect) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  proxy_tunnel_test::ScopedConnectProxy proxy(origin.port());
+  ASSERT_NE(0, proxy.port());
+
+  ws::WebSocketClient client(origin.url());
+  client.set_proxy("127.0.0.1", proxy.port());
+  auto res = client.connect();
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+
+  std::string msg;
+  ASSERT_TRUE(client.read(msg));
+  ASSERT_TRUE(client.send("hello"));
+  ASSERT_TRUE(client.read(msg));
+  EXPECT_EQ("hello", msg);
+  client.close();
+
+  EXPECT_EQ(1, proxy.connect_hits());
+  auto target = "127.0.0.1:" + std::to_string(origin.port());
+  auto connect_req = proxy.connect_request();
+  EXPECT_EQ(0u, connect_req.find("CONNECT " + target + " HTTP/1.1\r\n"));
+  EXPECT_NE(std::string::npos,
+            connect_req.find("\r\nHost: " + target + "\r\n"));
+}
+
+TEST(WebSocketProxyTest, BasicCredentialsStayWithTheirHop) {
+  proxy_tunnel_test::WebSocketCredentialsStayWithTheirHop(
+      [](ws::WebSocketClient &cli) {
+        cli.set_proxy_basic_auth("proxy-user", "proxy-pass");
+      },
+      "Basic " + detail::base64_encode("proxy-user:proxy-pass"),
+      "Basic " + detail::base64_encode("origin-user:origin-pass"));
+}
+
+TEST(WebSocketProxyTest, BearerCredentialsStayWithTheirHop) {
+  proxy_tunnel_test::WebSocketCredentialsStayWithTheirHop(
+      [](ws::WebSocketClient &cli) {
+        cli.set_proxy_bearer_token_auth("proxy-token");
+      },
+      "Bearer proxy-token", "Bearer origin-token");
+}
+
+TEST(WebSocketProxyTest, BasicAuthSetterStaysWithItsHop) {
+  proxy_tunnel_test::WebSocketSetterCredentialsStayWithTheirHop(
+      [](ws::WebSocketClient &cli) {
+        cli.set_proxy_basic_auth("proxy-user", "proxy-pass");
+        cli.set_basic_auth("origin-user", "origin-pass");
+      },
+      "Basic " + detail::base64_encode("proxy-user:proxy-pass"),
+      "Basic " + detail::base64_encode("origin-user:origin-pass"));
+}
+
+TEST(WebSocketProxyTest, BearerTokenAuthSetterStaysWithItsHop) {
+  proxy_tunnel_test::WebSocketSetterCredentialsStayWithTheirHop(
+      [](ws::WebSocketClient &cli) {
+        cli.set_proxy_bearer_token_auth("proxy-token");
+        cli.set_bearer_token_auth("origin-token");
+      },
+      "Bearer proxy-token", "Bearer origin-token");
+}
+
+TEST(WebSocketProxyTest, BasicCredentialsWithEmptyPasswordAreSent) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  proxy_tunnel_test::ScopedConnectProxy proxy(
+      origin.port(), proxy_tunnel_test::require_proxy_auth(
+                         "Basic " + detail::base64_encode("proxy-user:"),
+                         "Basic realm=\"proxy\""));
+  ASSERT_NE(0, proxy.port());
+
+  ws::WebSocketClient client(origin.url());
+  client.set_proxy("127.0.0.1", proxy.port());
+  client.set_proxy_basic_auth("proxy-user", "");
+  auto res = client.connect();
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  client.close();
+
+  EXPECT_EQ(1, proxy.connect_hits());
+}
+
+TEST(WebSocketProxyTest, ProxyRejectionReportsProxyConnection) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  proxy_tunnel_test::ScopedConnectProxy proxy(
+      origin.port(), proxy_tunnel_test::require_proxy_auth(
+                         "Bearer proxy-token", "Basic realm=\"proxy\""));
+  ASSERT_NE(0, proxy.port());
+
+  ws::WebSocketClient client(origin.url());
+  client.set_proxy("127.0.0.1", proxy.port());
+  auto res = client.connect();
+  EXPECT_FALSE(res);
+  EXPECT_EQ(Error::ProxyConnection, res.error());
+  EXPECT_EQ(StatusCode::ProxyAuthenticationRequired_407, res.status());
+  EXPECT_EQ("Basic realm=\"proxy\"",
+            res.get_header_value("Proxy-Authenticate"));
+  EXPECT_FALSE(client.is_open());
+}
+
+TEST(WebSocketProxyTest, NoProxyBypassesProxy) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  proxy_tunnel_test::ScopedConnectProxy proxy(origin.port());
+  ASSERT_NE(0, proxy.port());
+
+  ws::WebSocketClient client(origin.url());
+  client.set_proxy("127.0.0.1", proxy.port());
+  client.set_proxy_basic_auth("proxy-user", "proxy-pass");
+  client.set_no_proxy({"127.0.0.1"});
+  auto res = client.connect();
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+
+  std::string msg;
+  ASSERT_TRUE(client.read(msg));
+  EXPECT_EQ("authorization:|proxy-authorization:", msg)
+      << "proxy credentials must not reach a bypassed origin";
+  client.close();
+
+  EXPECT_EQ(0, proxy.connect_hits());
+}
+
+TEST(WebSocketProxyTest, ProxySettingAppliesOnReconnect) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  proxy_tunnel_test::ScopedConnectProxy proxy(origin.port());
+  ASSERT_NE(0, proxy.port());
+
+  ws::WebSocketClient client(origin.url());
+  client.set_proxy("127.0.0.1", proxy.port());
+  ASSERT_TRUE(client.connect());
+  ASSERT_TRUE(client.connect());
+  client.close();
+
+  EXPECT_EQ(2, proxy.connect_hits());
+}
+
+TEST(WebSocketProxyTest, ConnectTargetFollowsTunnelHostnameAddrMap) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  proxy_tunnel_test::ScopedConnectProxy proxy(origin.port());
+  ASSERT_NE(0, proxy.port());
+
+  auto port = std::to_string(origin.port());
+  ws::WebSocketClient client("ws://origin.example:" + port + "/ws");
+  client.set_tunnel_hostname_addr_map({{"origin.example", "127.0.0.1"}});
+  client.set_proxy("127.0.0.1", proxy.port());
+  auto res = client.connect();
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+
+  std::string msg;
+  ASSERT_TRUE(client.read(msg));
+  client.close();
+
+  EXPECT_EQ(1, proxy.connect_hits());
+  auto target = "127.0.0.1:" + port;
+  auto connect_req = proxy.connect_request();
+  EXPECT_EQ(0u, connect_req.find("CONNECT " + target + " HTTP/1.1\r\n"));
+  EXPECT_NE(std::string::npos,
+            connect_req.find("\r\nHost: " + target + "\r\n"));
+}
+
+TEST(WebSocketProxyTest, DirectHostnameAddrMapLeavesConnectTarget) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  proxy_tunnel_test::ScopedConnectProxy proxy(origin.port());
+  ASSERT_NE(0, proxy.port());
+
+  auto port = std::to_string(origin.port());
+  ws::WebSocketClient client("ws://origin.example:" + port + "/ws");
+  client.set_direct_hostname_addr_map({{"origin.example", "127.0.0.1"}});
+  client.set_proxy("127.0.0.1", proxy.port());
+  auto res = client.connect();
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+  client.close();
+
+  auto target = "origin.example:" + port;
+  auto connect_req = proxy.connect_request();
+  EXPECT_EQ(0u, connect_req.find("CONNECT " + target + " HTTP/1.1\r\n"));
+  EXPECT_NE(std::string::npos,
+            connect_req.find("\r\nHost: " + target + "\r\n"));
+}
+
+#ifdef CPPHTTPLIB_SSL_ENABLED
+TEST(WebSocketProxyTest, DigestRetriesConnectOnFreshSocket) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  proxy_tunnel_test::ScopedConnectProxy proxy(
+      origin.port(), [](const std::string &head) -> std::string {
+        if (head.find(
+                "\r\nProxy-Authorization: Digest username=\"proxy-user\"") !=
+            std::string::npos) {
+          return proxy_tunnel_test::kTunnelEstablished;
+        }
+        return "HTTP/1.1 407 Proxy Authentication Required\r\n"
+               "Proxy-Authenticate: Digest realm=\"proxy\", qop=\"auth\", "
+               "nonce=\"abc\", algorithm=MD5\r\n"
+               "Content-Length: 0\r\n\r\n";
+      });
+  ASSERT_NE(0, proxy.port());
+
+  ws::WebSocketClient client(origin.url());
+  client.set_proxy("127.0.0.1", proxy.port());
+  client.set_proxy_digest_auth("proxy-user", "proxy-pass");
+  auto res = client.connect();
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+
+  std::string msg;
+  ASSERT_TRUE(client.read(msg));
+  EXPECT_EQ("authorization:|proxy-authorization:", msg);
+  client.close();
+
+  EXPECT_EQ(2, proxy.connect_hits());
+}
+
+TEST(WebSocketProxyTest, WssTunnelsThroughConnect) {
+  proxy_tunnel_test::ScopedSSLServer origin;
+  origin.svr().WebSocket("/ws", proxy_tunnel_test::report_auth_then_echo);
+  origin.listen();
+
+  proxy_tunnel_test::ScopedConnectProxy proxy(
+      origin.port(), proxy_tunnel_test::require_proxy_auth(
+                         "Bearer proxy-token", "Bearer realm=\"proxy\""));
+  ASSERT_NE(0, proxy.port());
+
+  ws::WebSocketClient client(
+      "wss://127.0.0.1:" + std::to_string(origin.port()) + "/ws");
+  client.enable_server_certificate_verification(false);
+  client.set_proxy("127.0.0.1", proxy.port());
+  client.set_proxy_bearer_token_auth("proxy-token");
+  auto res = client.connect();
+  ASSERT_TRUE(res) << "Error: " << to_string(res.error());
+
+  std::string msg;
+  ASSERT_TRUE(client.read(msg));
+  EXPECT_EQ("authorization:|proxy-authorization:", msg)
+      << "Proxy-Authorization must not be sent inside the tunnel";
+  client.close();
+
   EXPECT_EQ(1, proxy.connect_hits());
 }
 #endif

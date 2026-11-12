@@ -111,8 +111,9 @@ RelPositionalEncoding::set_data(Session* session) {
     // Prefer GGUF-embedded PE (produced by convert_model.py). Fall back
     // to external pe.bin for legacy tdt-0.6b flow.
     if (session->gguf_loader != nullptr && session->gguf_loader->has_tensor(name + ".pe")) {
-        auto data = session->gguf_loader->get_tensor_file_data(name + ".pe", data_size);
-        ggml_backend_tensor_set(pe_tensor.tensor, data, 0, data_size);
+        // May be left unallocated for zero-copy mmap binding — see
+        // TensorContainer::allocate_tensors_on_backend_buffers.
+        session->bind_or_copy_tensor(pe_tensor, name + ".pe");
         return;
     }
     std::vector<char> buffer(data_size);
@@ -231,7 +232,7 @@ RelPositionMultiHeadAttention::build_graph_masked(
     // the shared merge-heads reshape below.
     ggml_tensor* attn = nullptr;
     bool attn_heads_merged = false;
-#ifdef NEMO_SPEECH_FUSED_RELPOS_ATTN
+#ifdef NEMO_SPEECH_CUDA_FAST_PATHS
     // The fused CUDA op accepts both the streaming per-key mask and the
     // offline per-(key,query) band mask. This entire branch is compiled ONLY
     // with a patched ggml: ggml_fused_relpos_attn is a patch-only symbol, so a
@@ -244,24 +245,6 @@ RelPositionMultiHeadAttention::build_graph_masked(
     // ggml_backend_sched_split_graph aborts with no backend able to take the
     // node. use_gpu=true guarantees the GPU backend exists (BackendManager
     // throws otherwise), and the scheduler places the op there.
-    //
-    // Shape gate as well. The fused kernel is tuned for short cache-aware
-    // windows -- the patch documents a warp-cooperative score loop for
-    // d_k == 128 and an occupancy query for the streaming shape (q = 2,
-    // kv = 72) -- and "other CUDA shapes retain the generic fused kernel".
-    // An offline full-context pass is the opposite shape: q is the whole
-    // utterance, and there the generic kernel loses badly to the unfused
-    // formulation below, which is batched cuBLAS GEMMs plus softmax and is
-    // exactly what large matrices want.
-    //
-    // Measured on 45 minutes of podcast, Parakeet TDT offline, best of two:
-    // fused 48.9 s (RTFx 55.2) against unfused 22.7 s (RTFx 118.9) -- 2.15x.
-    // The same option is worth +44% on the streaming path, so turning it off
-    // globally trades one workload for the other. Gating on query length keeps
-    // both: short windows take the fused kernel, long ones take cuBLAS.
-    //
-    // NEMO_SPEECH_RELPOS_MAX_Q overrides the threshold (0 disables the fused
-    // path entirely) so it can be swept without a rebuild.
     static const int64_t fused_max_q = [] {
         if (const char* s = std::getenv("NEMO_SPEECH_RELPOS_MAX_Q")) {
             char* end = nullptr;

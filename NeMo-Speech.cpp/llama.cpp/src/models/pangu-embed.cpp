@@ -2,7 +2,8 @@
 
 void llama_model_pangu_embed::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
-    switch (hparams.n_layer) {
+
+    switch (hparams.n_layer()) {
         case 26: type = LLM_TYPE_1B; break; // openPangu-Embedded-1B-V1.1
         case 34: type = LLM_TYPE_7B; break; // openPangu-Embedded-7B-V1.1
         default: type = LLM_TYPE_UNKNOWN;
@@ -50,11 +51,19 @@ void llama_model_pangu_embed::load_arch_tensors(llama_model_loader &) {
     }
 }
 
-std::unique_ptr<llm_graph_context> llama_model_pangu_embed::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+llama_rope_params llama_model_pangu_embed::get_rope_params(const llama_cparams & cparams, int il) const {
+    auto res = llama_model::get_rope_params(cparams, il);
+
+    res.factors = nullptr;
+
+    return res;
 }
 
-llama_model_pangu_embed::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+std::unique_ptr<llm_graph_context> llama_model_pangu_embed::build_arch_graph(const llm_graph_params & params) const {
+    return std::make_unique<graph>(params);
+}
+
+llama_model_pangu_embed::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -87,16 +96,8 @@ llama_model_pangu_embed::graph::graph(const llama_model & model, const llm_graph
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
                     n_embd_head, n_head, n_head_kv, il);
 
-            Qcur = ggml_rope_ext(
-                    ctx0, Qcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
-
-            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
+            Qcur = build_rope(Qcur, inp_pos, il);
+            Kcur = build_rope(Kcur, inp_pos, il);
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
@@ -156,6 +157,4 @@ llama_model_pangu_embed::graph::graph(const llama_model & model, const llm_graph
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }

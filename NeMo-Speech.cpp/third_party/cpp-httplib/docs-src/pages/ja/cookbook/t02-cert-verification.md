@@ -1,6 +1,6 @@
 ---
 title: "T02. SSL証明書の検証を制御する"
-order: 43
+order: 44
 status: "draft"
 ---
 
@@ -18,6 +18,8 @@ auto res = cli.Get("/");
 ```
 
 第1引数がCA証明書ファイル、第2引数がCA証明書ディレクトリ（省略可）です。OpenSSLバックエンドなら、`set_ca_cert_store()`で`X509_STORE*`を直接渡すこともできます。
+
+独自のCAを指定すると、クライアントはそのCAだけを信頼し、OSの証明書ストアは読みません。両方を信頼したい場合は、`cli.enable_system_ca(true)`も呼んでください。CA証明書はクライアントの最初の接続で一度だけ読み込まれるので、これらの設定は最初のリクエストより前に済ませておきましょう。
 
 ## 証明書検証を無効にする（非推奨）
 
@@ -46,8 +48,10 @@ cli.enable_server_hostname_verification(false);
 
 ## OSの証明書ストアをそのまま使う
 
-多くのLinuxディストリビューションでは、`/etc/ssl/certs/ca-certificates.crt`などにルート証明書がまとまっています。cpp-httplibは起動時にOSのデフォルトストアを自動で読みにいくので、普通のサーバーならとくに設定不要です。
+多くのLinuxディストリビューションでは、`/etc/ssl/certs/ca-certificates.crt`などにルート証明書がまとまっています。cpp-httplibはクライアントの最初の接続でOSのデフォルトストアを自動で読みにいくので、普通のサーバーならとくに設定不要です。
 
 > mbedTLSやwolfSSLバックエンドでも同じAPIが使えます。バックエンドの選び方は[T01. OpenSSL・mbedTLS・wolfSSLの選択指針](../t01-tls-backends)を参照してください。
 
 > 失敗したときの詳細を調べる方法は[C18. SSLエラーをハンドリングする](../c18-ssl-errors)を参照してください。
+
+> WebSocketクライアント（`wss://`）のTLS設定は[W05. wss接続でTLSを設定する](../w05-websocket-tls)を参照してください。

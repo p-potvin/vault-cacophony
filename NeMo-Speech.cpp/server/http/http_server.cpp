@@ -10,9 +10,12 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -21,6 +24,7 @@
 #include "audio_file.h"
 #include "audio_resampler.h"
 #include "engine_registry.h"
+#include "http_errors.h"
 #include "json.h"
 #include "subtitles.h"
 #if defined(NEMO_SPEECH_REGISTRY_S2S)
@@ -57,7 +61,7 @@ const speakerTranscript=(words,fallback='')=>{if(!words?.some(x=>x.speaker))retu
 const wavBlob=(chunks,sampleRate)=>{const samples=chunks.reduce((n,x)=>n+x.length,0),buffer=new ArrayBuffer(44+samples*2),view=new DataView(buffer),write=(at,text)=>{for(let i=0;i<text.length;i++)view.setUint8(at+i,text.charCodeAt(i))};write(0,'RIFF');view.setUint32(4,36+samples*2,true);write(8,'WAVE');write(12,'fmt ');view.setUint32(16,16,true);view.setUint16(20,1,true);view.setUint16(22,1,true);view.setUint32(24,sampleRate,true);view.setUint32(28,sampleRate*2,true);view.setUint16(32,2,true);view.setUint16(34,16,true);write(36,'data');view.setUint32(40,samples*2,true);let offset=44;chunks.forEach(chunk=>{for(const sample of chunk){view.setInt16(offset,sample,true);offset+=2}});return new Blob([buffer],{type:'audio/wav'})};
 const apiKey=new URLSearchParams(location.search).get('api_key'),apiFetch=(url,options={})=>{if(apiKey)options.headers={...(options.headers||{}),Authorization:`Bearer ${apiKey}`};return fetch(url,options)};
 document.querySelectorAll('input[type=file]').forEach(input=>{input.ondragover=e=>{e.preventDefault();input.classList.add('drag')};input.ondragleave=()=>input.classList.remove('drag');input.ondrop=e=>{e.preventDefault();input.classList.remove('drag');if(e.dataTransfer.files.length)input.files=e.dataTransfer.files}});
-Promise.all([apiFetch('/ready').then(r=>r.json()),apiFetch('/version').then(r=>r.json()),apiFetch('/v1/models').then(r=>{if(!r.ok)throw Error('model inventory requires an API key');return r.json()})]).then(([ready,version,inventory])=>{const models=inventory.data||[],capabilities=new Set(models.map(x=>x.capability)),names=models.map(x=>`${x.id} (${x.capability})`);document.getElementById('server-status').textContent=`Ready · v${version.version} · device ${ready.device||'auto'} · ${ready.capabilities.length} capabilities`;const list=document.getElementById('model-list');list.replaceChildren(...names.map(name=>{const item=document.createElement('li');item.textContent=name;return item}));document.querySelectorAll('[data-capability]').forEach(b=>{if(!capabilities.has(b.dataset.capability)){b.disabled=true;b.title=`Load a ${b.dataset.capability} model to enable this panel`}});document.getElementById('asr-speakers-option').hidden=!capabilities.has('diarization');const tts=models.find(x=>x.capability==='speech');if(tts){const voice=document.getElementById('tts-voice');voice.replaceChildren(new Option('Default',''),...(tts.voices||[]).map(x=>new Option(x,x)));const names={'en-US':'English (US)','es-ES':'Spanish (Spain)','de-DE':'German','fr-FR':'French','it-IT':'Italian','vi-VN':'Vietnamese','hi-IN':'Hindi','zh-CN':'Mandarin Chinese','ja-JP':'Japanese'},language=document.getElementById('tts-lang');language.replaceChildren(...(tts.languages||['en-US']).map(x=>new Option(names[x]||x,x)))}const active=document.querySelector('.tab.active');if(active?.disabled)document.querySelector('.tab:not(:disabled)')?.click()}).catch(e=>{document.getElementById('server-status').textContent=`Server unavailable: ${e.message}`});
+Promise.all([apiFetch('/ready').then(r=>r.json()),apiFetch('/version').then(r=>r.json()),apiFetch('/v1/models').then(r=>{if(!r.ok)throw Error('model inventory requires an API key');return r.json()})]).then(([ready,version,inventory])=>{const models=inventory.data||[],capabilities=new Set(models.map(x=>x.capability)),names=models.map(x=>`${x.id} (${x.capability})`);document.getElementById('server-status').textContent=`Ready · v${version.version} · device ${ready.device||'auto'} · ${ready.capabilities.length} capabilities`;const list=document.getElementById('model-list');list.replaceChildren(...names.map(name=>{const item=document.createElement('li');item.textContent=name;return item}));document.querySelectorAll('[data-capability]').forEach(b=>{if(!capabilities.has(b.dataset.capability)){b.disabled=true;b.title=`Load a ${b.dataset.capability} model to enable this panel`}});const asr=models.find(x=>x.capability==='transcription');document.getElementById('asr-speakers-option').hidden=!asr?.speaker_diarization;document.getElementById('listen').disabled=asr?.streaming===false;if(asr?.word_timestamps===false){const format=document.getElementById('asr-format');[...format.options].forEach(o=>{if(['verbose_json','srt','vtt'].includes(o.value)){o.disabled=true;o.title='Requires word timestamps, which the loaded model does not provide'}});format.value='json'}const tts=models.find(x=>x.capability==='speech');if(tts){const voice=document.getElementById('tts-voice');voice.replaceChildren(new Option('Default',''),...(tts.voices||[]).map(x=>new Option(x,x)));const names={'en-US':'English (US)','es-ES':'Spanish (Spain)','de-DE':'German','fr-FR':'French','it-IT':'Italian','vi-VN':'Vietnamese','hi-IN':'Hindi','zh-CN':'Mandarin Chinese','ja-JP':'Japanese'},language=document.getElementById('tts-lang');language.replaceChildren(...(tts.languages||['en-US']).map(x=>new Option(names[x]||x,x)))}const active=document.querySelector('.tab.active');if(active?.disabled)document.querySelector('.tab:not(:disabled)')?.click()}).catch(e=>{document.getElementById('server-status').textContent=`Server unavailable: ${e.message}`});
 const asrSpeakers=document.getElementById('asr-speakers'),asrFormat=document.getElementById('asr-format');asrSpeakers.onchange=()=>{if(asrSpeakers.checked)asrFormat.value='verbose_json'};asrFormat.onchange=()=>{if(asrFormat.value!=='verbose_json')asrSpeakers.checked=false};
 document.getElementById('transcribe').onclick=async()=>{const f=document.getElementById('audio-file').files[0];if(!f)return alert('Choose a WAV file');const d=new FormData(),format=document.getElementById('asr-format').value,speakers=asrSpeakers.checked;d.append('file',f);d.append('response_format',format);if(speakers)d.append('diarization','true');const l=document.getElementById('asr-lang').value;if(l)d.append('language',l);busy('asr-status',1);try{const r=await apiFetch('/v1/audio/transcriptions',{method:'POST',body:d});const t=await r.text();if(!r.ok)throw Error(t);const parsed=format==='verbose_json'?JSON.parse(t):null,words=parsed?.words||[];document.getElementById('asr-output').textContent=speakers?speakerTranscript(words,parsed?.text||''):t;timeline('asr-timeline',words);const ext=format==='verbose_json'||format==='json'?'json':format==='text'?'txt':format;downloadable('download-asr',`transcript.${ext}`,t,r.headers.get('content-type')||'text/plain')}catch(e){document.getElementById('asr-output').textContent=e}finally{busy('asr-status',0)}};
 document.getElementById('diarize').onclick=async()=>{const f=document.getElementById('diar-file').files[0];if(!f)return alert('Choose a WAV file');const d=new FormData();d.append('file',f);busy('diar-status',1);try{const r=await apiFetch('/v1/audio/diarizations',{method:'POST',body:d}),t=await r.text();if(!r.ok)throw Error(t);const j=JSON.parse(t),segments=j.segments||[],pretty=JSON.stringify(j,null,2),recording=f.name.replace(/\.[^.]+$/,'').replace(/\s+/g,'_'),rttm=segments.map(x=>`SPEAKER ${recording} 1 ${x.start.toFixed(3)} ${(x.end-x.start).toFixed(3)} <NA> <NA> speaker_${x.speaker} <NA> <NA>`).join('\n')+'\n';timeline('diar-timeline',segments);document.getElementById('diar-output').textContent=pretty;downloadable('download-diar-json','diarization.json',pretty,'application/json');downloadable('download-diar-rttm','diarization.rttm',rttm,'text/plain')}catch(e){document.getElementById('diar-output').textContent=e}finally{busy('diar-status',0)}};
@@ -136,6 +140,28 @@ form_value(
     return fallback;
 }
 
+// `model` of the ASR upload routes, as the chat API takes it: omitted or empty is the loaded
+// model, otherwise one of `served` (the ids GET /v1/models lists for the route and the chat API's
+// served id); any other id answers 404 unknown_model. True when the request was refused.
+bool
+refuse_unknown_model(
+    const httplib::Request& request, httplib::Response& response,
+    const std::vector<std::string>& served) {
+    const std::string model = form_value(request, "model");
+    if (model.empty() || std::find(served.begin(), served.end(), model) != served.end())
+        return false;
+    Value root(Value::Object{});
+    Value error(Value::Object{});
+    error["message"] = "requested model is not available";
+    error["type"] = "invalid_request_error";
+    error["param"] = "model";
+    error["code"] = "unknown_model";
+    root["error"] = std::move(error);
+    response.status = 404;
+    response.set_content(root.dump(), "application/json");
+    return true;
+}
+
 // `speech_contexts` - [{"phrases": ["..."], "boost": N}] - parsed into
 // recognition options. Same field name and shape as the gRPC RecognitionConfig
 // so word boosting reads identically across surfaces.
@@ -193,18 +219,6 @@ uploaded_file(const httplib::Request& request) {
     if (!request.form.has_file("file"))
         throw std::invalid_argument("multipart field 'file' is required");
     return request.form.get_file("file");
-}
-#endif
-
-#if defined(NEMO_SPEECH_REGISTRY_ASR)
-std::string
-timecode(int milliseconds, bool vtt) {
-    milliseconds = std::max(0, milliseconds);
-    char result[32];
-    std::snprintf(
-        result, sizeof(result), "%02d:%02d:%02d%c%03d", milliseconds / 3600000,
-        milliseconds / 60000 % 60, milliseconds / 1000 % 60, vtt ? '.' : ',', milliseconds % 1000);
-    return result;
 }
 #endif
 
@@ -276,23 +290,16 @@ transcript_response(
     if (format == "text")
         return alternative.transcript + "\n";
     if (format == "srt" || format == "vtt") {
-        const bool vtt = format == "vtt";
-        int audio_ms = std::max(1, static_cast<int>(std::round(result.audio_processed * 1000)));
+        // Truncate: word times never pass the input, and neither may a cue.
+        int audio_ms = std::max(1, static_cast<int>(result.audio_processed * 1000));
         std::vector<subtitle::Word> words;
         words.reserve(alternative.words.size());
         for (const auto& word : alternative.words)
             words.push_back(
-                {word.word, word.start_time, word.end_time, word.confidence, word.speaker_tag});
-        const auto cues = subtitle::make_cues(words, alternative.transcript, audio_ms);
-        std::string output = vtt ? "WEBVTT\n\n" : "";
-        for (size_t i = 0; i < cues.size(); ++i) {
-            if (!vtt)
-                output += std::to_string(i + 1) + "\n";
-            output += timecode(cues[i].start_ms, vtt) + " --> " +
-                      timecode(std::max(cues[i].start_ms + 1, cues[i].end_ms), vtt) + "\n";
-            output += cues[i].text + "\n\n";
-        }
-        return output;
+                {word.word, word.start_time, word.end_time, word.confidence, word.speaker_tag,
+                 word.display, word.joins_previous});
+        return subtitle::render_cues(
+            subtitle::make_cues(words, alternative.transcript, audio_ms), format == "vtt");
     }
     Value root(Value::Object{});
     root["text"] = alternative.transcript;
@@ -320,14 +327,71 @@ transcript_response(
 
 }  // namespace
 
+// Magpie owns one mutable streaming workspace, so synthesis is serialized by the
+// runtime.  This coordinator sits in front of it when preemption is requested:
+// a newer request makes every older request ineligible to start (or continue)
+// and waits for the active request to release the runtime.
+class TtsPreemptionCoordinator {
+   public:
+    uint64_t claim() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const uint64_t generation = ++newest_generation_;
+        ready_.notify_all();
+        ready_.wait(lock, [&] { return !active_ || generation != newest_generation_; });
+        if (generation != newest_generation_)
+            return 0;
+        active_ = true;
+        return generation;
+    }
+
+    bool superseded(uint64_t generation) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return generation != newest_generation_;
+    }
+
+    void release() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        active_ = false;
+        ready_.notify_all();
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::condition_variable ready_;
+    uint64_t newest_generation_ = 0;
+    bool active_ = false;
+};
+
+class TtsPreemptionLease {
+   public:
+    explicit TtsPreemptionLease(TtsPreemptionCoordinator* coordinator)
+        : coordinator_(coordinator) {}
+    ~TtsPreemptionLease() {
+        if (coordinator_)
+            coordinator_->release();
+    }
+
+    TtsPreemptionLease(const TtsPreemptionLease&) = delete;
+    TtsPreemptionLease& operator=(const TtsPreemptionLease&) = delete;
+
+   private:
+    TtsPreemptionCoordinator* coordinator_;
+};
+
 struct Server::Impl {
     EngineRegistry& models;
     ServerConfig config;
     std::unique_ptr<httplib::Server> server;
+    socket_t listen_socket = INVALID_SOCKET;  // recorded when httplib creates it
     std::atomic<uint64_t> request_id{1};
+    TtsPreemptionCoordinator tts_preemption;
 
     Impl(EngineRegistry& engines, ServerConfig config)
         : models(engines), config(std::move(config)) {
+        if (this->config.preempt_tts && this->config.threads < 2) {
+            throw std::invalid_argument(
+                "tts.preempt requires at least two HTTP workers (http.threads >= 2)");
+        }
         const bool has_cert = !this->config.tls_certificate.empty();
         const bool has_key = !this->config.tls_private_key.empty();
         if (has_cert != has_key)
@@ -345,6 +409,10 @@ struct Server::Impl {
         } else {
             server = std::make_unique<httplib::Server>();
         }
+        server->set_socket_options([this](socket_t sock) {
+            httplib::default_socket_options(sock);
+            listen_socket = sock;  // the last socket created is the one bound
+        });
         server->set_payload_max_length(this->config.max_upload_bytes);
         server->set_read_timeout(this->config.read_timeout_seconds);
         server->set_write_timeout(this->config.write_timeout_seconds);
@@ -416,19 +484,8 @@ struct Server::Impl {
         });
         server->set_exception_handler(
             [](const httplib::Request&, httplib::Response& response, std::exception_ptr error) {
-                try {
-                    if (error)
-                        std::rethrow_exception(error);
-                }
-                catch (const std::invalid_argument& exception) {
-                    fail(response, 400, exception.what());
-                    return;
-                }
-                catch (const std::exception& exception) {
-                    fail(response, 500, exception.what(), "server_error");
-                    return;
-                }
-                fail(response, 500, "unknown server error", "server_error");
+                const auto mapped = request_error(error);
+                fail(response, mapped.status, mapped.message, mapped.type);
             });
 
         server->Get("/", [this](const httplib::Request&, httplib::Response& response) {
@@ -493,6 +550,9 @@ struct Server::Impl {
                 item["object"] = "model";
                 item["owned_by"] = "local";
                 item["capability"] = "transcription";
+                item["streaming"] = model->supports_streaming();
+                item["word_timestamps"] = model->supports_word_timestamps();
+                item["speaker_diarization"] = model->supports_speaker_diarization();
                 item["device"] = this->models.device_label();
                 data.emplace_back(std::move(item));
             }
@@ -500,8 +560,9 @@ struct Server::Impl {
             }
 #endif
 #if defined(NEMO_SPEECH_REGISTRY_DIAR)
-            try {
-                (void)this->models.diarization();
+            // A diarization model, or a speech-LLM recognizer's speaker branch
+            const auto loaded = this->models.capabilities();
+            if (std::find(loaded.begin(), loaded.end(), "diarization") != loaded.end()) {
                 Value item(Value::Object{});
                 item["id"] = "diarization";
                 item["object"] = "model";
@@ -509,8 +570,6 @@ struct Server::Impl {
                 item["capability"] = "diarization";
                 item["device"] = this->models.device_label();
                 data.emplace_back(std::move(item));
-            }
-            catch (const std::exception&) {
             }
 #endif
 #if defined(NEMO_SPEECH_REGISTRY_TTS)
@@ -601,6 +660,18 @@ struct Server::Impl {
                 options.profanity_filter = form_bool(request, "profanity_filter");
                 options.enable_word_time_offsets =
                     format == "verbose_json" || format == "srt" || format == "vtt";
+                // timestamp_granularities[] (word, segment) as in OpenAI's API: verbose_json only;
+                // either one returns the words (there are no segment-level times).
+                for (const char* name : {"timestamp_granularities[]", "timestamp_granularities"}) {
+                    for (const auto& value : request.form.get_fields(name)) {
+                        if (value != "word" && value != "segment")
+                            throw std::invalid_argument(
+                                "timestamp_granularities must be word or segment");
+                        if (format != "verbose_json")
+                            throw std::invalid_argument(
+                                "timestamp_granularities requires response_format=verbose_json");
+                    }
+                }
                 options.enable_speaker_diarization = form_bool(request, "diarization");
                 if (options.enable_speaker_diarization) {
                     const std::string speakers = form_value(request, "max_speaker_count");
@@ -629,7 +700,13 @@ struct Server::Impl {
                     options.speech_contexts.push_back({{prompt}, 10.0f});
                 apply_speech_contexts(
                     form_value(request, "speech_contexts"), options.speech_contexts);
+                // A client that disconnects drops its request (speech-LLM backends).
+                options.cancelled = [&request] { return request.is_connection_closed(); };
                 auto recognizer = this->models.asr();
+                if (refuse_unknown_model(
+                        request, response,
+                        {recognizer->model_name(), this->config.chat.limits.model_name}))
+                    return;
                 const auto result = recognizer->recognize(
                     audio.samples.data(), audio.samples.size(), options, language,
                     audio.sample_rate);
@@ -674,12 +751,58 @@ struct Server::Impl {
                 const std::string format = body.string_or("response_format", "wav");
                 if (format != "wav" && format != "pcm")
                     throw std::invalid_argument("response_format must be wav or pcm");
+
+                uint64_t generation = 0;
+                if (this->config.preempt_tts) {
+                    generation = this->tts_preemption.claim();
+                    if (generation == 0) {
+                        fail(response, 409, "TTS synthesis was canceled by a newer request");
+                        return;
+                    }
+                }
+                TtsPreemptionLease lease(
+                    this->config.preempt_tts ? &this->tts_preemption : nullptr);
                 std::string pcm;
-                const auto result =
-                    synthesizer->synthesize(synthesis, [&](const auto&, const std::string& chunk) {
-                        pcm += chunk;
-                        return true;
-                    });
+                tts::SynthesisResult result;
+                try {
+                    result = synthesizer->synthesize(
+                        synthesis, [&](const auto&, const std::string& chunk) {
+                            if (this->config.preempt_tts &&
+                                this->tts_preemption.superseded(generation)) {
+                                return false;
+                            }
+                            pcm += chunk;
+                            return true;
+                        });
+                }
+                catch (const std::exception&) {
+                    if (this->config.preempt_tts && this->tts_preemption.superseded(generation)) {
+                        fail(response, 409, "TTS synthesis was canceled by a newer request");
+                        return;
+                    }
+                    throw;
+                }
+                if (this->config.preempt_tts && this->tts_preemption.superseded(generation)) {
+                    fail(response, 409, "TTS synthesis was canceled by a newer request");
+                    return;
+                }
+                if (this->config.tts_benchmark) {
+                    const auto& stats = result.stats;
+                    std::cerr << "[nemo_http][tts_benchmark]"
+                              << " text_chars=" << result.metadata.original_text.size()
+                              << " frames=" << stats.generated_frames
+                              << " audio_s=" << stats.audio_s
+                              << " decoder_ttft_ms=" << stats.decoder_ttft_ms
+                              << " decoder_itl_avg_ms=" << stats.decoder_itl_avg_ms
+                              << " decoder_itl_p95_ms=" << stats.decoder_itl_p95_ms
+                              << " decoder_itl_p99_ms=" << stats.decoder_itl_p99_ms
+                              << " codec_ttfa_ms=" << stats.codec_ttfa_ms
+                              << " codec_icl_avg_ms=" << stats.codec_icl_avg_ms
+                              << " codec_icl_p95_ms=" << stats.codec_icl_p95_ms
+                              << " codec_icl_p99_ms=" << stats.codec_icl_p99_ms
+                              << " e2e_ttfa_ms=" << stats.e2e_ttfa_ms
+                              << " e2e_rtfx=" << stats.e2e_rtfx << '\n';
+                }
                 if (format == "pcm")
                     response.set_content(std::move(pcm), "audio/pcm");
                 else
@@ -694,49 +817,109 @@ struct Server::Impl {
         server->Post(
             "/v1/audio/translations",
             [this](const httplib::Request& request, httplib::Response& response) {
-#if defined(NEMO_SPEECH_REGISTRY_SPEECH)
+#if defined(NEMO_SPEECH_REGISTRY_ASR)
                 const auto upload = uploaded_file(request);
                 const auto source_audio = audio::load_wav_memory(
                     upload.content.data(), upload.content.size(), upload.filename);
                 const std::string requested_source = form_value(request, "language");
-                const std::string target = form_value(request, "target_language", "en-US");
                 const std::string format = form_value(request, "response_format", "json");
                 if (format != "json" && format != "verbose_json" && format != "text")
                     throw std::invalid_argument(
                         "response_format must be json, verbose_json, or text");
-                speech::SpeechTranslationOptions options;
-                options.source_language = requested_source;
-                options.target_language = target;
-                options.recognition.language_code = requested_source;
-                options.recognition.enable_automatic_punctuation =
-                    form_bool(request, "automatic_punctuation", true);
-                options.recognition.verbatim_transcripts = form_bool(request, "verbatim");
-                options.recognition.profanity_filter = form_bool(request, "profanity_filter");
+                // the recognizer's id or the speech-translation entry of GET /v1/models
+                std::vector<std::string> served = {
+                    "speech-translation", this->config.chat.limits.model_name};
+                try {
+                    served.push_back(this->models.asr()->model_name());
+                }
+                catch (const std::exception&) {
+                }
+#if defined(NEMO_SPEECH_REGISTRY_SPEECH)
+                if (this->models.has_speech_translation()) {  // ASR -> NMT, into target_language
+                    if (refuse_unknown_model(request, response, served))
+                        return;
+                    speech::SpeechTranslationOptions options;
+                    options.source_language = requested_source;
+                    options.target_language = form_value(request, "target_language", "en-US");
+                    options.recognition.language_code = requested_source;
+                    options.recognition.enable_automatic_punctuation =
+                        form_bool(request, "automatic_punctuation", true);
+                    options.recognition.verbatim_transcripts = form_bool(request, "verbatim");
+                    options.recognition.profanity_filter = form_bool(request, "profanity_filter");
+                    const std::string prompt = form_value(request, "prompt");
+                    if (!prompt.empty())
+                        options.recognition.speech_contexts.push_back({{prompt}, 10.0f});
+                    apply_speech_contexts(
+                        form_value(request, "speech_contexts"),
+                        options.recognition.speech_contexts);
+                    std::vector<speech::SpeechTranslationResult> translated;
+                    speech::SpeechTranslationCallbacks callbacks;
+                    callbacks.translation = [&](const auto& result) {
+                        translated.push_back(result);
+                        return true;
+                    };
+                    auto stream = this->models.speech_translation()->streaming_translate(
+                        std::move(options), std::move(callbacks));
+                    stream->push(
+                        source_audio.samples.data(), source_audio.samples.size(),
+                        source_audio.sample_rate);
+                    stream->finish();
+                    if (translated.empty())
+                        throw std::runtime_error("NMT returned no translation");
+                    std::string text;
+                    for (const auto& result : translated) {
+                        if (!text.empty() && !result.text.empty())
+                            text += ' ';
+                        text += result.text;
+                    }
+                    if (format == "text") {
+                        response.set_content(text + "\n", "text/plain; charset=utf-8");
+                        return;
+                    }
+                    Value output(Value::Object{});
+                    output["text"] = text;
+                    if (format == "verbose_json") {
+                        output["task"] = "translate";
+                        output["language"] = translated.back().language_code;
+                        output["duration"] = static_cast<double>(source_audio.samples.size()) /
+                                             source_audio.sample_rate;
+                    }
+                    response.set_content(output.dump(), "application/json");
+                    return;
+                }
+#endif
+                // Without NMT, a speech-LLM recognizer translates itself (English by default).
+                std::shared_ptr<asr::Recognizer> recognizer;
+                try {
+                    recognizer = this->models.asr();
+                }
+                catch (const std::exception&) {
+                }
+                if (!recognizer || !recognizer->supports_translation()) {
+                    fail(
+                        response, 501,
+                        "speech translation needs an NMT model, or a speech-LLM model that "
+                        "translates");
+                    return;
+                }
+                if (refuse_unknown_model(request, response, served))
+                    return;
+                const std::string target = form_value(request, "target_language");
+                asr::AsrRequestOptions options;
+                options.language_code = requested_source;
+                options.speechlm.task = "translate";
+                options.speechlm.target_language = target;
                 const std::string prompt = form_value(request, "prompt");
                 if (!prompt.empty())
-                    options.recognition.speech_contexts.push_back({{prompt}, 10.0f});
+                    options.speech_contexts.push_back({{prompt}, 10.0f});
                 apply_speech_contexts(
-                    form_value(request, "speech_contexts"), options.recognition.speech_contexts);
-                std::vector<speech::SpeechTranslationResult> translated;
-                speech::SpeechTranslationCallbacks callbacks;
-                callbacks.translation = [&](const auto& result) {
-                    translated.push_back(result);
-                    return true;
-                };
-                auto stream = this->models.speech_translation()->streaming_translate(
-                    std::move(options), std::move(callbacks));
-                stream->push(
-                    source_audio.samples.data(), source_audio.samples.size(),
-                    source_audio.sample_rate);
-                stream->finish();
-                if (translated.empty())
-                    throw std::runtime_error("NMT returned no translation");
-                std::string text;
-                for (const auto& result : translated) {
-                    if (!text.empty() && !result.text.empty())
-                        text += ' ';
-                    text += result.text;
-                }
+                    form_value(request, "speech_contexts"), options.speech_contexts);
+                options.cancelled = [&request] { return request.is_connection_closed(); };
+                const auto result = recognizer->recognize(
+                    source_audio.samples.data(), source_audio.samples.size(), options,
+                    requested_source, source_audio.sample_rate);
+                const std::string text =
+                    result.alternatives.empty() ? "" : result.alternatives.front().transcript;
                 if (format == "text") {
                     response.set_content(text + "\n", "text/plain; charset=utf-8");
                     return;
@@ -745,14 +928,14 @@ struct Server::Impl {
                 output["text"] = text;
                 if (format == "verbose_json") {
                     output["task"] = "translate";
-                    output["language"] = translated.back().language_code;
+                    output["language"] = target.empty() ? "en" : target;
                     output["duration"] =
                         static_cast<double>(source_audio.samples.size()) / source_audio.sample_rate;
                 }
                 response.set_content(output.dump(), "application/json");
 #else
                 (void)request;
-                fail(response, 501, "audio translation requires ASR and NMT in this build");
+                fail(response, 501, "this build does not include ASR");
 #endif
             });
 
@@ -872,20 +1055,50 @@ struct Server::Impl {
                 request.form.has_field("mode") ? request.form.get_field("mode") : "streaming";
             if (mode != "streaming" && mode != "offline")
                 throw std::invalid_argument("mode must be streaming or offline");
-            auto engine = this->models.diarization();
-            const auto result = engine->diarize(
-                source.samples.data(), source.samples.size(), source.sample_rate,
-                mode == "offline" ? asr::DiarizationMode::Offline
-                                  : asr::DiarizationMode::Streaming);
             Value root(Value::Object{});
             Value::Array output;
-            for (const auto& segment : result.segments) {
+            const auto segment_item = [&](double start, double end, int speaker) {
                 Value item(Value::Object{});
-                item["start"] = segment.t0;
-                item["end"] = segment.t1;
-                item["speaker"] = segment.speaker + 1;
+                item["start"] = start;
+                item["end"] = end;
+                item["speaker"] = speaker + 1;
                 output.emplace_back(std::move(item));
+            };
+            std::shared_ptr<asr::Diarizer> engine;
+#if defined(NEMO_SPEECH_REGISTRY_ASR)
+            std::shared_ptr<asr::Recognizer> recognizer;
+#endif
+            try {
+                engine = this->models.diarization();
             }
+            catch (const std::exception&) {
+#if defined(NEMO_SPEECH_REGISTRY_ASR)
+                // No diarization model: a speech-LLM recognizer's speaker branch (its streaming
+                // Sortformer whatever the mode), without a transcript
+                try {
+                    recognizer = this->models.asr();
+                }
+                catch (const std::exception&) {
+                }
+                if (!recognizer || !recognizer->supports_offline_diarization())
+#endif
+                    throw;
+            }
+            if (engine) {
+                const auto result = engine->diarize(
+                    source.samples.data(), source.samples.size(), source.sample_rate,
+                    mode == "offline" ? asr::DiarizationMode::Offline
+                                      : asr::DiarizationMode::Streaming);
+                for (const auto& segment : result.segments)
+                    segment_item(segment.t0, segment.t1, segment.speaker);
+            }
+#if defined(NEMO_SPEECH_REGISTRY_ASR)
+            else {
+                for (const auto& segment : recognizer->diarize(
+                         source.samples.data(), source.samples.size(), source.sample_rate))
+                    segment_item(segment.start, segment.end, segment.speaker);
+            }
+#endif
             root["segments"] = std::move(output);
             response.set_content(root.dump(), "application/json");
 #else
@@ -919,6 +1132,26 @@ struct Server::Impl {
                 }
             }
             auto recognizer = this->models.asr();
+            auto send_error = [&](const RequestError& error) {
+                Value response(Value::Object{});
+                response["type"] = "error";
+                response["event_id"] = "event_" + std::to_string(request_id.fetch_add(1));
+                Value details(Value::Object{});
+                details["message"] = error.message;
+                details["type"] = error.type;
+                details["code"] = error.code;
+                response["error"] = std::move(details);
+                return socket.send(response.dump());
+            };
+            // Complete-audio backends (SALM) cannot stream: reject the session once, up front.
+            if (!recognizer->supports_streaming()) {
+                send_error(
+                    {400, "invalid_request_error", "streaming_unsupported",
+                     "the loaded ASR model transcribes complete audio only; use POST "
+                     "/v1/audio/transcriptions"});
+                socket.close(httplib::ws::CloseStatus::UnsupportedData, "streaming unsupported");
+                return;
+            }
             asr::AsrRequestOptions options;
             options.enable_automatic_punctuation = true;
             int sample_rate = recognizer->sample_rate();
@@ -955,6 +1188,8 @@ struct Server::Impl {
                     partial_transcript = alternative.transcript;
                 }
                 event["audio_processed"] = result.audio_processed;
+                if (result.is_final && !alternative.language_codes.empty())
+                    event["language"] = alternative.language_codes.front();  // panopticam: auto-detected locale
                 if (result.is_final && options.needs_word_timings()) {
                     Value::Array words;
                     for (const auto& word : alternative.words) {
@@ -1079,14 +1314,8 @@ struct Server::Impl {
                         throw std::invalid_argument("unsupported realtime event type: " + type);
                     }
                 }
-                catch (const std::exception& error) {
-                    Value response(Value::Object{});
-                    response["type"] = "error";
-                    Value details(Value::Object{});
-                    details["message"] = error.what();
-                    details["type"] = "invalid_request_error";
-                    response["error"] = std::move(details);
-                    if (!send(std::move(response)))
+                catch (...) {
+                    if (!send_error(request_error(std::current_exception())))
                         break;
                 }
             }
@@ -1107,6 +1336,7 @@ struct Server::Impl {
             server->WebSocket("/realtime", std::move(realtime_s2s), select_s2s_subprotocol);
         }
 #endif
+        chat::install(*server, models, this->config.chat);
     }
 };
 
@@ -1117,12 +1347,17 @@ Server::~Server() = default;
 
 bool
 Server::listen() {
-    return impl_->server->listen(impl_->config.address, impl_->config.port);
+    return bind() && listen_after_bind();
 }
 
 bool
 Server::bind() {
-    return impl_->server->bind_to_port(impl_->config.address, impl_->config.port);
+    if (!impl_->server->bind_to_port(impl_->config.address, impl_->config.port))
+        return false;
+    // httplib listens with a backlog of 5 pending connections: a burst of clients beyond that is
+    // reset before a worker sees it. Queue as many as the server has workers (Linux caps it at
+    // net.core.somaxconn); listening again on a listening socket changes only its backlog.
+    return ::listen(impl_->listen_socket, std::max(5, impl_->config.threads)) == 0;
 }
 
 bool

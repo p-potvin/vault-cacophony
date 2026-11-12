@@ -13,8 +13,6 @@ from typing import Dict, List, Optional
 from dataclasses import dataclass
 from pathlib import Path
 
-import datasets
-
 # Set cache directory for HuggingFace datasets
 cache_dir = Path.home() / ".cache" / "huggingface" / "datasets"
 cache_dir.mkdir(parents=True, exist_ok=True)
@@ -65,33 +63,71 @@ def normalize_number(s: str) -> Optional[int]:
     return int(match.group(0))
 
 class AimeDataset:
-    def __init__(self, split: str = "train"):
+    def __init__(self, split: str = "train", dataset_type: str = "aime"):
         self.split = split
+        self.dataset_type = dataset_type
         self.questions: List[Dict] = []
         self._load_dataset()
 
-    def _load_dataset(self):
-        print(f"Loading AIME dataset (split: {self.split})...")
+    def _get_question_text(self, question: Dict) -> str:
+        """Get question text, handling different dataset field names."""
+        return question.get("problem", question.get("question", ""))
 
-        cache_path = Path.home() / ".cache" / "huggingface" / "datasets" / "AI-MO___aimo-validation-aime" / "default" / "0.0.0"
-        if cache_path.exists():
-            print(f"Using cached dataset from {cache_path}")
-            ds = datasets.load_dataset("AI-MO/aimo-validation-aime", split=self.split, cache_dir=str(cache_path))
+    def _load_dataset(self):
+        import datasets
+
+        if self.dataset_type == "aime":
+            print(f"Loading AIME dataset (split: {self.split})...")
+            cache_path = Path.home() / ".cache" / "huggingface" / "datasets" / "AI-MO___aimo-validation-aime" / "default" / "0.0.0"
+            if cache_path.exists():
+                print(f"Using cached dataset from {cache_path}")
+                ds = datasets.load_dataset("AI-MO/aimo-validation-aime", split=self.split, cache_dir=str(cache_path))
+            else:
+                ds = datasets.load_dataset("AI-MO/aimo-validation-aime", split=self.split)
+        elif self.dataset_type == "aime2025":
+            print(f"Loading AIME2025 dataset...")
+            ds_list = []
+            for config_name in ["AIME2025-I", "AIME2025-II"]:
+                cache_path = Path.home() / ".cache" / "huggingface" / "datasets" / "opencompass___AIME2025" / "default" / "0.0.0"
+                if cache_path.exists():
+                    print(f"Using cached dataset from {cache_path}")
+                    ds = datasets.load_dataset("opencompass/AIME2025", config_name, split="test", cache_dir=str(cache_path))
+                else:
+                    ds = datasets.load_dataset("opencompass/AIME2025", config_name, split="test")
+                ds_list.extend(ds)
+            ds = ds_list
         else:
-            ds = datasets.load_dataset("AI-MO/aimo-validation-aime", split=self.split)
+            raise ValueError(f"Unknown dataset type: {self.dataset_type}")
 
         self.questions = list(ds)
-        print(f"AIME dataset loaded: {len(self.questions)} questions")
+        print(f"{self.dataset_type} dataset loaded: {len(self.questions)} questions")
 
     def find_question(self, request_text: str) -> Optional[Dict]:
+        # Strip common template prefixes to get the actual question text
+        # Templates include things like "Solve the following math problem step by step..."
+        # The actual question usually follows a blank line or after the template instruction
+        cleaned = request_text
+        # Split on double newline and take the part that looks like the problem
+        parts = cleaned.split('\n\n')
+        if len(parts) > 1:
+            # Find the part that's longest (likely the actual problem text)
+            problem_parts = [p for p in parts if len(p.strip()) > 100]
+            if problem_parts:
+                cleaned = max(problem_parts, key=lambda x: len(x))
+
         best_match = None
         best_distance = -1
         best_index = -1
 
         for i, question in enumerate(self.questions):
-            question_text = question["problem"]
-            request_lower = request_text.lower()
+            question_text = self._get_question_text(question)
+            request_lower = cleaned.lower()
             question_lower = question_text.lower()
+
+            # Check if question text is contained in the cleaned request
+            if question_lower in request_lower or request_lower in question_lower:
+                debug_log(f"DEBUG: Found substring match at index {i}")
+                return question
 
             # Exact match
             if question_lower == request_lower:
@@ -118,7 +154,7 @@ class AimeDataset:
             debug_log(f"DEBUG: Found best partial match at index {best_index} with distance {best_distance:.3f}")
             return best_match
 
-        debug_log(f"DEBUG: No matching question found for: {request_text[:100]}...")
+        debug_log(f"DEBUG: No matching question found for cleaned: {cleaned[:100]}...")
         return None
 
     def get_answer(self, question: Dict) -> str:
@@ -128,21 +164,79 @@ class AimeDataset:
             return str(normalized) if normalized is not None else answer
         return str(answer)
 
+class CodeDataset:
+    """Stand-in for a code model: replays canonical solutions as chat replies.
+
+    Handles both code suites: HumanEval keys off the function stub, ClassEval
+    off the class skeleton.
+    """
+
+    DEFAULT_SOURCE = {
+        "humaneval": "openai/openai_humaneval",
+        "classeval": "FudanSELab/ClassEval",
+    }
+
+    def __init__(self, dataset_type: str, source: Optional[str] = None):
+        self.dataset_type = dataset_type
+        self.source = source or self.DEFAULT_SOURCE[dataset_type]
+        self.questions: List[Dict] = []
+        self._load_dataset()
+
+    def _load_dataset(self):
+        print(f"Loading {self.dataset_type} dataset (source: {self.source})...")
+        local = Path(self.source)
+        if local.exists():
+            text = local.read_text()
+            if local.suffix == ".json":
+                rows = json.loads(text)
+            else:
+                rows = [json.loads(ln) for ln in text.splitlines() if ln.strip()]
+        else:
+            import datasets
+            rows = [dict(r) for r in datasets.load_dataset(self.source, split="test")]
+        self.questions = rows
+        print(f"{self.dataset_type} dataset loaded: {len(self.questions)} questions")
+
+    def _stub_field(self) -> str:
+        return "skeleton" if self.dataset_type == "classeval" else "prompt"
+
+    def _get_question_text(self, question: Dict) -> str:
+        return question[self._stub_field()]
+
+    def find_question(self, request_text: str) -> Optional[Dict]:
+        for question in self.questions:
+            stub = question[self._stub_field()].rstrip()
+            if stub and stub in request_text:
+                return question
+        return None
+
+    def get_answer(self, question: Dict) -> str:
+        if self.dataset_type == "classeval":
+            return question["solution_code"]
+        return question["prompt"] + question["canonical_solution"]
+
+
 class Simulator:
     def __init__(
         self,
         port: int = 8033,
         host: str = "localhost",
         success_rate: float = 0.8,
-        dataset_split: str = "train"
+        dataset_split: str = "train",
+        dataset_type: str = "aime",
+        dataset_source: Optional[str] = None
     ):
         self.port = port
         self.host = host
         self.success_rate = success_rate
-        self.dataset = AimeDataset(dataset_split)
+        self.dataset_type = dataset_type
+        if dataset_type in ("humaneval", "classeval"):
+            self.dataset = CodeDataset(dataset_type, dataset_source)
+        else:
+            self.dataset = AimeDataset(dataset_split, dataset_type)
         self.eval_state = EvalState(
-            id="aime-2025",
-            tasks=["aime"],
+            id=dataset_type,
+            tasks=[dataset_type],
             task_states={},
             sampling_config={"temperature": 0, "max_tokens": 2048}
         )
@@ -158,6 +252,16 @@ class Simulator:
             response_text = expected_answer
         else:
             response_text = self._generate_wrong_answer(question)
+
+        if self.dataset_type in ("humaneval", "classeval"):
+            response_text = (
+                f"Here is the implementation:\n\n```python\n{response_text}\n```\n\n"
+                "Let me know if you want it optimised further."
+            )
+
+        comp_tokens = random.randint(10000, 60000)
+        tps_gen = random.uniform(90.0, 110.0)
+        t_gen_ms = comp_tokens / tps_gen * 1000
 
         return {
             "id": f"chatcmpl-{int(time.time())}",
@@ -176,13 +280,23 @@ class Simulator:
             ],
             "usage": {
                 "prompt_tokens": 100,
-                "completion_tokens": 50,
-                "total_tokens": 150
+                "completion_tokens": comp_tokens,
+                "total_tokens": 100 + comp_tokens
+            },
+            "timings": {
+                "predicted_ms": t_gen_ms,
+                "predicted_per_second": tps_gen
             }
         }
 
     def _generate_wrong_answer(self, question: Dict) -> str:
         expected_answer = self.dataset.get_answer(question)
+
+        if self.dataset_type == "classeval":
+            return re.sub(r"(\n\s+def [^\n]+:\n)", r"\1        return None\n",
+                          question["skeleton"])
+        if self.dataset_type == "humaneval":
+            return question["prompt"] + "    return None\n"
 
         if expected_answer.isdigit():
             wrong_answer = str(int(expected_answer) + 1)
@@ -218,6 +332,12 @@ class Simulator:
         return response
 
 class RequestHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/v1/models":
+            self._send_json({"data": [{"id": "llama", "object": "model"}]}, 200)
+            return
+        self._send_json({"error": "Not found"}, 404)
+
     def do_POST(self):
         if self.path != "/v1/chat/completions":
             self._send_json({"error": "Not found"}, 404)
@@ -281,10 +401,23 @@ def main():
         help="Success rate 0-1 (default: 0.8)"
     )
     parser.add_argument(
+        "--dataset",
+        type=str,
+        default="aime",
+        choices=["aime", "aime2025", "humaneval", "classeval"],
+        help="Dataset type (default: aime)"
+    )
+    parser.add_argument(
         "--dataset-split",
         type=str,
         default="train",
         help="AIME dataset split to use (default: train)"
+    )
+    parser.add_argument(
+        "--dataset-source",
+        type=str,
+        default=None,
+        help="Override the dataset location (local .jsonl path or HuggingFace repo id)"
     )
 
     args = parser.parse_args()
@@ -294,7 +427,9 @@ def main():
         port=args.port,
         host=args.host,
         success_rate=args.success_rate,
-        dataset_split=args.dataset_split
+        dataset_split=args.dataset_split,
+        dataset_type=args.dataset,
+        dataset_source=args.dataset_source
     )
 
     server = HTTPServer((args.host, args.port), RequestHandler)
@@ -304,7 +439,7 @@ def main():
     print("\n=== llama-server-simulator ===")
     print(f"Server running on http://{args.host}:{args.port}")
     print(f"Success rate: {args.success_rate}")
-    print(f"AIME dataset loaded: {len(simulator.dataset.questions)} questions")
+    print(f"{args.dataset} dataset loaded: {len(simulator.dataset.questions)} questions")
     print("\nPress Ctrl+C to stop\n")
 
     try:

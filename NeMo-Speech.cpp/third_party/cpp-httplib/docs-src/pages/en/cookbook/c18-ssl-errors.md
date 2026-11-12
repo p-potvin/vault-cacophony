@@ -17,26 +17,34 @@ if (!res) {
   std::cerr << "error: " << httplib::to_string(err) << std::endl;
 
   if (err == httplib::Error::SSLConnection ||
-      err == httplib::Error::SSLServerVerification) {
+      err == httplib::Error::SSLServerVerification ||
+      err == httplib::Error::Read || err == httplib::Error::Write) {
     std::cerr << "ssl_error: " << res.ssl_error() << std::endl;
     std::cerr << "ssl_backend_error: " << res.ssl_backend_error() << std::endl;
   }
 }
 ```
 
-`ssl_error()` returns the error code from the SSL library (e.g., OpenSSL's `SSL_get_error()`). `ssl_backend_error()` gives you the backend's more detailed error value — for OpenSSL, that's `ERR_get_error()`.
+`ssl_error()` is a backend-independent TLS error category: an `httplib::tls::ErrorCode` cast to `int`. `ssl_backend_error()` gives you the backend's own error value. With OpenSSL that is `ERR_get_error()` when the handshake or a later read or write failed, and the verify result (`X509_V_ERR_*`) when certificate verification failed.
+
+A request that fails after the handshake reports `Error::Read` or `Error::Write`. Even then, `ssl_error()` and `ssl_backend_error()` carry the TLS error behind it. For example, if the server requires a client certificate you didn't send, OpenSSL's error reads "tlsv13 alert certificate required". Both values are reset for each request and are `0` when no TLS error was involved.
 
 ## Format OpenSSL errors as strings
 
-When you have a value from `ssl_backend_error()`, pass it to OpenSSL's `ERR_error_string()` to get a readable message.
+When you have a value from `ssl_backend_error()`, pass it to the OpenSSL function that matches the kind of failure to get a readable message.
 
 ```cpp
 #include <openssl/err.h>
+#include <openssl/x509.h>
 
-if (res.ssl_backend_error() != 0) {
+if (res.error() == httplib::Error::SSLConnection) {
   char buf[256];
   ERR_error_string_n(res.ssl_backend_error(), buf, sizeof(buf));
   std::cerr << "openssl: " << buf << std::endl;
+} else if (res.error() == httplib::Error::SSLServerVerification ||
+           res.error() == httplib::Error::SSLServerHostnameVerification) {
+  auto code = static_cast<long>(res.ssl_backend_error());
+  std::cerr << "openssl: " << X509_verify_cert_error_string(code) << std::endl;
 }
 ```
 

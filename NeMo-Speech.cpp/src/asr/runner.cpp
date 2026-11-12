@@ -91,8 +91,7 @@ normalize_per_feature(std::vector<float>& feats, int n_mels, int n_frames, doubl
 // Shared mid-stream EOU fire for both runners. Order is load-bearing:
 // finalize() commits a beam head's in-flight hypothesis and word timings, so
 // it precedes the transcript/words capture; the per-utterance clears come
-// last. This helper performs the decoder's soft utterance reset; a runner that
-// requires a hard model-state boundary resets the decoder again after capture.
+// last. Only per-utterance output is reset; model context belongs to the stream.
 void
 fire_eou(
     Decoder* head, const AsrRequestOptions& opts, std::vector<int>& all_tokens,
@@ -116,6 +115,15 @@ fire_eou(
     transcript.clear();
     if (head)
         head->reset_utterance();
+}
+
+// Bound the top hypothesis and every N-best alternative at the source, before
+// ITN, subtitles and speaker attribution read them.
+void
+bound_update_words(StreamingUpdate& update, int64_t frame_limit) {
+    bound_word_frames(update.words, frame_limit);
+    for (auto& hypothesis : update.extra_alternatives)
+        bound_word_frames(hypothesis.words, frame_limit);
 }
 
 // Shared VAD/endpointer wiring for both runner ctors. The Silero VAD is built
@@ -280,8 +288,14 @@ BufferedStreamRunner::step() {
     // reset_utterance cleared the decoder's buffer.
     if (!update.is_final && opts_.needs_word_timings())
         update.words = head_->word_timings();
+    bound_update_words(update, real_frame_limit());
     trim_buffers();
     return update;
+}
+
+int64_t
+BufferedStreamRunner::real_frame_limit() const {
+    return real_encoder_frames(total_mel_frames_produced_, model_->subsampling_factor());
 }
 
 // Advance the VAD speech scan over newly-decoded mel frames up to decoded_mel,
@@ -404,6 +418,7 @@ BufferedStreamRunner::finalize() {
             update, head_.get(), opts_.needs_word_timings(), transcript_,
             static_cast<float>(audio_base_ + audio_buf_.size()) / static_cast<float>(sample_rate_),
             opts_.max_alternatives);
+        bound_update_words(update, real_frame_limit());
         return update;
     }
 
@@ -442,6 +457,7 @@ BufferedStreamRunner::finalize() {
     fill_final_update(
         update, head_.get(), opts_.needs_word_timings(), transcript_,
         static_cast<float>(audio_end) / static_cast<float>(sample_rate_), opts_.max_alternatives);
+    bound_update_words(update, real_frame_limit());
     return update;
 }
 
@@ -598,8 +614,8 @@ BufferedStreamRunner::process_window(size_t win_start, size_t win_end, bool is_l
 
 OfflineRunner::OfflineRunner(
     AsrModel* model, const RecognizerConfig& cfg,
-    std::shared_ptr<const FlashlightResources> flashlight, std::shared_ptr<SileroVadModel> vad)
-    : model_(model), decoder_cfg_(cfg.decoder), seg_cfg_(cfg.vad.segmenter), vad_(std::move(vad)) {
+    std::shared_ptr<const FlashlightResources> flashlight)
+    : model_(model), decoder_cfg_(cfg.decoder) {
     if (!model_)
         throw std::invalid_argument("OfflineRunner: null model");
     if (cfg.batching.offline_bucket_ms > 0) {
@@ -616,8 +632,18 @@ OfflineRunner::OfflineRunner(
 // cross the positional-encoding budget; the exact length is always safe.
 size_t
 OfflineRunner::max_offline_samples_() const {
+    static const int max_sec = [] {
+        if (const char* s = std::getenv("NEMO_SPEECH_MAX_OFFLINE_SEC")) {
+            const int v = std::atoi(s);
+            if (v > 0)
+                return v;
+        }
+        return 90;
+    }();
+    const size_t vram_cap =
+        static_cast<size_t>(max_sec) * static_cast<size_t>(model_->sample_rate());
     if (!exceeds_offline_position_limit(*model_, audio_.size(), model_->sample_rate()))
-        return audio_.size();
+        return std::min(audio_.size(), vram_cap);
     size_t lo = static_cast<size_t>(model_->sample_rate());
     size_t hi = audio_.size();
     while (hi - lo > static_cast<size_t>(model_->fe().hop_length())) {
@@ -627,7 +653,7 @@ OfflineRunner::max_offline_samples_() const {
         else
             lo = mid;
     }
-    return lo;
+    return std::min(lo, vram_cap);
 }
 
 // Center of the quietest 100 ms window in [target - search_span, target], so
@@ -667,131 +693,6 @@ OfflineRunner::offline_segments_() const {
     return segments;
 }
 
-std::vector<bool>
-OfflineRunner::vad_speech_windows_(int& window_size) const {
-    std::vector<bool> speech;
-    window_size = 0;
-    if (!vad_)
-        return speech;
-    SileroVad vad(vad_);
-    window_size = vad.window_size();
-    std::vector<float> probs;
-    vad.feed_audio(audio_.data(), audio_.size(), probs);
-    vad.flush(probs);
-    // Onset/offset hysteresis, the same shape VadMasker uses: a single noisy
-    // window cannot flip the state, which keeps cuts off word edges.
-    speech.reserve(probs.size());
-    bool in_speech = false;
-    for (const float p : probs) {
-        if (in_speech ? (p < seg_cfg_.offset) : (p > seg_cfg_.onset))
-            in_speech = !in_speech;
-        speech.push_back(in_speech);
-    }
-    return speech;
-}
-
-std::vector<OfflineRunner::Segment>
-OfflineRunner::segments_for_decode_() const {
-    const size_t max_seg = max_offline_samples_();
-    std::vector<Segment> out;
-
-    if (!seg_cfg_.enable || !vad_ || audio_.empty()) {
-        for (const auto& [off, len] : offline_segments_())
-            out.push_back(Segment{off, len, /*reset_before=*/false});
-        return out;
-    }
-
-    int win = 0;
-    const std::vector<bool> speech = vad_speech_windows_(win);
-    if (speech.empty() || win <= 0) {
-        for (const auto& [off, len] : offline_segments_())
-            out.push_back(Segment{off, len, /*reset_before=*/false});
-        return out;
-    }
-
-    const double sr = static_cast<double>(model_->sample_rate());
-    const size_t min_sil_win =
-        std::max<size_t>(1, static_cast<size_t>(seg_cfg_.min_silence_ms * sr / 1000.0 / win));
-    const size_t max_len =
-        std::min(max_seg, static_cast<size_t>(seg_cfg_.max_segment_sec * sr));
-    const size_t min_len = static_cast<size_t>(seg_cfg_.min_segment_sec * sr);
-
-    // Candidate cuts: the midpoint of every silent run long enough to be a real
-    // pause. Midpoint (not edge) so both neighbours keep silence padding.
-    std::vector<size_t> cuts;
-    size_t run_start = 0;
-    bool in_run = false;
-    for (size_t i = 0; i <= speech.size(); ++i) {
-        const bool silent = (i < speech.size()) && !speech[i];
-        if (silent && !in_run) {
-            in_run = true;
-            run_start = i;
-        } else if (!silent && in_run) {
-            in_run = false;
-            if (i - run_start >= min_sil_win)
-                cuts.push_back((run_start + i) / 2 * static_cast<size_t>(win));
-        }
-    }
-
-    size_t off = 0;
-    size_t next_cut = 0;
-    // Whether the cut that OPENS the current segment was a real silence cut.
-    // The forced fallback below can land mid-word, and resetting the decoder
-    // there would throw away context the model legitimately needs -- so the
-    // reset flag has to follow the preceding cut, not merely "not the first".
-    bool opened_at_silence = false;
-    while (audio_.size() - off > max_len) {
-        // Latest eligible cut that keeps this segment within max_len and still
-        // leaves a segment of at least min_len.
-        size_t chosen = 0;
-        while (next_cut < cuts.size() && cuts[next_cut] <= off + min_len) ++next_cut;
-        for (size_t i = next_cut; i < cuts.size() && cuts[i] <= off + max_len; ++i)
-            chosen = cuts[i];
-        if (chosen > off) {
-            out.push_back(Segment{off, chosen - off, opened_at_silence});
-            off = chosen;
-            opened_at_silence = true;
-        } else {
-            // No pause in reach: fall back to the quietest window, and do NOT
-            // reset there -- the cut may be mid-word and the following audio
-            // genuinely continues the same utterance.
-            size_t cut = snap_to_quiet_(off + max_len, max_len / 10);
-            cut = std::max(cut, off + max_len / 2);
-            out.push_back(Segment{off, cut - off, opened_at_silence});
-            off = cut;
-            opened_at_silence = seg_cfg_.reset_on_forced_cut;
-        }
-    }
-    out.push_back(Segment{off, audio_.size() - off, opened_at_silence});
-
-    if (std::getenv("NEMO_SPEECH_DEBUG_VAD_SEG")) {
-        size_t speech_windows = 0, longest_sil = 0, cur_sil = 0;
-        for (const bool sp : speech) {
-            if (sp) {
-                speech_windows++;
-                cur_sil = 0;
-            } else {
-                longest_sil = std::max(longest_sil, ++cur_sil);
-            }
-        }
-        const double win_ms = win * 1000.0 / sr;
-        std::fprintf(
-            stderr,
-            "[vad ] segmenter: %zu windows (%.0f ms each), %zu speech / %zu silence\n"
-            "[vad ]   longest silent run %.0f ms (need >= %.0f ms to cut)\n"
-            "[vad ]   %zu candidate cuts -> %zu segments\n",
-            speech.size(), win_ms, speech_windows, speech.size() - speech_windows,
-            longest_sil * win_ms, seg_cfg_.min_silence_ms, cuts.size(), out.size());
-        for (const auto& s : out) {
-            std::fprintf(
-                stderr, "[vad ]   %8.2f - %8.2f s (%6.2f s)%s\n", s.off / sr,
-                (s.off + s.len) / sr, s.len / sr,
-                s.reset_before ? "  <- decoder context reset" : "");
-        }
-    }
-    return out;
-}
-
 void
 OfflineRunner::pad_audio_to_bucket_() {
     if (bucket_samples_ == 0 || audio_.empty())
@@ -822,29 +723,35 @@ OfflineRunner::finalize() {
         static_cast<float>(audio_.size()) / static_cast<float>(model_->sample_rate());
     if (audio_.empty())
         return update;
+    const size_t real_samples = audio_.size();
     pad_audio_to_bucket_();
 
     // Audio past the positional-encoding budget is split at quiet points and
     // decoded segment by segment through one stateful decoder with cumulative
     // frame offsets - the same contract the streaming runners use, so
     // transcripts and word timings stitch without any seam handling here.
-    const auto segments = segments_for_decode_();
+    const auto segments = offline_segments_();
     std::unique_ptr<Decoder> owned_decoder;
     Decoder* decoder = nullptr;
     std::vector<int> tokens;
+    // Encoder frames past the real audio (bucket padding and the final
+    // centered frame) can still emit; bound words to the real frames.
+    int64_t frame_limit = 0;
+    const auto note_real_frames = [&](size_t off, size_t len, int64_t frame_offset) {
+        if (off >= real_samples)
+            return;
+        const auto mel =
+            static_cast<int64_t>(std::min(len, real_samples - off)) / model_->fe().hop_length();
+        frame_limit = frame_offset +
+                      real_encoder_frames(std::max<int64_t>(1, mel), model_->subsampling_factor());
+    };
     if (model_->head_kind() == HeadKind::Ctc) {
         auto* ctc = static_cast<CtcModel*>(model_);
         decoder = ctc_decoder_.get();
         decoder->set_compute_timestamps(opts_.enable_word_time_offsets);
         decoder->set_request_options(opts_);
         int64_t frame_offset = 0;
-        for (const auto& [off, len, reset_before] : segments) {
-            // A silence boundary: drop the decoder's language context but keep
-            // everything transcribed so far. CTC is stateless across frames, so
-            // this is a no-op there; it is kept for symmetry and for stateful
-            // CTC decoders (Flashlight beam search carries an LM state).
-            if (reset_before)
-                decoder->reset_context();
+        for (const auto& [off, len] : segments) {
             std::vector<int> seg_tokens;
             if (auto* greedy = dynamic_cast<GreedyCtcDecoder*>(decoder)) {
                 std::vector<int32_t> best_ids;
@@ -853,12 +760,14 @@ OfflineRunner::finalize() {
                 ctc->infer_ctc_greedy(audio_.data() + off, len, best_ids, best_probs, T);
                 seg_tokens =
                     greedy->step_compact(best_ids.data(), best_probs.data(), T, frame_offset);
+                note_real_frames(off, len, frame_offset);
                 frame_offset += T;
             } else {
                 std::vector<float> log_probs;
                 int T = 0, C = 0;
                 ctc->infer_ctc(audio_.data() + off, len, log_probs, T, C);
                 seg_tokens = decoder->step(log_probs.data(), C, T, frame_offset);
+                note_real_frames(off, len, frame_offset);
                 frame_offset += T;
             }
             tokens.insert(tokens.end(), seg_tokens.begin(), seg_tokens.end());
@@ -869,25 +778,15 @@ OfflineRunner::finalize() {
         decoder = owned_decoder.get();
         decoder->set_compute_timestamps(opts_.enable_word_time_offsets);
         decoder->set_request_options(opts_);
-        // Full-utterance Recognize presents every encoder frame in this one
-        // call. The EOU punctuation floor is designed for the short trailing
-        // chunk of a streaming flush; enabling it here biases '.', '?', and
-        // '!' by +7.5 at *every* frame, changing early greedy decisions and in
-        // some cases truncating the hypothesis. HF/NeMo offline greedy decode
-        // applies no such bias, and this model already self-punctuates.
         const auto decode_begin = std::chrono::steady_clock::now();
         int64_t frame_offset = 0;
-        for (const auto& [off, len, reset_before] : segments) {
-            // The point of the whole exercise: re-enter the next segment from a
-            // blank predictor so a stale language state cannot suppress it.
-            // frame_offset keeps advancing, so word timings still stitch.
-            if (reset_before)
-                decoder->reset_context();
+        for (const auto& [off, len] : segments) {
             std::vector<float> enc;
             int T = 0;
             transducer->infer_offline(audio_.data() + off, len, enc, T, prompt_index_);
             auto seg_tokens =
                 decoder->step(enc.data(), transducer->rnnt_config().joint_dim, T, frame_offset);
+            note_real_frames(off, len, frame_offset);
             frame_offset += T;
             tokens.insert(tokens.end(), seg_tokens.begin(), seg_tokens.end());
         }
@@ -912,6 +811,7 @@ OfflineRunner::finalize() {
     update.confidence = decoder->confidence();
     if (opts_.max_alternatives > 1)
         update.extra_alternatives = decoder->additional_hypotheses(opts_.max_alternatives);
+    bound_update_words(update, frame_limit);
     return update;
 }
 
@@ -941,15 +841,6 @@ CacheStreamRunner::CacheStreamRunner(
     // attn_mask sizing and chunk-shift math. Same derivation the encoder uses
     // (make_cache_aware_config), so the two can't drift.
     enc_cfg_ = make_cache_aware_config(model->encoder_config(), right_ctx);
-    if (std::getenv("NEMO_SPEECH_DEBUG_RNNT"))
-        std::fprintf(
-            stderr,
-            "[enc ] cache-aware geometry: requested right_ctx=%d -> left_ctx=%d"
-            " chunk_frames=%d right_ctx=%d (attention %d frames, step %.0f ms)\n",
-            right_ctx, enc_cfg_.cache_left_ctx, enc_cfg_.cache_chunk_frames,
-            enc_cfg_.cache_right_ctx,
-            enc_cfg_.cache_left_ctx + enc_cfg_.cache_chunk_frames,
-            enc_cfg_.cache_chunk_frames * 80.0);
 
     // The per-stream K/V/conv cache is device-resident (cache_state_), allocated
     // lazily on first encode. Only attn_mask stays host-side - it's a per-call
@@ -1026,12 +917,20 @@ CacheStreamRunner::feed_audio(const float* samples, size_t n_samples) {
     audio_buf_.insert(audio_buf_.end(), samples, samples + n_samples);
 }
 
+int
+CacheStreamRunner::next_chunk_mel_frames() const {
+    // Preserve the existing overlap and steady-state formula; only startup
+    // uses the shorter causal chunk.
+    return first_chunk_ ? enc_cfg_.cache_first_chunk_mel_frames()
+                        : pre_encode_cache_size_ +
+                              enc_cfg_.subsampling_factor * (1 + enc_cfg_.cache_right_ctx);
+}
+
 void
-CacheStreamRunner::process_one_chunk(bool is_last) {
-    // NeMo formula: chunk_size_mel = pre_encode_cache_size + sub * (1 + R).
+CacheStreamRunner::process_one_chunk() {
     const int sub = enc_cfg_.subsampling_factor;
     const int R = enc_cfg_.cache_right_ctx;
-    const int chunk_size_mel = pre_encode_cache_size_ + sub * (1 + R);
+    const int chunk_size_mel = next_chunk_mel_frames();
     const int shift_size_mel = sub * (1 + R - cache_drop_size_);
     const int n_mels = model_->fe_config().n_mels;
     const int left_ctx = enc_cfg_.cache_left_ctx;
@@ -1061,9 +960,6 @@ CacheStreamRunner::process_one_chunk(bool is_last) {
     // If a head is attached (RNNT path), drive greedy decoding on this
     // chunk's encoder output. Accumulate emitted tokens + maintain transcript.
     if (head_ && last_enc_T_ > 0) {
-        // is_last marks the end-of-utterance flush so the head can apply its
-        // EOU punctuation floor (commits a marginal terminal '.'/'?').
-        head_->set_finalizing(is_last);
         // RnntModel returns joint.enc-projected features, not the wider raw
         // encoder representation. This projection is computed once for the
         // whole chunk (after optional prompt fusion) and reused by every symbol
@@ -1100,8 +996,23 @@ CacheStreamRunner::process_one_chunk(bool is_last) {
 
     // Advance mel buffer: drop shift_size_mel; keep overlap_mel_frames at
     // the head so the next chunk's leading frames see the same context.
-    const size_t shift_floats = static_cast<size_t>(shift_size_mel) * n_mels;
-    mel_offset_ = std::min(mel_offset_ + shift_floats, mel_buf_.size());
+    if (first_chunk_) {
+        first_chunk_ = false;
+        if (chunk_size_mel < pre_encode_cache_size_) {
+            // R=0 begins with one real mel frame. Its first subsequent chunk
+            // still needs the existing overlap; only the unavailable negative
+            // history is zero, and only AFTER the first chunk was encoded.
+            compact_mel_buffer();
+            mel_buf_.insert(
+                mel_buf_.begin(),
+                static_cast<size_t>(pre_encode_cache_size_ - chunk_size_mel) * n_mels, 0.0f);
+        } else {
+            mel_offset_ += static_cast<size_t>(chunk_size_mel - pre_encode_cache_size_) * n_mels;
+        }
+    } else {
+        const size_t shift_floats = static_cast<size_t>(shift_size_mel) * n_mels;
+        mel_offset_ = std::min(mel_offset_ + shift_floats, mel_buf_.size());
+    }
 }
 
 StreamingUpdate
@@ -1148,25 +1059,13 @@ CacheStreamRunner::step() {
         total_mel_frames_produced_ = i_start + n;
     }
 
-    const int sub = enc_cfg_.subsampling_factor;
-    const int R = enc_cfg_.cache_right_ctx;
-    const int chunk_size_mel = pre_encode_cache_size_ + sub * (1 + R);
-
     // Process every whole chunk available, polling the endpointer per chunk
     // so a silence gap interior to one large feed still fires. An EOU breaks
     // the loop; the next utterance's remaining chunks decode on the next
     // step() call.
     last_step_new_tokens_.clear();
-    while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >= chunk_size_mel) {
-        if (!stream_zero_padded_) {
-            // First-chunk zero-pad so the encoder's unconditional
-            // cache_drop_extra eats zero-pad, not the leading 160 ms of real audio.
-            compact_mel_buffer();
-            mel_buf_.insert(
-                mel_buf_.begin(), static_cast<size_t>(pre_encode_cache_size_) * n_mels, 0.0f);
-            stream_zero_padded_ = true;
-        }
-        process_one_chunk(/*is_last=*/false);
+    while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >= next_chunk_mel_frames()) {
+        process_one_chunk();
         if (poll_endpoint(update, /*after_chunk=*/true))
             break;
     }
@@ -1175,80 +1074,38 @@ CacheStreamRunner::step() {
     // per-utterance buffers are already cleared.
     if (!update.is_final)
         update.transcript_so_far = transcript_;
+    // Decoded progress, like the buffered runner's emit cursor: the decoded
+    // mel frontier (the endpointer's clock), not audio queued for lookahead.
+    const auto decoded_samples = std::min<int64_t>(
+        enc_cfg_.cache_decoded_mel_frames(total_frames_emitted_) * model_->fe().hop_length(),
+        static_cast<int64_t>(audio_end));
     update.audio_processed_sec =
-        static_cast<float>(audio_end) / static_cast<float>(model_->fe_config().sample_rate);
+        static_cast<float>(decoded_samples) / static_cast<float>(model_->fe_config().sample_rate);
     // A pending force_eou() must fire even on a chunk-less step.
     if (!update.is_final)
         poll_endpoint(update, /*after_chunk=*/false);
     if (!update.is_final && opts_.needs_word_timings() && head_)
         update.words = head_->word_timings();
+    if (head_)
+        update.late_punctuation = head_->take_late_punctuation();
+    bound_update_words(update, real_frame_limit());
     trim_buffers();
     return update;
 }
 
-void
-CacheStreamRunner::finish_endpoint(StreamingUpdate& update, bool preserve_buffered_future) {
-    compact_mel_buffer();
-    const int n_mels = model_->fe_config().n_mels;
-    const int sub = enc_cfg_.subsampling_factor;
-    const int R = enc_cfg_.cache_right_ctx;
-    const int chunk_size_mel = pre_encode_cache_size_ + sub * (1 + R);
-    const int shift_size_mel = sub * (1 + R - cache_drop_size_);
-
-    // After a decoded chunk, mel_buf_ starts with the encoder overlap. Frames
-    // beyond it have not been decoded and belong to the next utterance when
-    // endpointing fired automatically. A forced EOU instead commits all audio
-    // already supplied by the caller.
-    std::vector<float> next_mel;
-    if (preserve_buffered_future) {
-        const int overlap_frames = chunk_size_mel - shift_size_mel;
-        const size_t split = std::min(
-            mel_buf_.size(), static_cast<size_t>(overlap_frames) * static_cast<size_t>(n_mels));
-        next_mel.assign(mel_buf_.begin() + split, mel_buf_.end());
-        mel_buf_.resize(split);
-    }
-
-    // Flush the acoustic tail through the same EOS path as finalize(). The
-    // synthetic frames may commit terminal punctuation, but they must not
-    // advance the stream clock used by the next utterance.
-    const int64_t real_frames_emitted = total_frames_emitted_;
-    const int real_chunks_processed = chunks_processed_;
-    finalizing_ = true;
-    if (!mel_buf_.empty()) {
-        if (!stream_zero_padded_) {
-            mel_buf_.insert(
-                mel_buf_.begin(), static_cast<size_t>(pre_encode_cache_size_) * n_mels, 0.0f);
-            stream_zero_padded_ = true;
-        }
-        const size_t flush_frames = static_cast<size_t>(chunk_size_mel + shift_size_mel);
-        mel_buf_.resize(mel_buf_.size() + flush_frames * static_cast<size_t>(n_mels), 0.0f);
-        while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >= chunk_size_mel)
-            process_one_chunk(/*is_last=*/true);
-    }
-
-    fire_eou(head_.get(), opts_, all_tokens_, transcript_, update);
-
-    // An EOU is a decoder boundary, not a new audio stream. Reset model state
-    // and segment-local buffers while retaining global FE/VAD cursors and the
-    // absolute encoder-frame clock.
-    if (head_)
-        head_->reset();
-    zero_caches();
-    cache_filled_frames_ = 0;
-    std::fill(attn_mask_.begin(), attn_mask_.end(), 0.0f);
-    mel_buf_ = std::move(next_mel);
-    mel_offset_ = 0;
-    stream_zero_padded_ = false;
-    total_frames_emitted_ = real_frames_emitted;
-    chunks_processed_ = real_chunks_processed;
-    last_enc_out_.clear();
-    last_enc_T_ = 0;
-    finalizing_ = false;
+int64_t
+CacheStreamRunner::real_frame_limit() const {
+    return real_encoder_frames(total_mel_frames_produced_, enc_cfg_.subsampling_factor);
 }
 
 bool
 CacheStreamRunner::poll_endpoint(StreamingUpdate& update, bool after_chunk) {
     if (!endpointer_ || finalizing_)
+        return false;
+    // A client-forced boundary publishes after all currently decodable audio,
+    // not after the first chunk of a larger request. Keep any lookahead for
+    // subsequent audio; only actual end-of-stream may synthesize an EOS tail.
+    if (force_eou_pending_ && after_chunk)
         return false;
     const int sample_rate = model_->fe_config().sample_rate;
     const int hop = model_->fe().hop_length();
@@ -1259,26 +1116,30 @@ CacheStreamRunner::poll_endpoint(StreamingUpdate& update, bool after_chunk) {
     double now_ms = 0.0, last_speech_ms = 0.0;
     if (vad_ && endpointer_->config().vad_based) {
         // VAD-driven: scan the Silero speech bits over the newly decoded mel
-        // frames (enc frame f covers mel frames [f*sub, (f+1)*sub)).
+        // frames. Causal encoder frame f ends at mel f*sub (inclusive), so
+        // the shorter first chunk shifts the exclusive frontier by sub-1.
         const double mel_ms = 1000.0 * hop / sample_rate;
-        const int64_t decoded_mel = total_frames_emitted_ * enc_cfg_.subsampling_factor;
+        const int64_t decoded_mel = enc_cfg_.cache_decoded_mel_frames(total_frames_emitted_);
         scan_vad_speech(*vad_, decoded_mel, vad_scan_frame_, vad_speech_seen_frame_);
         now_ms = static_cast<double>(decoded_mel) * mel_ms;
         last_speech_ms = (vad_speech_seen_frame_ < 0)
                              ? 0.0
                              : static_cast<double>(vad_speech_seen_frame_ + 1) * mel_ms;
     } else {
-        // Token-silence: time since the decoder's last token emission frame.
+        // Sentence punctuation must not prolong silence or re-arm an endpoint.
         const double frame_ms = model_->ms_per_enc_frame();
         now_ms = static_cast<double>(total_frames_emitted_) * frame_ms;
-        const int64_t lef = head_ ? head_->last_emit_frame() : -1;
+        const int64_t lef = head_ ? head_->last_speech_frame() : -1;
         last_speech_ms = (lef < 0) ? 0.0 : static_cast<double>(lef + 1) * frame_ms;
     }
     if (!endpointer_->poll(now_ms, last_speech_ms))
         return false;
-    const bool preserve_buffered_future = after_chunk && !force_eou_pending_;
     force_eou_pending_ = false;
-    finish_endpoint(update, preserve_buffered_future);
+    // EOU publishes a hypothesis; it does not end the acoustic stream. Keep
+    // encoder caches, predictor state, mel overlap and the absolute clock.
+    // Flushing synthetic EOS frames and resetting here changes recognition
+    // after every pause and can delete words from the next utterance.
+    fire_eou(head_.get(), opts_, all_tokens_, transcript_, update);
     return true;
 }
 
@@ -1310,7 +1171,7 @@ CacheStreamRunner::trim_buffers() {
         // masker's neighbourhood scans never cross the trimmed base.
         const int64_t margin =
             std::max<int64_t>(256, vad_masker_ ? 2 * vad_masker_->max_scan() : 0);
-        const int64_t decoded_mel = total_frames_emitted_ * enc_cfg_.subsampling_factor;
+        const int64_t decoded_mel = enc_cfg_.cache_decoded_mel_frames(total_frames_emitted_);
         const int64_t g = decoded_mel - margin;
         if (g > 0)
             vad_->discard_timeline_before(g);
@@ -1326,6 +1187,7 @@ CacheStreamRunner::finalize() {
             static_cast<float>(audio_base_ + audio_buf_.size()) /
                 static_cast<float>(model_->fe_config().sample_rate),
             opts_.max_alternatives);
+        bound_update_words(update, real_frame_limit());
         return update;
     }
     finalizing_ = true;
@@ -1349,6 +1211,7 @@ CacheStreamRunner::finalize() {
 
     auto drained = step();  // process any whole chunks first.
     update.new_token_ids = std::move(drained.new_token_ids);
+    update.late_punctuation = std::move(drained.late_punctuation);
 
     const int n_mels = model_->fe_config().n_mels;
     const int sub = enc_cfg_.subsampling_factor;
@@ -1357,24 +1220,18 @@ CacheStreamRunner::finalize() {
     const int shift_size_mel = sub * (1 + R - cache_drop_size_);
     const size_t buffered = (mel_buf_.size() - mel_offset_) / n_mels;
     if (buffered > 0) {
-        // A stream shorter than one chunk never entered step()'s chunk
-        // loop, so the start-of-stream zero-pad hasn't happened yet; apply
-        // it here or the encoder's cache_drop_extra eats the leading
-        // ~160 ms of real audio instead of pad.
-        if (!stream_zero_padded_) {
-            mel_buf_.insert(
-                mel_buf_.begin(), static_cast<size_t>(pre_encode_cache_size_) * n_mels, 0.0f);
-            stream_zero_padded_ = true;
-        }
         // Tail flush: pad enough zero mel for the final real frame to
         // see a full right-context window AND for the RNNT predictor
         // to get at least one all-zero enc frame to commit pending tail tokens.
+        // Real speech can surface only in these frames (late emission), so
+        // they are decoded; their words are bounded to real_frame_limit().
         const size_t flush_pad_frames = static_cast<size_t>(chunk_size_mel + shift_size_mel);
         mel_buf_.resize(mel_buf_.size() + flush_pad_frames * static_cast<size_t>(n_mels), 0.0f);
         const size_t before = all_tokens_.size();
         last_step_new_tokens_.clear();
-        while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >= chunk_size_mel) {
-            process_one_chunk(/*is_last=*/true);
+        while (static_cast<int>((mel_buf_.size() - mel_offset_) / n_mels) >=
+               next_chunk_mel_frames()) {
+            process_one_chunk();
         }
         for (size_t i = before; i < all_tokens_.size(); i++) {
             update.new_token_ids.push_back(all_tokens_[i]);
@@ -1393,6 +1250,9 @@ CacheStreamRunner::finalize() {
         static_cast<float>(audio_base_ + audio_buf_.size()) /
             static_cast<float>(model_->fe_config().sample_rate),
         opts_.max_alternatives);
+    if (head_)
+        update.late_punctuation += head_->take_late_punctuation(/*end_of_stream=*/true);
+    bound_update_words(update, real_frame_limit());
     return update;
 }
 
@@ -1419,7 +1279,7 @@ CacheStreamRunner::reset() {
     last_enc_T_ = 0;
     finalized_ = false;
     finalizing_ = false;
-    stream_zero_padded_ = false;
+    first_chunk_ = true;
     zero_caches();
     std::fill(attn_mask_.begin(), attn_mask_.end(), 0.0f);
     if (head_)

@@ -5,7 +5,7 @@
 
 1. Prepare Toolchain For RISCV
 ~~~
-wget https://archive.spacemit.com/toolchain/spacemit-toolchain-linux-glibc-x86_64-v1.1.2.tar.xz
+wget https://github.com/spacemit-com/toolchain/releases/download/v1.2.4/spacemit-toolchain-linux-glibc-x86_64-v1.2.4.tar.xz
 ~~~
 
 2. Build
@@ -63,7 +63,7 @@ ${QEMU_ROOT_PATH}/bin/qemu-riscv64 -L ${RISCV_ROOT_PATH_IME1}/sysroot -cpu max,v
 | Q5_1 |  | :heavy_check_mark: |
 | Q5_K |  | :heavy_check_mark: |
 | Q6_K |  | :heavy_check_mark: |
-| Q8_0 |  | :heavy_check_mark: |
+| Q8_0 | :heavy_check_mark: | :heavy_check_mark: |
 
 
 ## Performance

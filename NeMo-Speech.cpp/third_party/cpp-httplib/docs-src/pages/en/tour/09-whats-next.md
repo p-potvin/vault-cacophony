@@ -21,7 +21,9 @@ if (result) {
 }
 ```
 
-You can also pass a `content_receiver` callback to `Get()`. This approach works with Keep-Alive.
+Note that `stream::Get()` reads no more of the body than the client's `set_payload_max_length()` allows, which is 100MB by default. For larger downloads, raise it, or set it to 0 for no limit.
+
+You can also pass a `content_receiver` callback to `Get()`. This approach works with Keep-Alive, and it has no size limit unless you set one with `set_payload_max_length()`.
 
 ```cpp
 httplib::Client cli("http://localhost:8080");
@@ -50,7 +52,7 @@ svr.Get("/stream", [](const auto &, auto &res) {
     res.set_chunked_content_provider("text/plain",
         [](size_t offset, httplib::DataSink &sink) {
             sink.write("chunk\n", 6);
-            return true;  // Return false to finish
+            return true;  // Call sink.done() to finish
         });
 });
 ```
@@ -155,7 +157,7 @@ svr.set_pre_routing_handler([](const auto &req, auto &res) {
 });
 
 svr.set_post_routing_handler([](const auto &req, auto &res) {
-    // Runs after the response is sent
+    // Runs just before the response is sent
     res.set_header("X-Server", "cpp-httplib");
 });
 ```
@@ -168,7 +170,7 @@ svr.set_pre_routing_handler([](const auto &req, auto &res) {
     return httplib::Server::HandlerResponse::Unhandled;
 });
 
-svr.Get("/me", [](const auto &req, auto &res) {
+svr.Get("/me", [](const httplib::Request &req, httplib::Response &res) {
     auto *user = res.user_data.get<std::string>("auth_user");
     res.set_content("Hello, " + *user, "text/plain");
 });
@@ -205,14 +207,14 @@ In addition to TCP, we support Unix Domain Sockets. You can use them for inter-p
 // Server
 httplib::Server svr;
 svr.set_address_family(AF_UNIX);
-svr.listen("/tmp/httplib.sock", 0);
+svr.listen("/tmp/httplib.sock", 80);  // The port is unused, but must not be 0
 ```
 
 ```cpp
 // Client
 httplib::Client cli("http://localhost");
 cli.set_address_family(AF_UNIX);
-cli.set_hostname_addr_map({{"localhost", "/tmp/httplib.sock"}});
+cli.set_direct_hostname_addr_map({{"localhost", "/tmp/httplib.sock"}});
 
 auto res = cli.Get("/");
 ```

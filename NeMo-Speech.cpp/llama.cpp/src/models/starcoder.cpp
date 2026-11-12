@@ -2,7 +2,8 @@
 
 void llama_model_starcoder::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_EPS, hparams.f_norm_eps);
-    switch (hparams.n_layer) {
+
+    switch (hparams.n_layer()) {
         case 24: type = LLM_TYPE_1B; break;
         case 36: type = LLM_TYPE_3B; break;
         case 42: type = LLM_TYPE_7B; break;
@@ -53,10 +54,10 @@ void llama_model_starcoder::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_starcoder::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph>(*this, params);
+    return std::make_unique<graph>(params);
 }
 
-llama_model_starcoder::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_starcoder::graph::graph(const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -139,6 +140,4 @@ llama_model_starcoder::graph::graph(const llama_model & model, const llm_graph_p
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }

@@ -5,10 +5,12 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "batching.h"
@@ -18,7 +20,8 @@
 
 namespace ggml_runtime {
 class Session;
-}
+struct DeviceTensor;
+}  // namespace ggml_runtime
 class FeModule;
 
 struct MelSpecConfig {
@@ -91,6 +94,32 @@ class MelSpectrogramExtractor {
         const float* audio, size_t n_samples, size_t valid_samples, std::vector<float>& features,
         int& n_frames, bool reflect_left = true, bool normalize = true) const;
 
+    // One utterance of compute_padded_batch: its first n samples, zero-padded to n_fe (as the
+    // single-utterance path would be: preemphasis runs over the padded signal), its first `frames`
+    // frames copied to byte dst_offset of the destination.
+    struct PaddedItem {
+        const float* samples = nullptr;
+        size_t n = 0, n_fe = 0;
+        int frames = 0;
+        size_t dst_offset = 0;
+    };
+    // Several utterances in one GPU run (reflect_left, no normalization), the log-mel kept on the
+    // device: items are zero-padded to n_pad >= every n_fe samples, which leaves the frames
+    // covering an item's own (padded) samples unchanged. Each item's frames (frame-major, n_mels
+    // each) are copied device to device into `dst` (same device), complete on return. mean / var
+    // receive each item's NeMo per_feature statistics over its frames (mean and unbiased
+    // variance, n_mels floats per item, item-major). Returns false without a GPU session.
+    bool compute_padded_batch(
+        const std::vector<PaddedItem>& items, size_t n_pad, const ggml_runtime::DeviceTensor& dst,
+        float* mean, float* var) const;
+
+    // Frames compute() returns for n_samples (reflect_left = true).
+    int frames_for(size_t n_samples) const {
+        return (static_cast<int>(n_samples) + 1 + 2 * (cfg_.n_fft / 2) - cfg_.n_fft) /
+                   hop_length() +
+               1;
+    }
+
     // Override the generated filterbank with the model's training-time basis.
     // `fb` is row-major (n_mels, n_fft / 2 + 1).
     void set_mel_basis(const float* fb, int n_mels, int n_bins);
@@ -122,8 +151,14 @@ class MelSpectrogramExtractor {
     std::vector<float> window_;     // Hann window of length win_length
     std::vector<float> mel_basis_;  // (n_mels, n_fft/2 + 1) row-major
 
+    // CPU fast-path tables, built once and rebuilt whenever mel_basis_ changes.
+    std::vector<std::pair<int, int>> fft_swaps_;  // bit-reversal swap list
+    std::vector<float> fft_tw_re_, fft_tw_im_;    // per-stage FFT twiddles
+    std::vector<int> mel_kbeg_, mel_kend_;        // nonzero span of each mel row
+
     void init_window();
     void init_mel_basis();
+    void init_cpu_tables();
 
     // GPU log-mel for one window - runs through session_->run(). Output
     // layout matches the CPU path: `out` is resized to (n_mels * n_frames),
@@ -141,6 +176,9 @@ class MelSpectrogramExtractor {
     std::unique_ptr<ggml_runtime::Session> session_;
     std::unique_ptr<GpuBatcher> batcher_;
     mutable std::mutex compute_mu_;  // serialises session_->run() across streams
+    // compute_padded_batch staging (under compute_mu_); never freed, like the PEE pinned pool (CUDA
+    // may be torn down before static destructors run).
+    mutable ggml_backend_buffer_t pin_in_ = nullptr;
 };
 
 // Read PCM16 or float32 WAV audio and downmix it to mono. Does not resample.

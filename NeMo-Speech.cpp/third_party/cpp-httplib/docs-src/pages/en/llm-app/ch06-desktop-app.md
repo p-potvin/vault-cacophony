@@ -407,7 +407,6 @@ bool download_model(const ModelInfo &model,
                     std::function<bool(int)> progress_cb) {
   httplib::Client cli("https://huggingface.co");
   cli.set_follow_location(true);  // Hugging Face redirects to a CDN
-  cli.set_read_timeout(std::chrono::hours(1)); // Long timeout for large models
 
   auto url = "/" + model.repo + "/resolve/main/" + model.filename;
   auto path = get_models_dir() / model.filename;
@@ -468,10 +467,6 @@ int main() {
   }
   auto llm = llamalib::Llama{path};
   std::mutex llm_mutex; // Protect access during model switching
-
-  // Set a long timeout since LLM inference takes time (default is 5 seconds)
-  svr.set_read_timeout(300);
-  svr.set_write_timeout(300);
 
   svr.set_logger([](const auto &req, const auto &res) {
     std::cout << req.method << " " << req.path << " -> " << res.status
@@ -680,9 +675,10 @@ int main() {
 To summarize the changes from Chapter 5:
 
 - `#include <csignal>` replaced with `#include <thread>`, `<cpp-embedlib-httplib.h>`, `"WebAssets.h"`, `"webview/webview.h"`
-- Removed the `signal_handler` function
+- Removed the `signal_handler` function and moved `svr` into `main()`
 - `svr.set_mount_point("/", "./public")` replaced with `httplib::mount(svr, Web::FS)`
 - `svr.listen("127.0.0.1", 8080)` replaced with `bind_to_any_port` + `listen_after_bind` + WebView event loop
+- Added `setup_macos_edit_menu()` and its `<objc/objc-runtime.h>` include (macOS only)
 
 Not a single line of handler code has changed. The REST API, SSE streaming, and model management built through Chapter 5 all work as-is.
 

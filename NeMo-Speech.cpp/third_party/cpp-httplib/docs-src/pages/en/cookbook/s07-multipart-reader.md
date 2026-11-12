@@ -48,23 +48,63 @@ svr.Post("/upload",
      const httplib::ContentReader &content_reader) {
     std::ofstream ofs;
 
-    content_reader(
+    auto ok = content_reader(
       [&](const httplib::FormData &file) {
-        if (!file.filename.empty()) {
-          ofs.open("uploads/" + file.filename, std::ios::binary);
-        }
-        return static_cast<bool>(ofs);
+        if (ofs.is_open()) { ofs.close(); }         // done with the previous file
+        if (file.filename.empty()) { return true; } // a plain field, skip it
+
+        auto name = httplib::sanitize_filename(file.filename);
+        if (name.empty()) { return false; }         // reject an unsafe name
+
+        ofs.open("uploads/" + name, std::ios::binary);
+        return ofs.is_open();
       },
       [&](const char *data, size_t len) {
+        if (!ofs.is_open()) { return true; }        // not part of a file
         ofs.write(data, len);
         return static_cast<bool>(ofs);
       });
 
+    if (!ok) { return; } // the status is already set
     res.set_content("uploaded", "text/plain");
   });
 ```
 
+The header callback runs at the start of every part, so it closes the previous file before opening the next one. `file.filename` is whatever the client sent, so always pass it through `httplib::sanitize_filename()`. An empty result means the name is unsafe.
+
 Only a small chunk sits in memory at any moment, so gigabyte-scale files are no problem.
+
+## Count the parts yourself
+
+There is a cap on the number of parts, `CPPHTTPLIB_MULTIPART_FORM_DATA_FILE_MAX_COUNT` (1024 by default), but it only applies to the buffered path, where every part is accumulated into `req.form`. The `ContentReader` keeps nothing on the library side, so the cap does not apply here.
+
+If you want an upper bound, count the parts yourself and return `false` from the header callback. The parser stops right there.
+
+```cpp
+svr.Post("/upload",
+  [](const httplib::Request &req, httplib::Response &res,
+     const httplib::ContentReader &content_reader) {
+    size_t count = 0;
+
+    auto ok = content_reader(
+      [&](const httplib::FormData &file) {
+        if (++count > 100) { return false; } // stop here
+        return true;
+      },
+      [&](const char *data, size_t len) {
+        return true;
+      });
+
+    if (!ok) {
+      res.status = httplib::StatusCode::BadRequest_400;
+      return;
+    }
+
+    res.set_content("ok", "text/plain");
+  });
+```
+
+When `content_reader` returns `false`, the response status becomes 400 (413 if the body exceeded the size limit). Set it yourself if you want a different one. The rest of the body is left unread and the connection is closed, so a client that is still sending sees the connection drop.
 
 > **Warning:** When you use `HandlerWithContentReader`, `req.body` stays **empty**. Handle the body yourself inside the callbacks.
 

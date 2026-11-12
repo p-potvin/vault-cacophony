@@ -38,9 +38,16 @@ __kernel void kernel_gemv_moe_q5_0_f32_ns(
     uint sgid = get_local_id(1);
     uint slid = get_sub_group_local_id();
 
+    if (i01 >= ne01) {
+        return;
+    }
+
     uint i11 = i20 % ne11;
 
     uint expert_id = src2[i20];
+    if ((int)expert_id == -1) { // skipped slot, the dst row is zeroed by kernel_moe_zero_dst
+        return;
+    }
     uint expert_offset = expert_id * ne00 * ne01 / 32;
 
     __private float sum = 0.0f; // each thread calculate partial sum of one output

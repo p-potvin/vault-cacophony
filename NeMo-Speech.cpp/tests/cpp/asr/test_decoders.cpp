@@ -9,6 +9,7 @@
 //   RnntGreedyDecoder  scripted MockRnntEngine: emission sequence, blank =
 //                      frame advance, max_symbols_per_step cap, LSTM state /
 //                      prev_token preserved across reset_utterance (riva EOU).
+//   bound_word_frames  end-of-stream flush words stay on real frames.
 //
 // Usage: ./test_decoders   (no model files, no GPU)
 #include <cmath>
@@ -18,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "fastconformer.h"
 #include "greedy_ctc_decoder.h"
 #include "rnnt_greedy_decoder.h"
 
@@ -293,6 +295,7 @@ class MockRnntEngine : public RnntEngine {
 
     const RnntConfig& rnnt_config() const override { return cfg_; }
     const std::vector<std::string>& vocab() const override { return vocab_; }
+    void set_piece(int id, const std::string& text) { vocab_.at(id) = text; }
 
     struct State : RnntStreamState {
         float bank[2] = {0.0f, 0.0f};
@@ -382,7 +385,7 @@ test_rnnt_max_symbols_cap() {
 }
 
 void
-test_rnnt_eou_punctuation_bias() {
+test_rnnt_finalization_preserves_native_punctuation() {
     MockRnntEngine eng;
     RnntGreedyDecoder dec(&eng);
     const int blank = eng.rnnt_config().blank_id;
@@ -390,18 +393,215 @@ test_rnnt_eou_punctuation_bias() {
 
     eng.rounds = {{blank}};
     dec.step(enc.data(), 4, 1, 0);
-    check(eng.last_logit_bias.empty(), "rnnt: no punctuation bias mid-stream");
+    check(eng.last_logit_bias.empty(), "rnnt: initial silence has no punctuation bias");
 
-    dec.set_finalizing(true);
-    eng.rounds = {{blank}};
+    eng.rounds = {{0}, {blank}};
     dec.step(enc.data(), 4, 1, 1);
+    eng.rounds = {{blank}, {3}};
+    const auto tail = dec.step(enc.data(), 4, 1, 2);
+    const int joints = eng.joint_calls;
+    dec.finalize();
     check(
-        eng.last_logit_bias.size() == static_cast<size_t>(eng.rnnt_config().vocab_size),
-        "rnnt: EOU bias spans the joint vocabulary including blank");
+        tail.empty() && eng.last_logit_bias.empty() && eng.joint_calls == joints &&
+            dec.stats().emitted_tokens == 1,
+        "rnnt: a clipped stream closes without forcing terminal punctuation");
+
+    dec.reset();
+    dec.set_compute_timestamps(true);
+    eng.rounds = {{0}, {blank}};
+    dec.step(enc.data(), 4, 1, 0);
+    eng.rounds = {{3}, {blank}};
+    const auto native = dec.step(enc.data(), 4, 1, 1);
+    dec.finalize();
     check(
-        eng.last_logit_bias.size() > 4 && near(eng.last_logit_bias[3], 7.5f) &&
-            near(eng.last_logit_bias[blank], 0.0f),
-        "rnnt: EOU floors terminal punctuation without biasing blank");
+        native == std::vector<int>{3} && eng.last_logit_bias.empty() &&
+            dec.word_timings().size() == 1 && dec.word_timings()[0].word == "a?",
+        "rnnt: finalization preserves native terminal punctuation");
+}
+
+void
+test_rnnt_stalls_do_not_inject_punctuation() {
+    MockRnntEngine eng;
+    eng.set_piece(2, ",");
+    RnntGreedyDecoder dec(&eng);
+    const int blank = eng.rnnt_config().blank_id;
+    std::vector<float> enc(4, 0.0f);
+    for (bool formatting : {false, true}) {
+        dec.reset();
+        AsrRequestOptions opts;
+        opts.enable_automatic_punctuation = formatting;
+        opts.enable_word_time_offsets = true;
+        dec.set_request_options(opts);
+        eng.rounds = {{0}, {blank}};
+        dec.step(enc.data(), 4, 1, 0);
+        const int predictors = eng.predictor_calls;
+        for (int frame = 1; frame <= 100; ++frame) {
+            const int joints = eng.joint_calls;
+            // A second query would return punctuation: it must never be made.
+            eng.rounds = {{blank}, {3}};
+            const auto tokens = dec.step(enc.data(), 4, 1, frame);
+            check(
+                tokens.empty() && eng.last_logit_bias.empty() && eng.joint_calls == joints + 1 &&
+                    eng.predictor_calls == predictors && dec.stats().emitted_tokens == 1 &&
+                    dec.last_emit_frame() == 0 && dec.last_speech_frame() == 0,
+                "rnnt: prolonged stalls neither bias punctuation nor run a suggestion query");
+        }
+        eng.rounds = {{3}, {blank}};
+        const auto native = dec.step(enc.data(), 4, 1, 101);
+        dec.finalize();
+        check(
+            native == std::vector<int>{3} && eng.last_logit_bias.empty() &&
+                dec.word_timings().size() == 1 && dec.word_timings()[0].word == "a?" &&
+                dec.word_timings()[0].end_frame == 1,
+            "rnnt: native punctuation survives prolonged stalls without changing word duration");
+        dec.reset_utterance();
+        for (int frame = 102; frame <= 110; ++frame) {
+            eng.rounds = {{blank}, {3}};
+            check(
+                dec.step(enc.data(), 4, 1, frame).empty() && eng.last_logit_bias.empty(),
+                "rnnt: soft EOU does not enable punctuation bias");
+        }
+        eng.rounds = {{blank}};
+        dec.step(enc.data(), 4, 1, 111);
+        dec.finalize();
+        check(
+            eng.last_logit_bias.empty() && dec.word_timings().empty(),
+            "rnnt: closing after an endpoint cannot synthesize another punctuation final");
+    }
+}
+
+void
+test_rnnt_late_punctuation_returns_to_previous_final() {
+    MockRnntEngine eng;
+    RnntGreedyDecoder dec(&eng);
+    const int blank = eng.rnnt_config().blank_id;
+    std::vector<float> enc(4, 0.0f);
+    auto step = [&](std::vector<int> round, int64_t frame) {
+        eng.rounds = {std::move(round), {blank}};
+        return dec.step(enc.data(), 4, 1, frame);
+    };
+
+    step({3}, 0);
+    check(
+        dec.take_late_punctuation().empty(),
+        "rnnt: leading punctuation at stream start is dropped");
+
+    step({0}, 1);
+    dec.reset_utterance();
+    check(step({3}, 2).empty(), "rnnt: late punctuation is not part of the next utterance");
+    check(dec.take_late_punctuation().empty(), "rnnt: late punctuation waits for the next word");
+    eng.set_piece(
+        1,
+        "\xE2\x96\x81"
+        "B");
+    step({1}, 3);
+    check(
+        dec.take_late_punctuation() == "?",
+        "rnnt: late punctuation before a capitalized word returns to the previous final");
+    check(dec.take_late_punctuation().empty(), "rnnt: late punctuation is delivered once");
+
+    dec.reset_utterance();
+    step({3}, 4);
+    step({2}, 5);
+    check(
+        dec.take_late_punctuation().empty(),
+        "rnnt: a late sentence mark before a lowercase word is dropped");
+
+    step({3}, 6);
+    step({0}, 7);
+    check(dec.take_late_punctuation().empty(), "rnnt: punctuation inside an utterance is not late");
+
+    dec.reset_utterance();
+    step({3}, 8);
+    check(
+        dec.take_late_punctuation(/*end_of_stream=*/true) == "?",
+        "rnnt: end of stream releases a waiting late mark");
+
+    step({0}, 9);
+    dec.reset_utterance();
+    step({3}, 10);
+    dec.reset();
+    check(dec.take_late_punctuation().empty(), "rnnt: hard reset discards late punctuation");
+}
+
+void
+test_rnnt_endpoint_punctuation_continuity() {
+    MockRnntEngine eng;
+    RnntGreedyDecoder dec(&eng);
+    AsrRequestOptions opts;
+    opts.enable_word_time_offsets = true;
+    opts.enable_automatic_punctuation = true;
+    dec.set_request_options(opts);
+    const int blank = eng.rnnt_config().blank_id;
+    std::vector<float> enc(4, 0.0f);
+    eng.rounds = {{0}, {blank}};
+    dec.step(enc.data(), 4, 1, 0);
+    for (int frame = 1; frame <= 8; ++frame) {
+        eng.rounds = {{blank}};
+        dec.step(enc.data(), 4, 1, frame);
+    }
+    check(eng.last_logit_bias.empty(), "rnnt: continuing silence never enables punctuation bias");
+    eng.rounds = {{3}, {blank}};
+    dec.step(enc.data(), 4, 1, 9);
+    dec.finalize();
+    check(
+        dec.word_timings().size() == 1 && dec.word_timings()[0].word == "a?" &&
+            dec.word_timings()[0].end_frame == 1 && dec.last_speech_frame() == 0,
+        "rnnt: terminal punctuation stays in the published word");
+    const int predictor_calls = eng.predictor_calls;
+    dec.reset_utterance();
+    eng.rounds = {{blank}};
+    dec.step(enc.data(), 4, 1, 10);
+    check(
+        eng.predictor_calls == predictor_calls && eng.last_logit_bias.empty(),
+        "rnnt: soft EOU preserves cached predictor without injecting punctuation bias");
+    eng.rounds = {{3}, {blank}};
+    auto late = dec.step(enc.data(), 4, 1, 11);
+    dec.finalize();
+    check(
+        late.empty() && dec.word_timings().empty() && eng.last_prev_token == 3,
+        "rnnt: late punctuation updates predictor but creates no next-final text or word");
+    check(
+        dec.last_emit_frame() == 11 && dec.last_speech_frame() == 0,
+        "rnnt: late punctuation cannot re-arm the endpoint speech clock");
+    eng.rounds = {{1}, {blank}};
+    auto next = dec.step(enc.data(), 4, 1, 12);
+    eng.rounds = {{3}, {blank}};
+    dec.step(enc.data(), 4, 1, 13);
+    eng.rounds = {{3}, {blank}};
+    auto repeated = dec.step(enc.data(), 4, 1, 14);
+    dec.finalize();
+    check(
+        next == std::vector<int>{1} && repeated.empty() && dec.word_timings().size() == 1 &&
+            dec.word_timings()[0].word == "b?" && dec.word_timings()[0].start_frame == 12 &&
+            dec.word_timings()[0].end_frame == 13,
+        "rnnt: next utterance retains text, punctuation and absolute timings without duplicates");
+    dec.reset();
+    check(dec.last_speech_frame() == -1, "rnnt: hard reset clears endpoint speech evidence");
+    for (int frame = 0; frame < 8; ++frame) {
+        eng.rounds = {{blank}};
+        dec.step(enc.data(), 4, 1, frame);
+    }
+    check(eng.last_logit_bias.empty(), "rnnt: initial silence cannot accumulate punctuation bias");
+    check(
+        !sp_is_punctuation("-") && !sp_is_punctuation("'") && !sp_is_punctuation("\"") &&
+            !sp_is_punctuation("don't") && !sp_is_punctuation("-5"),
+        "rnnt: publication cleanup preserves signs, quotes and contractions");
+    eng.set_piece(2, "\xE2\x96\x81");
+    dec.reset();
+    eng.rounds = {{0}, {blank}};
+    dec.step(enc.data(), 4, 1, 0);
+    eng.rounds = {{2}, {blank}};
+    dec.step(enc.data(), 4, 1, 1);
+    eng.rounds = {{3}, {blank}};
+    dec.step(enc.data(), 4, 1, 2);
+    eng.rounds = {{1}, {blank}};
+    dec.step(enc.data(), 4, 1, 3);
+    dec.finalize();
+    check(
+        dec.word_timings().size() == 2 && dec.word_timings()[0].word == "a?" &&
+            dec.word_timings()[1].word == "b",
+        "rnnt: bare word separator cannot detach punctuation into its own timed word");
 }
 
 void
@@ -466,15 +666,71 @@ test_rnnt_punctuation_word_timing() {
     RnntGreedyDecoder dec(&eng);
     dec.set_compute_timestamps(true);
     const int blank = eng.rnnt_config().blank_id;
-    // f0 emits "▁a", f1 emits "▁?": punctuation extends the first word.
+    // f0 emits "▁a", f1 emits "▁?": punctuation attaches without extending speech time.
     eng.rounds = {{0, blank}, {blank, 3}, {blank}};
     std::vector<float> enc(2 * 4, 0.0f);
     dec.step(enc.data(), 4, 2, /*frame_offset=*/5);
     dec.finalize();
     const auto& w = dec.word_timings();
     const bool ok =
-        w.size() == 1 && w[0].word == "a?" && w[0].start_frame == 5 && w[0].end_frame == 7;
+        w.size() == 1 && w[0].word == "a?" && w[0].start_frame == 5 && w[0].end_frame == 6;
     check(ok, "rnnt: boundary-prefixed terminator stays with timed word");
+}
+
+void
+test_rnnt_causal_startup_coordinates() {
+    // #46 shortened the first Mel chunk, not the decoder's emission-frame
+    // grid. Guard against applying the VAD frontier correction to word times,
+    // and against restarting the absolute frame offset after an EOU.
+    for (int right : {0, 3, 6, 13}) {
+        const auto cfg = make_cache_aware_config(EncoderConfig{}, right);
+        const int count = right + 1;
+        const int64_t first_mel = 1 + 8 * right;
+        MockRnntEngine eng;
+        RnntGreedyDecoder dec(&eng);
+        dec.set_compute_timestamps(true);
+        const int blank = eng.rnnt_config().blank_id;
+        std::vector<int> last_only(count, blank);
+        last_only.back() = 0;
+        eng.rounds = {last_only, {blank}};
+        std::vector<float> frames(count * eng.rnnt_config().joint_dim, 0.0f);
+        const auto first = dec.step(frames.data(), eng.rnnt_config().joint_dim, count, 0);
+        dec.finalize();
+        const auto words = dec.word_timings();
+        check(
+            first == std::vector<int>{0} && words.size() == 1,
+            "rnnt causal startup: control must emit a timed word");
+        if (words.size() != 1)
+            continue;
+        check(
+            words[0].start_frame == right && words[0].end_frame == count,
+            "rnnt causal startup: first word keeps the emission-frame grid");
+        check(
+            cfg.cache_decoded_mel_frames(count) == first_mel &&
+                words[0].start_frame * 8 == first_mel - 1,
+            "rnnt causal startup: emission anchor and exclusive Mel frontier differ");
+        dec.reset_utterance();
+        eng.rounds = {{1}, {blank}};
+        const auto next = dec.step(frames.data(), eng.rnnt_config().joint_dim, count, count);
+        dec.finalize();
+        const auto& after_eou = dec.word_timings();
+        check(
+            next == std::vector<int>{1} && after_eou.size() == 1 &&
+                after_eou[0].start_frame == count && after_eou[0].end_frame == count + 1 &&
+                dec.last_speech_frame() == count,
+            "rnnt causal startup: EOU preserves absolute word and token-silence coordinates");
+        check(
+            cfg.cache_decoded_mel_frames(2 * count) == first_mel + 8 * count,
+            "rnnt causal startup: second chunk advances by the steady-state stride");
+        dec.reset();
+        eng.rounds = {{2}, {blank}};
+        dec.step(frames.data(), eng.rnnt_config().joint_dim, count, 0);
+        dec.finalize();
+        const auto& reset = dec.word_timings();
+        check(
+            reset.size() == 1 && reset[0].start_frame == 0 && reset[0].end_frame == 1,
+            "rnnt causal startup: only a new stream restarts word coordinates at zero");
+    }
 }
 
 void
@@ -569,6 +825,60 @@ test_tdt_duration_and_state_commit() {
 }
 
 void
+test_eos_flush_word_bounds() {
+    check(
+        real_encoder_frames(0, 8) == 0 && real_encoder_frames(1, 8) == 1 &&
+            real_encoder_frames(8, 8) == 1 && real_encoder_frames(9, 8) == 2 &&
+            real_encoder_frames(105, 8) == 14,
+        "bounds: real encoder frames follow (M - 1) / sub + 1");
+
+    // Four real frames, then the end-of-stream flush through zero frames.
+    // Tokens emitted in the flush keep their text and land on the last real
+    // frame; a word spanning the boundary keeps its onset.
+    MockRnntEngine eng;
+    eng.set_piece(3, "d");  // continuation piece
+    RnntGreedyDecoder dec(&eng);
+    dec.set_compute_timestamps(true);
+    const int blank = eng.rnnt_config().blank_id;
+    std::vector<float> enc(4 * 4, 0.0f);
+    eng.rounds = {{blank, 0}, {blank, blank, 1}, {blank}};
+    dec.step(enc.data(), 4, 4, /*frame_offset=*/0);
+    eng.rounds = {{3}, {blank, blank, 2}, {blank}};
+    dec.step(enc.data(), 4, 4, /*frame_offset=*/4);
+    dec.finalize();
+    auto words = dec.word_timings();
+    check(
+        words.size() == 3 && words[1].word == "bd" && words[1].end_frame == 5 &&
+            words[2].start_frame == 6,
+        "bounds: control decodes words past the real frames");
+    bound_word_frames(words, real_encoder_frames(25, 8));
+    check(
+        words.size() == 3 && words[0].word == "a" && words[0].start_frame == 1 &&
+            words[0].end_frame == 2 && words[1].word == "bd" && words[1].start_frame == 3 &&
+            words[1].end_frame == 4 && words[2].word == "c" && words[2].start_frame == 3 &&
+            words[2].end_frame == 4,
+        "bounds: flushed words keep text and order on the last real frame");
+
+    // A TDT duration on the final frame must not reach past it either.
+    MockTdtEngine tdt_eng;
+    TdtGreedyDecoder tdt(&tdt_eng);
+    tdt.set_compute_timestamps(true);
+    const int tdt_blank = tdt_eng.rnnt_config().blank_id;
+    tdt_eng.rounds = {{tdt_blank, 1}, {tdt_blank, 1}, {0, 2}};
+    std::vector<float> frames(3 * 2, 0.0f);
+    tdt.step(frames.data(), 2, 3, /*frame_offset=*/0);
+    tdt.finalize();
+    auto tdt_words = tdt.word_timings();
+    check(
+        tdt_words.size() == 1 && tdt_words[0].start_frame == 2 && tdt_words[0].end_frame == 4,
+        "bounds: TDT control duration reaches past the last frame");
+    bound_word_frames(tdt_words, 3);
+    check(
+        tdt_words.size() == 1 && tdt_words[0].start_frame == 2 && tdt_words[0].end_frame == 3,
+        "bounds: TDT duration ends on the last real frame");
+}
+
+void
 test_tdt_zero_duration_guard() {
     MockTdtEngine eng;
     TdtGreedyDecoder dec(&eng);
@@ -614,12 +924,17 @@ main() {
     test_greedy_open_word_needs_finalize();
     test_rnnt_emission_and_blank();
     test_rnnt_max_symbols_cap();
-    test_rnnt_eou_punctuation_bias();
+    test_rnnt_finalization_preserves_native_punctuation();
+    test_rnnt_stalls_do_not_inject_punctuation();
+    test_rnnt_late_punctuation_returns_to_previous_final();
+    test_rnnt_endpoint_punctuation_continuity();
     test_rnnt_state_threading_and_reset_utterance();
     test_rnnt_word_timings();
+    test_rnnt_causal_startup_coordinates();
     test_rnnt_punctuation_word_timing();
     test_rnnt_open_word_needs_finalize();
     test_tdt_duration_and_state_commit();
+    test_eos_flush_word_bounds();
     test_tdt_zero_duration_guard();
     test_tdt_duration_crosses_step_boundary();
     std::fprintf(stdout, g_fail ? "FAILED (%d)\n" : "ALL PASS\n", g_fail);

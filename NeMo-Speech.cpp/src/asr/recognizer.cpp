@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
-#include <cstdlib>
 #include "recognizer.h"
 
 #include <algorithm>
@@ -8,12 +7,15 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include "gguf.h"
 #include "model.h"
 #include "silero_vad.h"
 #ifdef NEMO_SPEECH_WITH_FLASHLIGHT
@@ -38,11 +40,18 @@ head_name(HeadKind head) {
 }
 
 std::unique_ptr<ggml_runtime::BackendManager>
-make_backend(int gpu_idx) {
+make_backend(const BackendConfig& backend) {
     ggml_runtime::Params p;
-    p.use_gpu = (gpu_idx >= 0);
-    p.gpu_device_idx = std::max(gpu_idx, 0);
+    p.use_gpu = (backend.gpu >= 0);
+    p.gpu_device_idx = std::max(backend.gpu, 0);
     p.pe_bin_path = const_cast<char*>("");
+    if (backend.threads > 0) {
+        p.n_threads = backend.threads;
+    } else {
+        // More busy-waiting CPU workers than hardware threads slows the graph down.
+        const unsigned hw = std::thread::hardware_concurrency();
+        p.n_threads = hw > 0 ? std::min(8, static_cast<int>(hw)) : 8;
+    }
     return std::make_unique<ggml_runtime::BackendManager>(p);
 }
 
@@ -88,25 +97,99 @@ exceeds_offline_position_limit(const AsrModel& model, size_t n_samples, int inpu
     return frames > enc.pos_emb_max_len;
 }
 
+namespace {
+
+// The keys of a GGUF's header (no tensor data); empty when the file is not a readable GGUF.
+class GgufHeader {
+   public:
+    explicit GgufHeader(const std::string& path) {
+        gguf_init_params params{};
+        params.no_alloc = true;
+        params.ctx = nullptr;
+        ctx_ = gguf_init_from_file(path.c_str(), params);
+    }
+    ~GgufHeader() {
+        if (ctx_)
+            gguf_free(ctx_);
+    }
+    GgufHeader(const GgufHeader&) = delete;
+    GgufHeader& operator=(const GgufHeader&) = delete;
+
+    explicit operator bool() const { return ctx_ != nullptr; }
+    std::string str(const char* key) const {
+        const int64_t id = ctx_ ? gguf_find_key(ctx_, key) : -1;
+        return id >= 0 && gguf_get_kv_type(ctx_, id) == GGUF_TYPE_STRING
+                   ? gguf_get_val_str(ctx_, id)
+                   : "";
+    }
+    // Whether the string array `key` holds `value`.
+    bool lists(const char* key, std::string_view value) const {
+        const int64_t id = ctx_ ? gguf_find_key(ctx_, key) : -1;
+        if (id < 0 || gguf_get_kv_type(ctx_, id) != GGUF_TYPE_ARRAY ||
+            gguf_get_arr_type(ctx_, id) != GGUF_TYPE_STRING)
+            return false;
+        for (size_t i = 0; i < gguf_get_arr_n(ctx_, id); ++i)
+            if (value == gguf_get_arr_str(ctx_, id, i))
+                return true;
+        return false;
+    }
+
+   private:
+    gguf_context* ctx_ = nullptr;
+};
+
+}  // namespace
+
+void
+resolve_salm_encoder(RecognizerConfig& cfg) {
+    if (cfg.model.path.empty())
+        return;
+    const GgufHeader decoder(cfg.model.path);
+    if (!decoder)
+        return;
+    const std::string named = decoder.str("nemo_speech.speech_model");  // the encoder file
+    if (cfg.salm.encoder_path.empty() && !named.empty()) {
+        const auto path = std::filesystem::path(cfg.model.path).parent_path() / named;
+        if (!std::filesystem::exists(path))
+            throw std::invalid_argument(
+                cfg.model.path + " needs its encoder file " + named +
+                " in the same directory (or asr.salm.encoder_path, --salm-encoder)");
+        cfg.salm.encoder_path = path.string();
+    }
+    if (cfg.salm.encoder_path.empty())
+        return;
+    const GgufHeader encoder(cfg.salm.encoder_path);
+    if (!encoder)
+        return;
+    // the CTC timestamp head (word timestamps, speakers) is part of the encoder file
+    cfg.salm.ctc_path =
+        encoder.lists("nemo_speech.components", "ctc_timestamp") ? cfg.salm.encoder_path : "";
+    const std::string want = decoder.str("nemo_speech.checkpoint_id");
+    const std::string have = encoder.str("nemo_speech.checkpoint_id");
+    if (!want.empty() && !have.empty() && want != have)
+        throw std::invalid_argument(
+            cfg.salm.encoder_path + " and " + cfg.model.path +
+            " come from different checkpoints (nemo_speech.checkpoint_id " + have + " and " + want +
+            ")");
+}
+
 Recognizer::Recognizer(RecognizerConfig cfg)
-    : bm_(make_backend(cfg.backend.gpu)), cfg_(std::move(cfg)),
+    : bm_(make_backend(cfg.backend)), cfg_(std::move(cfg)),
       streaming_ingress_batches_(cfg_.batching), offline_ingress_batches_(cfg_.batching) {
     if (cfg_.streaming.chunk_size <= 0.0f || cfg_.streaming.ctc_left_padding < 0.0f ||
         cfg_.streaming.ctc_right_padding < 0.0f)
         throw std::invalid_argument(
             "invalid streaming geometry: chunk_size must be > 0 and paddings must be >= 0");
+    if (!cfg_.salm.encoder_path.empty())
+        throw std::invalid_argument("SALM must be loaded through EngineRegistry::load_asr");
     model_ = AsrModel::load(*bm_, cfg_.model.path, cfg_.batching);
     model_name_ = cfg_.model.name.empty() ? model_->model_name() : cfg_.model.name;
     // Self-punctuating models must bypass the separate PnC model.
     postproc_ = std::make_unique<postproc::Postprocessor>(
         cfg_.postproc, bm_.get(), vocab_self_punctuates(model_->vocab()), cfg_.batching);
-    // Offline segmentation is a third consumer of the VAD weights, alongside
-    // feature masking and VAD-driven endpointing. Without it listed here a
-    // --vad-segmentation run loads no VAD model and silently does nothing.
     const bool need_vad =
         !cfg_.vad.model_path.empty() &&
-        (cfg_.vad.masker.mask_enable || cfg_.vad.segmenter.enable ||
-         (cfg_.endpointing.enable && cfg_.endpointing.vad_based));
+        (cfg_.vad.masker.mask_enable || (cfg_.endpointing.enable && cfg_.endpointing.vad_based));
     if (need_vad) {
         vad_model_ = std::make_shared<SileroVadModel>(*bm_, cfg_.vad.model_path, cfg_.batching);
         GGMLF_LOG_INFO("[recognizer] VAD weights/session loaded once and shared across streams\n");
@@ -130,11 +213,14 @@ Recognizer::Recognizer(RecognizerConfig cfg)
 
     if (!cfg_.diar.model_path.empty()) {
         diar_model_ = std::make_unique<DiarModel>(*bm_, cfg_.diar.model_path, cfg_.batching);
-        const DiarGeometry geo = cfg_.diar.resolved_geometry();
+        const DiarGeometry geo = diar_model_->resolved_geometry(cfg_.diar.resolved_geometry());
+        const auto& diar_cfg = diar_model_->cfg();
         GGMLF_LOG_INFO(
-            "[recognizer] diarizer loaded: %s (spkcache=%d fifo=%d chunk=%d rc=%d)\n",
-            cfg_.diar.model_path.c_str(), geo.spkcache_len, geo.fifo_len, geo.chunk_len,
-            geo.chunk_right_context);
+            "[recognizer] diarizer loaded: %s (%s, speakers=%d, output=%.0fms, "
+            "spkcache=%d fifo=%d chunk=%d lc=%d rc=%d)\n",
+            cfg_.diar.model_path.c_str(), diar_cfg.is_v3() ? "v3" : "v2", diar_cfg.num_speakers,
+            diar_cfg.seconds_per_output_frame() * 1000.0, geo.spkcache_len, geo.fifo_len,
+            geo.chunk_len, geo.chunk_left_context, geo.chunk_right_context);
     }
     log_model_status();
 }
@@ -203,13 +289,48 @@ Recognizer::log_execution_status(bool streaming) const {
     std::call_once(streaming ? streaming_status_once_ : offline_status_once_, std::move(emit));
 }
 
+Recognizer::Recognizer(RecognizerConfig cfg, std::unique_ptr<OfflineRecognitionBackend> backend)
+    : offline_backend_(std::move(backend)),
+      model_name_(cfg.model.name.empty() ? "salm" : cfg.model.name), cfg_(std::move(cfg)),
+      streaming_ingress_batches_(cfg_.batching), offline_ingress_batches_(cfg_.batching) {
+    if (!offline_backend_)
+        throw std::invalid_argument("offline recognition backend is null");
+    if (cfg_.log_status)
+        GGMLF_LOG_INFO("[recognizer] SALM complete-audio backend loaded\n");
+}
+
+std::vector<std::pair<std::string, BatchMetrics>>
+Recognizer::batch_metrics() const {
+    if (offline_backend_)
+        return {{"salm", offline_backend_->batch_metrics()}};
+    std::vector<std::pair<std::string, BatchMetrics>> out{
+        {"frontend", model_->fe().batch_metrics()}};
+    if (model_->head_kind() == HeadKind::Ctc) {
+        out.emplace_back("encoder", static_cast<const CtcModel*>(model_.get())->batch_metrics());
+    } else {
+        const auto* rnnt = static_cast<const RnntModel*>(model_.get());
+        out.emplace_back("encoder", rnnt->encoder_batch_metrics());
+        out.emplace_back("predictor", rnnt->predictor_batch_metrics());
+        out.emplace_back("joint", rnnt->joint_batch_metrics());
+    }
+    return out;
+}
+
 BatchMetrics
 Recognizer::vad_batch_metrics() const {
     return vad_model_ ? vad_model_->batch_metrics() : BatchMetrics{};
 }
 
+BatchMetrics
+Recognizer::pnc_batch_metrics() const {
+    return postproc_ ? postproc_->pnc_batch_metrics() : BatchMetrics{};
+}
+
 std::unique_ptr<AsrRunner>
 Recognizer::make_runner() const {
+    if (offline_backend_)
+        throw std::invalid_argument(
+            "SALM supports complete audio only; streaming recognition is unavailable");
     // head_kind() is the authoritative runner discriminator.
     if (model_->head_kind() != HeadKind::Ctc) {
         auto* transducer = static_cast<RnntModel*>(model_.get());
@@ -224,6 +345,10 @@ Recognizer::make_runner() const {
 
 void
 Recognizer::warmup() {
+    if (offline_backend_) {
+        offline_backend_->warmup();
+        return;
+    }
     // Push ~4 s of silence through a real runner so the lazy per-shape graph
     // build (and, for RNNT, the cache-aware Session setup) happens now. 0.1 s
     // chunks: enough for the buffered runner to emit one full window and the
@@ -233,8 +358,7 @@ Recognizer::warmup() {
         static_cast<RnntModel*>(model_.get())->supports_cache_streaming();
     std::unique_ptr<AsrRunner> runner;
     if (!supports_streaming)
-        runner =
-            std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_, vad_model_);
+        runner = std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_);
     else
         runner = make_runner();
     if (model_->has_prompt()) {
@@ -335,6 +459,10 @@ RecognitionStream::RecognitionStream(
         }
         diar_ = std::make_unique<DiarStream>(
             *recognizer_->diar_model(), recognizer_->config().diar.resolved_geometry());
+        // Words are tagged when their final is built, which for a stream
+        // without endpointing is at finish(). Keep their frames until then.
+        diar_->hold_frames_from(0);
+        diar_shift_sec_ = recognizer_->enc_frame_center_offset_ms() / 1000.0;
     }
     if (coordinate_ingress_)
         recognizer_->register_streaming_ingress();
@@ -363,6 +491,7 @@ RecognitionStream::push(const float* samples, size_t n, int sample_rate) {
     } else if (rate != input_sample_rate_) {
         throw std::invalid_argument("input sample rate cannot change within a stream");
     }
+    input_samples_ += n;
     if (coordinate_ingress_)
         pending_cohort_target_ = recognizer_->arrive_streaming_ingress();
     // The diarizer consumes the same model-rate audio the runner does, so it
@@ -395,7 +524,7 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
     r.channel_tag = 1;
     r.audio_processed = u.audio_processed_sec;
 
-    if (!is_final) {
+    if (!is_final && !interim_words_) {
         // Interim results contain only the raw top hypothesis.
         Alternative alt;
         alt.transcript = u.transcript_so_far;
@@ -407,7 +536,6 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
     // Detected languages are per-stream (shared by every alternative).
     const auto langs = runner_->detected_languages();
     const bool want_off = opts_.needs_word_timings();
-    const double ms = recognizer_->ms_per_enc_frame();
     const std::string lang0 = langs.empty() ? std::string() : langs.front();
     std::string postproc_language = opts_.language_code;
     std::string normalized_requested = postproc_language;
@@ -425,6 +553,30 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
     std::vector<std::string> tag_words;
     tag_words.reserve(langs.size());
     for (const auto& l : langs) tag_words.push_back("<" + l + ">");
+
+    if (!is_final) {
+        // Raw interim text plus decoder word timings. Speaker tags only once
+        // the model-specific attribution window covers the word onset.
+        Alternative alt;
+        alt.transcript = u.transcript_so_far;
+        alt.confidence = 0.0f;
+        alt.language_codes.assign(langs.begin(), langs.end());
+        if (want_off) {
+            for (const auto& w : u.words) {
+                if (std::find(tag_words.begin(), tag_words.end(), w.word) != tag_words.end())
+                    continue;
+                Word ww;
+                ww.word = w.word;
+                set_word_time_(ww, w);
+                ww.confidence = w.confidence;
+                ww.language_code = lang0;
+                alt.words.push_back(std::move(ww));
+            }
+        }
+        r.alternatives.push_back(std::move(alt));
+        refresh_speaker_tags(r);
+        return r;
+    }
 
     // Build one Alternative from a decoder hypothesis. Postproc (PnC/ITN/
     // profanity) may remap word spans, so it runs before frame->ms conversion;
@@ -446,16 +598,14 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
             for (const auto& w : words) {
                 Word ww;
                 ww.word = w.word;
-                ww.start_time = static_cast<int32_t>(w.start_frame * ms + 0.5);
-                ww.end_time = static_cast<int32_t>(w.end_frame * ms + 0.5);
+                set_word_time_(ww, w);
                 ww.confidence = w.confidence;
                 ww.language_code = lang0;
                 if (tag_speakers && diar_) {
                     // Transducer punctuation can extend a word timestamp into
                     // the next turn. Anchor attribution to the word onset and
                     // average two diar frames to reject single-frame noise.
-                    const int spk =
-                        diar_->speaker_for_word_time(ww.start_time / 1000.0, ww.end_time / 1000.0);
+                    const int spk = word_speaker_(ww.start_time, ww.end_time);
                     ww.speaker_tag = spk >= 0 ? spk + 1 : 0;
                 }
                 alt.words.push_back(std::move(ww));
@@ -476,11 +626,38 @@ RecognitionStream::build_result_(const StreamingUpdate& u, bool is_final) const 
     return r;
 }
 
+int64_t
+RecognitionStream::input_ms_() const {
+    return input_sample_rate_ > 0
+               ? static_cast<int64_t>(
+                     input_samples_ * 1000 / static_cast<uint64_t>(input_sample_rate_))
+               : 0;
+}
+
+void
+RecognitionStream::set_word_time_(Word& word, const WordTiming& timing) const {
+    // The runner bounds frames to the real audio, but the last encoder frame
+    // can extend past the end of the input. Bound milliseconds by the input at
+    // its original sample rate as well.
+    const double ms = recognizer_->ms_per_enc_frame();
+    int64_t start = static_cast<int64_t>(timing.start_frame * ms + 0.5);
+    int64_t end = static_cast<int64_t>(timing.end_frame * ms + 0.5);
+    if (input_sample_rate_ > 0) {
+        end = std::min(end, input_ms_());
+        // A nonempty frame span stays nonempty; ITN's zero-width spans stay so.
+        start = std::max<int64_t>(
+            0, std::min(start, timing.end_frame > timing.start_frame ? end - 1 : end));
+    }
+    word.start_time = static_cast<int32_t>(start);
+    word.end_time = static_cast<int32_t>(end);
+}
+
 void
 RecognitionStream::flush_diar_deficit_(const StreamingUpdate& u) {
     if (!diar_ || u.words.empty())
         return;
-    const double end_sec = u.words.back().end_frame * recognizer_->ms_per_enc_frame() / 1000.0;
+    const double end_sec =
+        diar_time_(u.words.back().end_frame * recognizer_->ms_per_enc_frame() / 1000.0);
     const auto target = static_cast<int64_t>(std::ceil(end_sec / diar_->seconds_per_frame()));
     if (target > diar_->n_frames()) {
         const int64_t before = diar_->n_frames();
@@ -499,10 +676,21 @@ RecognitionStream::next() {
     const ScopedBatchCohort cohort_scope(
         pending_cohort_target_ > 0 ? pending_cohort_target_ : current_batch_cohort_target());
     auto u = runner_->step();
+    late_punctuation_ += u.late_punctuation;
     if (u.is_final) {
         flush_diar_deficit_(u);
         last_processed_sec_ = std::max(last_processed_sec_, u.audio_processed_sec);
-        return build_result_(u, /*is_final=*/true);
+        auto result = build_result_(u, /*is_final=*/true);
+        if (diar_ && !u.words.empty()) {
+            // This final's words are tagged and later words start at or after
+            // its last one.
+            const double last_start_sec =
+                diar_time_(u.words.back().start_frame * recognizer_->ms_per_enc_frame() / 1000.0);
+            diar_->hold_frames_from(
+                static_cast<int64_t>(last_start_sec / diar_->seconds_per_frame()));
+        }
+        result.late_punctuation = std::exchange(late_punctuation_, {});
+        return result;
     }
     // Deliver an interim only when this step advanced the audio cursor (decoded
     // at least one new window). Once the buffered audio is consumed the cursor
@@ -513,7 +701,9 @@ RecognitionStream::next() {
     last_processed_sec_ = std::max(last_processed_sec_, u.audio_processed_sec);
     if (advanced && !u.transcript_so_far.empty()) {
         pending_cohort_target_ = 0;
-        return build_result_(u, /*is_final=*/false);
+        auto result = build_result_(u, /*is_final=*/false);
+        result.late_punctuation = std::exchange(late_punctuation_, {});
+        return result;
     }
     pending_cohort_target_ = 0;
     return std::nullopt;
@@ -537,7 +727,34 @@ RecognitionStream::finish() {
     if (diar_)
         diar_->finish();  // flush the diarizer tail before tagging final words
     auto u = runner_->finalize();
-    return build_result_(u, /*is_final=*/true);
+    auto result = build_result_(u, /*is_final=*/true);
+    // All input is decoded: report its duration at the original rate, which
+    // resampling can round by a fraction of a model-rate sample.
+    if (input_sample_rate_ > 0)
+        result.audio_processed =
+            static_cast<float>(static_cast<double>(input_samples_) / input_sample_rate_);
+    result.late_punctuation = std::exchange(late_punctuation_, {}) + u.late_punctuation;
+    return result;
+}
+
+double
+RecognitionStream::stable_speaker_time() const {
+    return diar_ ? diar_->stable_frames() * diar_->seconds_per_frame() : 0.0;
+}
+
+void
+RecognitionStream::refresh_speaker_tags(Result& result) const {
+    if (!diar_ || result.alternatives.empty())
+        return;
+    for (auto& word : result.alternatives.front().words) {
+        const int speaker = word_speaker_(word.start_time, word.end_time);
+        word.speaker_tag = speaker >= 0 ? speaker + 1 : 0;
+    }
+}
+
+int
+RecognitionStream::word_speaker_(int32_t start_ms, int32_t end_ms) const {
+    return diar_->speaker_for_word_time(diar_time_(start_ms / 1000.0), diar_time_(end_ms / 1000.0));
 }
 
 std::unique_ptr<RecognitionStream>
@@ -556,6 +773,12 @@ Result
 Recognizer::recognize(
     const float* samples, size_t n, AsrRequestOptions opts, const std::string& language_code,
     int sample_rate) {
+    if (offline_backend_) {
+        // Speech-LLM backends keep the model's own punctuation and casing on every transport;
+        // enable_automatic_punctuation selects classic models' PnC. ITN and profanity stay opt-in.
+        opts.enable_automatic_punctuation = true;
+        return offline_backend_->recognize(samples, n, std::move(opts), language_code, sample_rate);
+    }
     // A lone in-flight request skips the ingress gather wait entirely.
     const ScopedActiveCount active(active_offline_requests_);
     const ScopedBatchCohort cohort_scope(offline_ingress_batches_.arrive(active.count()));
@@ -569,41 +792,16 @@ Recognizer::recognize(
     // Vulkan RNNT support was originally validated on the cache-aware graph.
     // Keep that compatibility route until the offline graph has Vulkan parity
     // coverage; CTC and offline-only TDT remain offline.
-    const bool vulkan_requires_streaming = vulkan && model_->head_kind() != HeadKind::Ctc;
-    // Length alone no longer forces the streaming runner on this complete-buffer
-    // path. Measured on nemotron-3.5, whose limit is 399.9 s: a 395 s prefix
-    // decodes offline at 1074 words / 18.3 s dropped, and appending 10 s pushes
-    // the *same* 0-395 s audio onto the streaming runner and down to 1060 words
-    // / 25.0 s dropped. Ten seconds at the end deleted words six minutes
-    // earlier, because those ten seconds changed which decoder ran.
-    //
-    // OfflineRunner already handles over-limit input: max_offline_samples_()
-    // binary-searches the largest length inside the positional-encoding budget
-    // and offline_segments_() cuts there, snapping each boundary to the
-    // quietest 100 ms window. Offline-only models (parakeet-tdt) already got
-    // that; cache-aware ones were diverted past it.
-    //
-    // This is the file/complete-buffer path only. Genuine streaming
-    // (streaming_recognize, live capture, server streams) builds its runner
-    // unconditionally and is unaffected. Set NEMO_SPEECH_LONGFORM_STREAMING=1
-    // to restore the previous length-triggered behaviour.
-    static const bool longform_streaming = [] {
-        const char* s = std::getenv("NEMO_SPEECH_LONGFORM_STREAMING");
-        return s != nullptr && *s != 0 && *s != '0';
-    }();
     const bool use_streaming =
-        ((longform_streaming && exceeds_offline_limit) || vulkan_requires_streaming) &&
+        (exceeds_offline_limit || (vulkan && model_->head_kind() != HeadKind::Ctc)) &&
         supports_streaming;
     std::unique_ptr<AsrRunner> runner;
     if (use_streaming) {
         runner = make_runner();
     } else {
-        // OfflineRunner partitions the audio before decoding: at VAD silence
-        // when the segmenter is enabled (resetting the decoder's language
-        // context at each such boundary), and always at the quietest point
-        // when the positional-encoding budget forces a cut.
-        runner =
-            std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_, vad_model_);
+        // Past the positional-encoding limit OfflineRunner splits the audio at
+        // quiet points and decodes segment by segment.
+        runner = std::make_unique<OfflineRunner>(model_.get(), cfg_, flashlight_resources_);
     }
     log_execution_status(use_streaming);
     if (model_->has_prompt())
@@ -615,13 +813,60 @@ Recognizer::recognize(
     return stream->finish();
 }
 
+bool
+Recognizer::supports_streaming() const {
+    return !offline_backend_ && (model_->head_kind() == HeadKind::Ctc ||
+                                 static_cast<RnntModel*>(model_.get())->supports_cache_streaming());
+}
+
+bool
+Recognizer::supports_word_timestamps() const {
+    return !offline_backend_ || offline_backend_->supports_word_timestamps();
+}
+
+bool
+Recognizer::supports_translation() const {
+    return offline_backend_ && offline_backend_->supports_translation();
+}
+
+bool
+Recognizer::supports_instructions() const {
+    return offline_backend_ && offline_backend_->supports_instructions();
+}
+
+std::vector<std::string>
+Recognizer::translation_languages() const {
+    return offline_backend_ ? offline_backend_->translation_languages()
+                            : std::vector<std::string>{};
+}
+
+bool
+Recognizer::supports_offline_diarization() const {
+    return offline_backend_ && offline_backend_->supports_offline_diarization();
+}
+
+std::vector<SpeechLmSegment>
+Recognizer::diarize(const float* samples, size_t n, int sample_rate) const {
+    if (!supports_offline_diarization())
+        throw std::runtime_error("diarization is not loaded");
+    return offline_backend_->diarize(samples, n, sample_rate);
+}
+
+bool
+Recognizer::supports_speaker_diarization() const {
+    return offline_backend_ ? offline_backend_->supports_speaker_diarization()
+                            : diar_model_ != nullptr;
+}
+
 int
 Recognizer::sample_rate() const {
-    return model_->sample_rate();
+    return offline_backend_ ? offline_backend_->sample_rate() : model_->sample_rate();
 }
 
 std::vector<std::string>
 Recognizer::supported_languages() const {
+    if (offline_backend_)
+        return offline_backend_->supported_languages();
     auto languages = model_->prompt_languages();
     if (languages.empty())
         languages.push_back("en-US");
@@ -630,7 +875,12 @@ Recognizer::supported_languages() const {
 
 double
 Recognizer::ms_per_enc_frame() const {
-    return model_->ms_per_enc_frame();
+    return offline_backend_ ? 80.0 : model_->ms_per_enc_frame();
+}
+
+double
+Recognizer::enc_frame_center_offset_ms() const {
+    return offline_backend_ ? 0.0 : model_->enc_frame_center_offset_ms();
 }
 
 }  // namespace nemo_speech::asr

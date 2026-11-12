@@ -4,7 +4,7 @@ order: 15
 status: "draft"
 ---
 
-cpp-httplibは送信時の圧縮と受信時の解凍をサポートしています。ただし、zlibまたはBrotliを有効にしてビルドしておく必要があります。
+cpp-httplibは送信時の圧縮と受信時の解凍をサポートしています。ただし、zlib、Brotli、Zstdのいずれかを有効にしてビルドしておく必要があります。
 
 ## ビルド時の準備
 
@@ -13,10 +13,11 @@ cpp-httplibは送信時の圧縮と受信時の解凍をサポートしていま
 ```cpp
 #define CPPHTTPLIB_ZLIB_SUPPORT    // gzip / deflate
 #define CPPHTTPLIB_BROTLI_SUPPORT  // brotli
+#define CPPHTTPLIB_ZSTD_SUPPORT    // zstd
 #include <httplib.h>
 ```
 
-リンク時に`zlib`や`brotli`のライブラリも必要です。
+有効にした方式に応じて、`zlib`、`brotli`、`zstd`のライブラリもリンクします。
 
 ## リクエストボディを圧縮して送る
 
@@ -28,7 +29,7 @@ std::string big_payload = build_payload();
 auto res = cli.Post("/api/data", big_payload, "application/json");
 ```
 
-`set_compress(true)`を呼んでおくと、POSTやPUTのリクエストボディがgzipで圧縮されて送信されます。サーバー側が対応している必要があります。
+`set_compress(true)`を呼んでおくと、POST、PUT、PATCHのリクエストボディが圧縮されて送信されます。圧縮方式は、ビルドで有効にしたもののうち、Brotli、gzip、Zstdの順で最初に当てはまるものです。サーバー側もその方式に対応している必要があります。
 
 ## レスポンスを解凍する
 
@@ -44,4 +45,4 @@ std::cout << res->body << std::endl;
 
 デフォルトで有効なので、通常は何もしなくても解凍されます。あえて生の圧縮データを触りたいときだけ`set_decompress(false)`にしましょう。
 
-> **Warning:** `CPPHTTPLIB_ZLIB_SUPPORT`を定義せずにビルドすると、`set_compress()`や`set_decompress()`を呼んでも何も起こりません。マクロの定義を忘れていないか、最初に確認しましょう。
+> **Warning:** 圧縮ライブラリを1つも有効にしていないビルドでは、`set_compress(true)`を呼んでもリクエストは圧縮されません。また、ビルドで有効にしていない方式で圧縮されたレスポンスが返ってくると、リクエストは`Error::UnsupportedContentEncoding`で失敗します。うまく動かないときは、まずマクロの定義を確認しましょう。

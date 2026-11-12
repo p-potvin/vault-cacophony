@@ -12,6 +12,8 @@ The client has three kinds of timeouts, each set independently.
 | Read | `set_read_timeout` | 300s | Time to wait for a single `recv` when receiving the response |
 | Write | `set_write_timeout` | 5s | Time to wait for a single `send` when sending the request |
 
+Over HTTPS, the connection timeout also bounds the whole TLS handshake. A handshake that doesn't finish in time fails with `Error::SSLConnection`.
+
 ## Basic usage
 
 ```cpp
@@ -48,3 +50,5 @@ cli.set_read_timeout(10s);
 ```
 
 > **Warning:** The read timeout covers a single receive call — not the whole request. If data keeps trickling in during a large download, the request can take half an hour without ever hitting the timeout. To cap the total request time, use [C13. Set an overall timeout](../c13-max-timeout).
+
+> For WebSocket client timeouts, see [W06. Set Timeouts](../w06-websocket-timeouts).

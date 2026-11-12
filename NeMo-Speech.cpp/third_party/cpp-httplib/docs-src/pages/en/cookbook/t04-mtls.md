@@ -1,6 +1,6 @@
 ---
 title: "T04. Configure mTLS"
-order: 45
+order: 46
 status: "draft"
 ---
 
@@ -55,7 +55,23 @@ httplib::SSLClient cli("api.example.com", 443,
 auto res = cli.Get("/");
 ```
 
-Note you're using `SSLClient` directly, not `Client`. If the private key has a password, pass it as the fifth argument.
+If the certificate and key paths are all you need, `Client` takes them too: `httplib::Client cli("https://api.example.com", "client-cert.pem", "client-key.pem")`. When the private key has a password, use `SSLClient` and pass it as the fifth argument.
+
+The client side has the same `PemMemory` struct too, letting you set the client certificate from PEM in memory.
+
+```cpp
+httplib::SSLClient::PemMemory pem{};
+pem.cert_pem = client_cert.data();
+pem.cert_pem_len = client_cert.size();
+pem.key_pem = client_key.data();
+pem.key_pem_len = client_key.size();
+
+httplib::SSLClient cli("api.example.com", 443, pem);
+
+auto res = cli.Get("/");
+```
+
+> For mTLS with a WebSocket client (`wss://`), see [W05. Configure TLS for wss:// Connections](../w05-websocket-tls).
 
 ## Read client info from a handler
 

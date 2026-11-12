@@ -15,6 +15,16 @@ on:
       '**/*.cpp'
     ]
 
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: [
+      '.github/workflows/build-sanitize.yml'
+    ]
+
+cache-mode: none
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
   cancel-in-progress: true
@@ -22,20 +32,25 @@ concurrency:
 env:
   GGML_NLOOP: 3
   GGML_N_THREADS: 1
-  LLAMA_LOG_COLORS: 1
-  LLAMA_LOG_PREFIX: 1
-  LLAMA_LOG_TIMESTAMPS: 1
+  LLAMA_ARG_LOG_COLORS: 1
+  LLAMA_ARG_LOG_PREFIX: 1
+  LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
-  ubuntu-latest-sanitizer:
-    runs-on: ubuntu-latest
-
+  ctest:
     continue-on-error: true
 
     strategy:
       matrix:
-        sanitizer: [ADDRESS, THREAD, UNDEFINED]
-        build_type: [Debug]
+        include:
+        - sanitizer: ADDRESS
+          machine: ubuntu-26.04
+        - sanitizer: THREAD
+          machine: ubuntu-26.04
+        - sanitizer: UNDEFINED
+          machine: ubuntu-26.04
+
+    runs-on: ${{ matrix.machine }}
 
     steps:
       - name: Clone
@@ -43,45 +58,57 @@ jobs:
         uses: actions/checkout@v6
 
       - name: ccache
-        uses: ggml-org/ccache-action@v1.2.21
+        uses: ggml-org/ccache-action@v1.2.24
         with:
-          key: ubuntu-latest-sanitizer-${{ matrix.sanitizer }}
-          evict-old-files: 1d
-          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+          restore: false
+          save: false
 
-      - name: Dependencies
-        id: depends
-        run: |
-          sudo apt-get update
-          sudo apt-get install build-essential libssl-dev
+      - name: ccache-buckets-restore
+        uses: ./.github/actions/ccache-buckets
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
+        with:
+          key: ctest-sanitizer-${{ matrix.sanitizer }}
+          folder: llama.cpp
+          hf_bucket: ggml-org/cache
 
       - name: Build
         id: cmake_build
-        if: ${{ matrix.sanitizer != 'THREAD' }}
+        if: ${{ matrix.sanitizer == 'ADDRESS' || matrix.sanitizer == 'UNDEFINED' }}
         run: |
           cmake -B build \
-            -DLLAMA_FATAL_WARNINGS=ON \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
-            -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+            -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON
 
-          cmake --build build --config ${{ matrix.build_type }} -j $(nproc)
+          cmake --build build --config RelWithDebInfo -j $(nproc)
 
       - name: Build (no OpenMP)
         id: cmake_build_no_openmp
         if: ${{ matrix.sanitizer == 'THREAD' }}
         run: |
           cmake -B build \
-            -DLLAMA_FATAL_WARNINGS=ON \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DLLAMA_SANITIZE_${{ matrix.sanitizer }}=ON \
             -DGGML_SANITIZE_${{ matrix.sanitizer }}=ON \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
             -DGGML_OPENMP=OFF
 
-          cmake --build build --config ${{ matrix.build_type }} -j $(nproc)
+          cmake --build build --config RelWithDebInfo -j $(nproc)
+
+      - name: ccache-buckets-save
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+        uses: ./.github/actions/ccache-buckets
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}
+        with:
+          key: ctest-sanitizer-${{ matrix.sanitizer }}
+          folder: llama.cpp
+          evict-old-files: 1d
+          hf_bucket: ggml-org/cache
+          save: true
 
       - name: Test
         id: cmake_test
         run: |
           cd build
-          ctest -L main --verbose --timeout 900
+          ctest -L main -E tokenizer --verbose --timeout 900

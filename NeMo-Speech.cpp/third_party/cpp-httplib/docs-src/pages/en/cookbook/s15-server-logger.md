@@ -4,7 +4,7 @@ order: 34
 status: "draft"
 ---
 
-To log the requests the server receives and the responses it returns, use `Server::set_logger()`. The callback fires once per completed request, making it the foundation for access logs and metrics collection.
+To log the requests the server receives and the responses it returns, use `Server::set_logger()`. The callback fires once per request, right before the response is written, making it the foundation for access logs and metrics collection.
 
 ## Basic usage
 
@@ -17,6 +17,8 @@ svr.set_logger([](const httplib::Request &req, const httplib::Response &res) {
 ```
 
 The log callback receives both the `Request` and the `Response`. You can grab the method, path, status, client IP, headers, body — whatever you need.
+
+`req.path` is percent-decoded, so it may contain control characters such as CR/LF. Escape it before writing it to a log file, or a crafted request can forge log lines.
 
 ## Access-log style format
 
@@ -38,6 +40,8 @@ svr.set_logger([](const auto &req, const auto &res) {
 });
 ```
 
+For a response sent through a content provider, such as a file served from a mount point, `res.body` is empty here, so the size shows `0B`.
+
 ## Measure request time
 
 To include request duration in the log, stash a start timestamp in `res.user_data` from a pre-routing handler, then subtract in the logger.
@@ -48,7 +52,7 @@ svr.set_pre_routing_handler([](const auto &req, auto &res) {
   return httplib::Server::HandlerResponse::Unhandled;
 });
 
-svr.set_logger([](const auto &req, const auto &res) {
+svr.set_logger([](const httplib::Request &req, const httplib::Response &res) {
   auto *start = res.user_data.get<std::chrono::steady_clock::time_point>("start");
   auto elapsed = start
     ? std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -59,6 +63,8 @@ svr.set_logger([](const auto &req, const auto &res) {
 });
 ```
 
+Since the logger runs before the response is written, the time doesn't include sending the body.
+
 For more on `user_data`, see [S12. Pass data between handlers with `res.user_data`](../s12-user-data).
 
-> **Note:** The logger runs synchronously on the same thread as request processing. Heavy work inside it hurts throughput — push it to a queue and process asynchronously if you need anything expensive.
+> **Note:** The logger runs synchronously on the same thread as request processing, and all logger calls on a server share one lock. Heavy work inside it hurts throughput — push it to a queue and process asynchronously if you need anything expensive.

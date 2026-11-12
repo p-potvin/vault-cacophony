@@ -17,7 +17,7 @@ order: 6
 
 モデルは初回起動時に自動ダウンロードされるので、ユーザーに渡すのはバイナリ1つだけです。
 
-## 6.1 webview/webview を導入する
+## 6.1 webview/webviewを導入する
 
 [webview/webview](https://github.com/webview/webview)は、OS標準のWebViewコンポーネント（macOSならWKWebView、LinuxならWebKitGTK、WindowsならWebView2）をC/C++から使えるようにするライブラリです。Electronのように独自ブラウザを同梱するわけではないので、バイナリサイズへの影響はほぼありません。
 
@@ -78,7 +78,7 @@ int main() {
 
 5章の`signal_handler`は不要になります。デスクトップアプリではウインドウを閉じることがアプリの終了を意味するからです。
 
-## 6.3 cpp-embedlib で静的ファイルを埋め込む
+## 6.3 cpp-embedlibで静的ファイルを埋め込む
 
 5章では`public/`ディレクトリからファイルを配信していました。これだと配布時に`public/`も一緒に渡す必要があります。[cpp-embedlib](https://github.com/yhirose/cpp-embedlib)を使うと、HTML・CSS・JavaScriptをバイナリに埋め込んで、配布物をバイナリ1つにまとめられます。
 
@@ -108,7 +108,7 @@ target_link_libraries(translate-app PRIVATE
 
 `cpp_embedlib_add`は、`public/`配下のファイルをコンパイル時にバイナリに変換し、`WebAssets`という静的ライブラリを作ります。リンクすると`Web::FS`というオブジェクトから埋め込みファイルにアクセスできます。`cpp-embedlib-httplib`は`httplib::mount()`関数を提供するヘルパーライブラリです。
 
-### set_mount_point を httplib::mount に置き換える
+### set_mount_pointをhttplib::mountに置き換える
 
 5章の`set_mount_point`をcpp-embedlibの`httplib::mount`に置き換えるだけです。
 
@@ -407,7 +407,6 @@ bool download_model(const ModelInfo &model,
                     std::function<bool(int)> progress_cb) {
   httplib::Client cli("https://huggingface.co");
   cli.set_follow_location(true);  // Hugging FaceはCDNにリダイレクトする
-  cli.set_read_timeout(std::chrono::hours(1)); // 大きなモデルに備えて長めに
 
   auto url = "/" + model.repo + "/resolve/main/" + model.filename;
   auto path = get_models_dir() / model.filename;
@@ -468,10 +467,6 @@ int main() {
   }
   auto llm = llamalib::Llama{path};
   std::mutex llm_mutex; // モデル切り替え中のアクセスを保護する
-
-  // LLM推論は時間がかかるのでタイムアウトを長めに設定（デフォルトは5秒）
-  svr.set_read_timeout(300);
-  svr.set_write_timeout(300);
 
   svr.set_logger([](const auto &req, const auto &res) {
     std::cout << req.method << " " << req.path << " -> " << res.status
@@ -680,9 +675,10 @@ int main() {
 5章からの変更点をまとめると:
 
 - `#include <csignal>` → `#include <thread>`, `<cpp-embedlib-httplib.h>`, `"WebAssets.h"`, `"webview/webview.h"`
-- `signal_handler`関数を削除
+- `signal_handler`関数を削除し、`svr`を`main()`の中に移動
 - `svr.set_mount_point("/", "./public")` → `httplib::mount(svr, Web::FS)`
 - `svr.listen("127.0.0.1", 8080)` → `bind_to_any_port` + `listen_after_bind` + WebViewのイベントループ
+- macOS用に`setup_macos_edit_menu()`と`<objc/objc-runtime.h>`のインクルードを追加
 
 ハンドラのコードは1行も変わっていません。5章まで作ってきたREST API・SSEストリーミング・モデル管理がそのまま動きます。
 

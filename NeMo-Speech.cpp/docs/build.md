@@ -10,10 +10,13 @@ platform without a suitable release artifact.
 - CMake 3.26 or newer and Ninja;
 - a C compiler and a C++17-capable compiler compatible with the selected
   backend and, when applicable, its toolkit;
-- SentencePiece development files for ASR and diarization; and
+- SentencePiece development files for ASR and diarization; when its
+  `sentencepiece_processor.h` includes Abseil headers (upstream since 0.2.1, as
+  in Homebrew's package), the Abseil development package as well; and
 - any toolkit required by the selected backend.
 
-CUDA 12 and 13 are supported. Outside the Windows build driver, gRPC builds
+CUDA 12 and 13 are supported; CUDA builds with `patches/` (the default) need
+CUDA 12.8 or newer. Outside the Windows build driver, gRPC builds
 additionally need compatible gRPC, Protobuf compiler/runtime, and Abseil
 development packages from a mutually compatible package set.
 
@@ -38,7 +41,7 @@ macOS with Homebrew:
 
 ```bash
 xcode-select --install  # skip if the Command Line Tools are already installed
-brew install cmake ninja sentencepiece
+brew install cmake ninja sentencepiece abseil
 ```
 
 Windows from an elevated PowerShell with Chocolatey:
@@ -55,8 +58,8 @@ only when selecting those features; see the platform sections below.
 ### Backend toolkits
 
 - CPU builds need no accelerator toolkit.
-- CUDA builds need a supported CUDA 12 or 13 toolkit (including `nvcc`) at
-  build time and a compatible NVIDIA driver at run time. Set
+- CUDA builds need a supported CUDA 12 or 13 toolkit (including `nvcc`; 12.8
+  or newer with `patches/`) at build time and a compatible NVIDIA driver at run time. Set
   `CMAKE_CUDA_ARCHITECTURES` when the output must run on GPUs other than the
   build host.
 - Vulkan builds need Vulkan headers and loader development files, `glslc`, and
@@ -70,9 +73,8 @@ only when selecting those features; see the platform sections below.
 Initialize the submodules needed by the selected components:
 
 ```bash
-git submodule update --init ggml
+git submodule update --init llama.cpp                # required (also provides ggml)
 git submodule update --init third_party/cpp-httplib  # HTTP server only
-git submodule update --init llama.cpp                # ASR live capture, NMT, or VoiceChat
 git submodule update --init proto/riva-common        # gRPC only
 git submodule update --init third_party/flashlight-text third_party/kenlm  # Flashlight only
 git submodule update --init third_party/open_jtalk   # Japanese TTS only
@@ -80,8 +82,8 @@ git submodule update --init --recursive third_party/cppjieba  # Mandarin TTS onl
 ```
 
 Always configure through `scripts/configure.sh`. It checks the required
-submodules and applies the patches needed by the selected preset. CUDA presets
-apply the pinned patches from `ggml-patches/` in order. Mandarin TTS also
+submodules and runs the preset. CMake applies the project's llama.cpp and ggml
+changes from `patches/` itself, so no separate patch step is needed. Mandarin TTS also
 requires the Git LFS files under `src/tts/tokenizer/mandarin_data/`; the helper
 reports any files that are still LFS pointers. Materialize them with
 `git lfs pull --include='src/tts/tokenizer/mandarin_data/*'`.
@@ -107,7 +109,7 @@ component sets. VoiceChat also provides a focused `cuda-s2s` preset. Run
 | `cuda-s2s` | CUDA VoiceChat pipeline and realtime WebSocket server |
 | `metal-nmt` | Metal-enabled NMT build |
 | `vulkan-diar` | Vulkan standalone diarization build |
-| `<backend>-server` | ASR, diarization, NMT, TTS, HTTP API, realtime WebSocket, and playground |
+| `<backend>-server` | ASR, diarization, speech-LLM transcription, NMT, TTS, HTTP API, realtime WebSocket, and playground |
 | `cuda-full` | CUDA server plus normalization, Flashlight, and language frontends (prepare the [optional dependencies](#optional-dependencies) first) |
 | `developer` | CPU speech components plus HTTP, gRPC, examples, tests, and tools |
 
@@ -124,8 +126,8 @@ scripts/configure.sh cuda-server -DNEMO_SPEECH_WITH_NORM=ON
 cmake --build --preset cuda-server
 ```
 
-For a manual configuration, explicitly disable the patched CUDA paths when
-building against stock ggml:
+A raw CMake configuration also applies `patches/` automatically. To build
+against pristine upstream llama.cpp and ggml instead:
 
 ```bash
 cmake -S . -B build -G Ninja \
@@ -134,8 +136,8 @@ cmake -S . -B build -G Ninja \
 cmake --build build -j"$(nproc)"
 ```
 
-See [ggml patches](development/ggml-patches.md) for the patched and stock
-runtime tradeoffs.
+See [`patches/README.md`](../patches/README.md) for what the patches change and
+how to edit them.
 
 ## Components
 
@@ -145,6 +147,7 @@ runtime tradeoffs.
 | `NEMO_SPEECH_BUILD_DIAR` | ON | Standalone and ASR-integrated diarization |
 | `NEMO_SPEECH_BUILD_TTS` | ON | TTS runtime, C ABI, and CLI |
 | `NEMO_SPEECH_BUILD_NMT` | OFF | NMT through llama.cpp |
+| `NEMO_SPEECH_BUILD_SPEECHLM` | OFF | Speech-LLM transcription through llama.cpp ([SALM](salm/README.md); needs ASR) |
 | `NEMO_SPEECH_BUILD_S2S` | OFF | VoiceChat runtime and realtime server integration |
 | `NEMO_SPEECH_BUILD_CLI` | ON | Unified `nemo-speech` executable |
 | `NEMO_SPEECH_BUILD_MIC_CAPTURE` | ON | Microphone capture in the CLI and live example |
@@ -193,6 +196,15 @@ prefix without `sudo`:
 
 ```bash
 CC=gcc-12 CXX=g++-12 scripts/build_itn_deps.sh
+```
+
+With `STATIC=1`, the default on macOS, the script also builds pinned Protobuf
+and RE2 and installs static archives only. `libnemo_speech_text_normalization`
+then carries the whole stack privately, so neither system package is needed at
+build or run time. The release archives use this mode:
+
+```bash
+STATIC=1 scripts/build_itn_deps.sh
 ```
 
 On Linux, normalization builds also require the static SentencePiece

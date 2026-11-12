@@ -7,13 +7,13 @@ void llama_model_llama::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
     if (hparams.n_expert == 8) {
-        switch (hparams.n_layer) {
+        switch (hparams.n_layer()) {
             case 32: type = LLM_TYPE_8x7B; break;
             case 56: type = LLM_TYPE_8x22B; break;
             default: type = LLM_TYPE_UNKNOWN;
         }
     } else {
-        switch (hparams.n_layer) {
+        switch (hparams.n_layer()) {
             case 16: type = LLM_TYPE_1B; break; // Llama 3.2 1B
             case 22: type = LLM_TYPE_1B; break;
             case 26: type = LLM_TYPE_3B; break;
@@ -92,11 +92,11 @@ void llama_model_llama::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_llama::build_arch_graph(const llm_graph_params & params) const {
-    return std::make_unique<graph<false>>(*this, params);
+    return std::make_unique<graph<false>>(params);
 }
 
 template <bool embed>
-llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
+llama_model_llama::graph<embed>::graph(const llm_graph_params & params) : llm_graph_context(params) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -124,6 +124,8 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     for (int il = 0; il < n_layer; ++il) {
+        res->t_layer_inp[il] = inpL;
+
         ggml_tensor * inpSA = inpL;
 
         // norm
@@ -134,24 +136,12 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
 
         // self-attention
         {
-            // rope freq factors for llama3; may return nullptr for llama2 and other models
-            ggml_tensor * rope_factors = model.get_rope_factors(cparams, il);
-
             // compute Q and K and RoPE them
             auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur,
                     n_embd_head, n_head, n_head_kv, il);
 
-            Qcur = ggml_rope_ext(
-                    ctx0, Qcur, inp_pos, rope_factors,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
-
-            Kcur = ggml_rope_ext(
-                    ctx0, Kcur, inp_pos, rope_factors,
-                    n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
-                    ext_factor, attn_factor, beta_fast, beta_slow
-                    );
+            Qcur = build_rope(Qcur, inp_pos, il);
+            Kcur = build_rope(Kcur, inp_pos, il);
 
             cb(Qcur, "Qcur", il);
             cb(Kcur, "Kcur", il);
@@ -240,8 +230,6 @@ llama_model_llama::graph<embed>::graph(const llama_model & model, const llm_grap
         cb(cur, "result_output", -1);
         res->t_logits = cur;
     }
-
-    ggml_build_forward_expand(gf, cur);
 }
 
 template struct llama_model_llama::graph<false>;

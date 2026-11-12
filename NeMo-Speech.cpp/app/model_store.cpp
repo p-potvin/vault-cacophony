@@ -53,16 +53,24 @@ struct ArchiveMember {
     uint64_t size = 0;
 };
 
+struct ArchiveRange {
+    uint64_t start = 0;
+    uint64_t end = 0;
+    std::string stop_before;
+};
+
 struct Artifact {
     std::string role;
     std::string type;
     std::string filename;
+    std::string revision;
     std::string directory;
     std::string sha256;
     uint64_t size = 0;
     uint64_t range_end = 0;
     std::string stop_before;
     std::vector<ArchiveMember> members;
+    std::vector<ArchiveRange> ranges;
 };
 
 struct Model {
@@ -280,6 +288,13 @@ validate_repo(const std::string& repo) {
     validate_component(repo.substr(slash + 1), "repository name");
 }
 
+void
+validate_revision(const std::string& revision, const std::string& description) {
+    if (revision.size() != 40 ||
+        revision.find_first_not_of("0123456789abcdef") != std::string::npos)
+        throw std::runtime_error("model index revision must be a full commit SHA: " + description);
+}
+
 bool
 looks_like_repo(const std::string& reference) {
     try {
@@ -314,10 +329,7 @@ load_index() {
                 model.aliases.push_back(alias.string());
             }
         }
-        if (model.revision.size() != 40 ||
-            model.revision.find_first_not_of("0123456789abcdef") != std::string::npos)
-            throw std::runtime_error(
-                "model index revision must be a full commit SHA: " + model.repo);
+        validate_revision(model.revision, model.repo);
         if (const Value* companions = model_value.find("companions")) {
             for (const auto& companion : companions->array()) {
                 validate_repo(companion.string());
@@ -330,6 +342,7 @@ load_index() {
             artifact.role = artifact_value.at("role").string();
             artifact.type = artifact_value.at("type").string();
             artifact.filename = artifact_value.at("filename").string();
+            artifact.revision = artifact_value.string_or("revision");
             artifact.directory = artifact_value.string_or("directory");
             artifact.sha256 = artifact_value.at("sha256").string();
             artifact.size = integer(artifact_value, "size");
@@ -340,6 +353,8 @@ load_index() {
                 "asr", "diarization", "tts", "codec", "tokenizer"};
             if (allowed_roles.find(artifact.role) == allowed_roles.end())
                 throw std::runtime_error("unsupported artifact role in model index");
+            if (!artifact.revision.empty())
+                validate_revision(artifact.revision, model.repo + "/" + artifact.role);
             if (!artifact_roles.insert(artifact.role).second)
                 throw std::runtime_error(
                     "duplicate artifact role in model index: " + model.repo + "/" + artifact.role);
@@ -362,18 +377,55 @@ load_index() {
                     artifact.members.push_back(std::move(member));
                 }
             }
-            if (artifact.type != "file" && artifact.type != "tar-prefix")
+            if (const Value* ranges = artifact_value.find("ranges")) {
+                for (const auto& range_value : ranges->array()) {
+                    ArchiveRange range;
+                    range.start = integer(range_value, "start");
+                    range.end = integer(range_value, "end");
+                    range.stop_before = range_value.string_or("stop_before");
+                    if (!range.stop_before.empty())
+                        validate_component(range.stop_before, "archive stop member");
+                    artifact.ranges.push_back(std::move(range));
+                }
+            }
+            if (artifact.type != "file" && artifact.type != "tar-prefix" &&
+                artifact.type != "tar-ranges")
                 throw std::runtime_error("unsupported artifact type in model index");
             if (artifact.size == 0)
                 throw std::runtime_error("model index artifact size must be positive");
             if (artifact.type == "file" &&
                 (!artifact.directory.empty() || !artifact.stop_before.empty() ||
-                 !artifact.members.empty()))
+                 !artifact.members.empty() || !artifact.ranges.empty()))
                 throw std::runtime_error("regular model artifact contains archive-only fields");
             if (artifact.type == "tar-prefix" &&
                 (artifact.directory.empty() || artifact.stop_before.empty() ||
-                 artifact.members.empty() || artifact.range_end != artifact.size - 1))
+                 artifact.members.empty() || !artifact.ranges.empty() ||
+                 artifact.range_end != artifact.size - 1))
                 throw std::runtime_error("invalid tokenizer archive metadata in model index");
+            if (artifact.type == "tar-ranges") {
+                if (artifact.directory.empty() || !artifact.stop_before.empty() ||
+                    artifact.members.empty() || artifact.ranges.empty() || artifact.range_end != 0)
+                    throw std::runtime_error(
+                        "invalid ranged tokenizer archive metadata in model index");
+                uint64_t total_size = 0;
+                uint64_t previous_end = 0;
+                for (size_t i = 0; i < artifact.ranges.size(); ++i) {
+                    const auto& range = artifact.ranges[i];
+                    if (range.end < range.start || range.end == UINT64_MAX ||
+                        range.start % 512 != 0 || (range.end + 1) % 512 != 0 ||
+                        (i > 0 && range.start <= previous_end))
+                        throw std::runtime_error("invalid tokenizer archive range in model index");
+                    const uint64_t range_size = range.end - range.start + 1;
+                    if (range_size > UINT64_MAX - total_size)
+                        throw std::runtime_error(
+                            "tokenizer archive range size overflows in model index");
+                    total_size += range_size;
+                    previous_end = range.end;
+                }
+                if (total_size != artifact.size)
+                    throw std::runtime_error(
+                        "tokenizer archive ranges do not match artifact size in model index");
+            }
             model.artifacts.push_back(std::move(artifact));
         }
         if (model.artifacts.empty())
@@ -426,7 +478,7 @@ find_model(const Index& index, const std::string& repo) {
 const Artifact&
 find_artifact(const Model& model, const std::string& role, bool directory) {
     for (const auto& artifact : model.artifacts) {
-        if (artifact.role == role && (artifact.type == "tar-prefix") == directory)
+        if (artifact.role == role && (artifact.type != "file") == directory)
             return artifact;
     }
     throw MissingModelError(
@@ -591,9 +643,14 @@ base_url() {
 }
 
 std::string
+artifact_revision(const Model& model, const Artifact& artifact) {
+    return artifact.revision.empty() ? model.revision : artifact.revision;
+}
+
+std::string
 download_url(const Model& model, const Artifact& artifact) {
-    return base_url() + "/" + model.repo + "/resolve/" + model.revision + "/" + artifact.filename +
-           "?download=true";
+    return base_url() + "/" + model.repo + "/resolve/" + artifact_revision(model, artifact) + "/" +
+           artifact.filename + "?download=true";
 }
 
 int
@@ -682,7 +739,7 @@ download(const Model& model, const Artifact& artifact, const fs::path& output) {
     const std::string protocols = loopback ? "=http,https" : "=https";
     fs::path curl_errors = output;
     curl_errors += ".curl-errors";
-    auto invoke = [&](bool resume) {
+    auto invoke = [&](bool resume, const fs::path& destination, const std::string& range) {
         std::error_code remove_error;
         fs::remove(curl_errors, remove_error);
         std::vector<std::string> arguments = {
@@ -705,11 +762,11 @@ download(const Model& model, const Artifact& artifact, const fs::path& output) {
             "--speed-time",
             "30",
             "--output",
-            output.u8string()};
-        if (artifact.type == "tar-prefix") {
+            destination.u8string()};
+        if (!range.empty()) {
             arguments.push_back("--range");
-            arguments.push_back("0-" + std::to_string(artifact.range_end));
-        } else if (resume && fs::exists(output)) {
+            arguments.push_back(range);
+        } else if (resume && fs::exists(destination)) {
             arguments.push_back("--continue-at");
             arguments.push_back("-");
         }
@@ -724,11 +781,52 @@ download(const Model& model, const Artifact& artifact, const fs::path& output) {
         arguments.push_back(download_url(model, artifact));
         return run_curl(arguments);
     };
-    int status = invoke(true);
+    int status = 0;
+    if (artifact.type == "tar-ranges") {
+        std::ofstream combined(output, std::ios::binary | std::ios::trunc);
+        if (!combined)
+            throw std::runtime_error("cannot create ranged artifact " + path_utf8(output));
+        for (size_t i = 0; i < artifact.ranges.size(); ++i) {
+            const auto& range = artifact.ranges[i];
+            fs::path segment = output;
+            segment += ".range-" + std::to_string(i);
+            std::error_code error;
+            fs::remove(segment, error);
+            status = invoke(
+                false, segment, std::to_string(range.start) + "-" + std::to_string(range.end));
+            if (status != 0) {
+                fs::remove(segment, error);
+                break;
+            }
+            const uint64_t expected_size = range.end - range.start + 1;
+            const uintmax_t actual_size = fs::file_size(segment, error);
+            if (error || actual_size != expected_size) {
+                fs::remove(segment, error);
+                throw std::runtime_error("downloaded tokenizer archive range has the wrong size");
+            }
+            bool assembled = false;
+            {
+                std::ifstream input(segment, std::ios::binary);
+                assembled = input && (combined << input.rdbuf());
+            }
+            // Close the segment before removing it; Windows cannot delete open files.
+            fs::remove(segment, error);
+            if (!assembled)
+                throw std::runtime_error("cannot assemble ranged tokenizer artifact");
+        }
+        combined.close();
+        if (!combined)
+            throw std::runtime_error("cannot assemble ranged tokenizer artifact");
+    } else {
+        const std::string range = artifact.type == "tar-prefix"
+                                      ? "0-" + std::to_string(artifact.range_end)
+                                      : std::string{};
+        status = invoke(true, output, range);
+    }
     if (status == 33 && artifact.type == "file") {
         std::error_code error;
         fs::remove(output, error);
-        status = invoke(false);
+        status = invoke(false, output, {});
     }
     if (status == 127)
         throw std::runtime_error(curl_missing_message());
@@ -774,6 +872,63 @@ verification_marker_path(const fs::path& path) {
     fs::path marker = path;
     marker += ".verified";
     return marker;
+}
+
+fs::path
+partial_revision_path(const fs::path& path) {
+    fs::path marker = path;
+    marker += ".revision";
+    return marker;
+}
+
+bool
+partial_revision_matches(const fs::path& path, const std::string& revision) {
+    const fs::path marker = partial_revision_path(path);
+    std::error_code error;
+    if (!fs::is_regular_file(marker, error) || error || fs::file_size(marker, error) > 64 || error)
+        return false;
+    std::ifstream input(marker, std::ios::binary);
+    std::string stored_revision;
+    if (!std::getline(input, stored_revision))
+        return false;
+    std::string extra;
+    return !std::getline(input, extra) && stored_revision == revision;
+}
+
+void
+write_partial_revision(const fs::path& path, const std::string& revision) {
+    const fs::path marker = partial_revision_path(path);
+    fs::path temporary = marker;
+    temporary += ".tmp";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        output << revision << '\n';
+        if (!output) {
+            std::error_code error;
+            fs::remove(temporary, error);
+            throw std::runtime_error("cannot write partial-download revision marker");
+        }
+    }
+    std::error_code error;
+    fs::remove(marker, error);
+    error.clear();
+    fs::rename(temporary, marker, error);
+    if (error) {
+        fs::remove(temporary, error);
+        throw std::runtime_error("cannot install partial-download revision marker");
+    }
+}
+
+void
+discard_partial_download(const fs::path& path) {
+    std::error_code error;
+    fs::remove(path, error);
+    if (error)
+        throw std::runtime_error("cannot discard stale partial download: " + error.message());
+    fs::remove(partial_revision_path(path), error);
+    if (error)
+        throw std::runtime_error(
+            "cannot discard stale partial-download revision marker: " + error.message());
 }
 
 std::string
@@ -829,20 +984,31 @@ write_verification_marker(const fs::path& path, const Artifact& artifact, const 
 
 bool
 valid_file(const fs::path& path, const Artifact& artifact, bool cache_hit = false) {
-    FileState before{};
-    if (!file_state(path, artifact.size, before))
-        return false;
-    if (cache_hit && verification_marker_matches(path, artifact, before))
-        return true;
-    if (sha256_file(path) != artifact.sha256)
-        return false;
-    FileState after{};
-    if (!file_state(path, artifact.size, after) || before.size != after.size ||
-        before.modified != after.modified)
-        return false;
-    if (cache_hit)
-        write_verification_marker(path, artifact, after);
-    return true;
+    constexpr int max_attempts = 4;
+    // Shared caches can expose a finishing writer or delayed filesystem metadata here.
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        FileState before{};
+        if (!file_state(path, artifact.size, before))
+            return false;
+        if (cache_hit && verification_marker_matches(path, artifact, before))
+            return true;
+
+        const std::string actual_sha256 = sha256_file(path);
+        FileState after{};
+        const bool stable = file_state(path, artifact.size, after) && before.size == after.size &&
+                            before.modified == after.modified;
+        if (stable) {
+            if (actual_sha256 != artifact.sha256)
+                return false;
+            if (cache_hit)
+                write_verification_marker(path, artifact, after);
+            return true;
+        }
+
+        if (attempt + 1 < max_attempts)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
 }
 
 bool
@@ -899,16 +1065,32 @@ validate_pax_metadata(const std::string& data) {
 }
 
 void
-extract_tar_prefix(const fs::path& archive, const fs::path& destination, const Artifact& artifact) {
-    std::ifstream input(archive, std::ios::binary);
-    if (!input)
-        throw std::runtime_error("cannot read tokenizer archive " + path_utf8(archive));
-    fs::create_directories(destination);
+extract_tar_segment(
+    std::ifstream& input, const fs::path& destination, uint64_t segment_size,
+    const std::string& stop_before) {
     std::array<char, 512> header{};
+    uint64_t segment_remaining = segment_size;
     bool reached_stop = false;
-    while (input.read(header.data(), header.size())) {
-        if (std::all_of(header.begin(), header.end(), [](char c) { return c == '\0'; }))
+    bool reached_end = false;
+    auto read = [&](char* output, size_t size) {
+        if (size > segment_remaining || !input.read(output, static_cast<std::streamsize>(size)))
+            throw std::runtime_error("truncated tokenizer artifact");
+        segment_remaining -= size;
+    };
+    auto skip = [&](uint64_t size) {
+        if (size > segment_remaining)
+            throw std::runtime_error("truncated tokenizer artifact");
+        input.seekg(static_cast<std::streamoff>(size), std::ios::cur);
+        if (!input)
+            throw std::runtime_error("truncated tokenizer artifact");
+        segment_remaining -= size;
+    };
+    while (segment_remaining >= header.size()) {
+        read(header.data(), header.size());
+        if (std::all_of(header.begin(), header.end(), [](char c) { return c == '\0'; })) {
+            reached_end = true;
             break;
+        }
         uint64_t checksum = 0;
         for (size_t i = 0; i < header.size(); ++i)
             checksum += static_cast<unsigned char>(i >= 148 && i < 156 ? ' ' : header[i]);
@@ -924,7 +1106,7 @@ extract_tar_prefix(const fs::path& archive, const fs::path& destination, const A
         for (const auto& component : relative)
             if (component == "..")
                 throw std::runtime_error("unsafe path in tokenizer artifact");
-        if (relative.filename() == artifact.stop_before) {
+        if (!stop_before.empty() && relative.filename() == stop_before) {
             reached_stop = true;
             break;
         }
@@ -943,8 +1125,7 @@ extract_tar_prefix(const fs::path& archive, const fs::path& destination, const A
             while (remaining > 0) {
                 const size_t count =
                     static_cast<size_t>(std::min<uint64_t>(remaining, buffer.size()));
-                if (!input.read(buffer.data(), static_cast<std::streamsize>(count)))
-                    throw std::runtime_error("truncated tokenizer artifact");
+                read(buffer.data(), count);
                 file.write(buffer.data(), static_cast<std::streamsize>(count));
                 remaining -= count;
             }
@@ -952,8 +1133,7 @@ extract_tar_prefix(const fs::path& archive, const fs::path& destination, const A
                 throw std::runtime_error("cannot extract " + path_utf8(output));
         } else if ((type == 'x' || type == 'g') && size <= 64 * 1024) {
             std::string metadata(static_cast<size_t>(size), '\0');
-            if (!input.read(metadata.data(), static_cast<std::streamsize>(metadata.size())))
-                throw std::runtime_error("truncated tokenizer artifact");
+            read(metadata.data(), metadata.size());
             validate_pax_metadata(metadata);
         } else {
             throw std::runtime_error("unsupported TAR entry in tokenizer artifact");
@@ -961,16 +1141,32 @@ extract_tar_prefix(const fs::path& archive, const fs::path& destination, const A
         const uint64_t padding = (512 - (size % 512)) % 512;
         if (type == '5') {
             if (size != 0)
-                input.seekg(static_cast<std::streamoff>(size + padding), std::ios::cur);
+                skip(size + padding);
         } else if (padding != 0) {
-            input.seekg(static_cast<std::streamoff>(padding), std::ios::cur);
+            skip(padding);
         }
-        if (!input)
-            throw std::runtime_error("truncated tokenizer artifact");
     }
-    if (!reached_stop)
-        throw std::runtime_error(
-            "tokenizer archive prefix did not reach the expected model weights");
+    if (!stop_before.empty() && !reached_stop)
+        throw std::runtime_error("tokenizer archive range did not reach the expected stop member");
+    if (stop_before.empty() && !reached_end && segment_remaining != 0)
+        throw std::runtime_error("tokenizer archive range ends inside a TAR header");
+    skip(segment_remaining);
+}
+
+void
+extract_tar_artifact(
+    const fs::path& archive, const fs::path& destination, const Artifact& artifact) {
+    std::ifstream input(archive, std::ios::binary);
+    if (!input)
+        throw std::runtime_error("cannot read tokenizer archive " + path_utf8(archive));
+    fs::create_directories(destination);
+    if (artifact.type == "tar-prefix") {
+        extract_tar_segment(input, destination, artifact.size, artifact.stop_before);
+    } else {
+        for (const auto& range : artifact.ranges) {
+            extract_tar_segment(input, destination, range.end - range.start + 1, range.stop_before);
+        }
+    }
     for (const auto& member : artifact.members) {
         if (!valid_member(destination / member.name, member))
             throw std::runtime_error(
@@ -981,6 +1177,7 @@ extract_tar_prefix(const fs::path& archive, const fs::path& destination, const A
 PulledModelArtifact
 materialize(const Model& model, const Artifact& artifact) {
     const fs::path directory = model_directory(model);
+    const std::string revision = artifact_revision(model, artifact);
     fs::create_directories(directory);
     const fs::path destination =
         artifact.type == "file" ? directory / artifact.filename : directory / artifact.directory;
@@ -992,7 +1189,7 @@ materialize(const Model& model, const Artifact& artifact) {
             std::fprintf(stderr, "[model] cached: %s\n", path_utf8(destination).c_str());
         return {model.repo, artifact.role, destination, true};
     }
-    if (artifact.type == "tar-prefix") {
+    if (artifact.type != "file") {
         bool valid = fs::is_directory(destination);
         for (const auto& member : artifact.members)
             valid = valid && valid_member(destination / member.name, member);
@@ -1008,30 +1205,53 @@ materialize(const Model& model, const Artifact& artifact) {
             stderr,
             "[model] downloading %s@%.12s (%s, %.1f MiB)\n"
             "[model] license: %s — %s\n",
-            model.repo.c_str(), model.revision.c_str(), artifact.role.c_str(),
-            artifact.size / 1048576.0, model.license.c_str(), model.license_url.c_str());
+            model.repo.c_str(), revision.c_str(), artifact.role.c_str(), artifact.size / 1048576.0,
+            model.license.c_str(), model.license_url.c_str());
     }
     const fs::path partial = directory / (artifact.filename + ".partial");
+    std::error_code partial_error;
+    if (fs::exists(partial, partial_error) && !partial_error) {
+        if (!partial_revision_matches(partial, revision))
+            discard_partial_download(partial);
+    } else {
+        fs::remove(partial_revision_path(partial), partial_error);
+    }
     if (!valid_file(partial, artifact)) {
-        if (artifact.type == "tar-prefix") {
-            std::error_code error;
-            fs::remove(partial, error);
+        if (artifact.type != "file") {
+            discard_partial_download(partial);
         } else {
             std::error_code error;
             if (fs::is_regular_file(partial, error) &&
                 fs::file_size(partial, error) > artifact.size)
-                fs::remove(partial, error);
+                discard_partial_download(partial);
         }
+        write_partial_revision(partial, revision);
         download(model, artifact, partial);
     }
     if (!cli_quiet() && !cli_json())
         std::fprintf(stderr, "[model] verifying size and SHA-256...\n");
     if (!valid_file(partial, artifact)) {
+        std::string actual_size = "unavailable";
+        std::string actual_sha256 = "unavailable";
+        std::error_code diagnostic_error;
+        if (fs::is_regular_file(partial, diagnostic_error) && !diagnostic_error) {
+            const uintmax_t size = fs::file_size(partial, diagnostic_error);
+            if (!diagnostic_error)
+                actual_size = std::to_string(size);
+            try {
+                actual_sha256 = sha256_file(partial);
+            }
+            catch (const std::exception&) {
+            }
+        }
         std::error_code error;
         fs::remove(partial, error);
+        fs::remove(partial_revision_path(partial), error);
         throw std::runtime_error(
             "downloaded artifact failed size or SHA-256 verification: " + model.repo + "/" +
-            artifact.filename);
+            artifact.filename + " (revision " + artifact_revision(model, artifact) +
+            ", expected size " + std::to_string(artifact.size) + ", actual size " + actual_size +
+            ", expected SHA-256 " + artifact.sha256 + ", actual SHA-256 " + actual_sha256 + ")");
     }
 
     std::error_code error;
@@ -1041,13 +1261,14 @@ materialize(const Model& model, const Artifact& artifact) {
         fs::rename(partial, destination, error);
         if (error)
             throw std::runtime_error("cannot install model artifact: " + error.message());
+        fs::remove(partial_revision_path(partial), error);
         FileState state{};
         if (file_state(destination, artifact.size, state))
             write_verification_marker(destination, artifact, state);
     } else {
         const fs::path extracting = directory / (artifact.directory + ".extracting");
         fs::remove_all(extracting, error);
-        extract_tar_prefix(partial, extracting, artifact);
+        extract_tar_artifact(partial, extracting, artifact);
         fs::remove_all(destination, error);
         error.clear();
         fs::rename(extracting, destination, error);
@@ -1056,6 +1277,7 @@ materialize(const Model& model, const Artifact& artifact) {
             throw std::runtime_error("cannot install tokenizer artifact: " + error.message());
         }
         fs::remove(partial, error);
+        fs::remove(partial_revision_path(partial), error);
     }
     if (!cli_quiet() && !cli_json())
         std::fprintf(stderr, "[model] ready: %s\n", path_utf8(destination).c_str());

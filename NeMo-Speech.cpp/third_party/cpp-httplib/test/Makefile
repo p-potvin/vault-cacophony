@@ -1,5 +1,5 @@
 CXX = clang++
-CXXFLAGS = -g -std=c++11 -I. -Wall -Wextra -Wtype-limits -Wconversion -Wshadow $(EXTRA_CXXFLAGS) -DCPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO -fsanitize=address # -fno-exceptions -DCPPHTTPLIB_NO_EXCEPTIONS
+CXXFLAGS = -g -std=c++11 -I. -Wall -Wextra -Wtype-limits -Wconversion -Wshadow -DCPPHTTPLIB_USE_NON_BLOCKING_GETADDRINFO -fsanitize=address $(EXTRA_CXXFLAGS) # -fno-exceptions -DCPPHTTPLIB_NO_EXCEPTIONS
 
 ifneq ($(OS), Windows_NT)
 	UNAME_S := $(shell uname -s)
@@ -8,8 +8,11 @@ ifneq ($(OS), Windows_NT)
 		OPENSSL_DIR = $(PREFIX)/opt/openssl@3
 		OPENSSL_SUPPORT = -DCPPHTTPLIB_OPENSSL_SUPPORT -I$(OPENSSL_DIR)/include -L$(OPENSSL_DIR)/lib -lssl -lcrypto
 		OPENSSL_SUPPORT += -framework CoreFoundation -framework Security
-		MBEDTLS_DIR ?= $(shell brew --prefix mbedtls@3)
-		MBEDTLS_SUPPORT = -DCPPHTTPLIB_MBEDTLS_SUPPORT -I$(MBEDTLS_DIR)/include -L$(MBEDTLS_DIR)/lib -lmbedtls -lmbedx509 -lmbedcrypto
+		# Homebrew's default mbedtls is 4.x; override MBEDTLS_DIR for other versions.
+		MBEDTLS_DIR ?= $(shell brew --prefix mbedtls)
+		# Mbed TLS 4.x renamed libmbedcrypto to libtfpsacrypto; pick whichever exists.
+		MBEDTLS_CRYPTO_LIB ?= $(shell test -f "$(MBEDTLS_DIR)/lib/libtfpsacrypto.dylib" -o -f "$(MBEDTLS_DIR)/lib/libtfpsacrypto.a" && echo tfpsacrypto || echo mbedcrypto)
+		MBEDTLS_SUPPORT = -DCPPHTTPLIB_MBEDTLS_SUPPORT -I$(MBEDTLS_DIR)/include -L$(MBEDTLS_DIR)/lib -lmbedtls -lmbedx509 -l$(MBEDTLS_CRYPTO_LIB)
 		MBEDTLS_SUPPORT += -framework CoreFoundation -framework Security
 		WOLFSSL_DIR ?= $(shell brew --prefix wolfssl)
 		WOLFSSL_SUPPORT = -DCPPHTTPLIB_WOLFSSL_SUPPORT -I$(WOLFSSL_DIR)/include -I$(WOLFSSL_DIR)/include/wolfssl -L$(WOLFSSL_DIR)/lib -lwolfssl
@@ -259,6 +262,10 @@ test_benchmark : test_benchmark.cc ../httplib.h Makefile
 
 test_websocket_heartbeat : test_websocket_heartbeat.cc ../httplib.h Makefile
 	$(CXX) -o $@ -I.. $(CXXFLAGS) test_websocket_heartbeat.cc $(TEST_ARGS)
+	@file $@
+
+test_websocket_thread_safety : test_websocket_thread_safety.cc ../httplib.h Makefile cert.pem
+	$(CXX) -o $@ -I.. $(CXXFLAGS) test_websocket_thread_safety.cc $(TEST_ARGS)
 	@file $@
 
 test_proxy : test_proxy.cc ../httplib.h Makefile cert.pem

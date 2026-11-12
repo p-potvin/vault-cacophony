@@ -76,7 +76,7 @@ endif()
 
 ## 4.2 モデル一覧を定義する
 
-アプリが扱えるモデルの一覧を定義します。翻訳タスクで検証済みの4モデルを用意しました。
+アプリが扱えるモデルの一覧を定義します。翻訳タスクで検証済みの3モデルを用意しました。
 
 ```cpp
 struct ModelInfo {
@@ -219,7 +219,6 @@ bool download_model(const ModelInfo &model,
                     std::function<bool(int)> progress_cb) {
   httplib::Client cli("https://huggingface.co");
   cli.set_follow_location(true);
-  cli.set_read_timeout(std::chrono::hours(1));
 
   auto url = "/" + model.repo + "/resolve/main/" + model.filename;
   auto path = get_models_dir() / model.filename;
@@ -469,7 +468,6 @@ bool download_model(const ModelInfo &model,
                     std::function<bool(int)> progress_cb) {
   httplib::Client cli("https://huggingface.co");
   cli.set_follow_location(true);  // Hugging FaceはCDNにリダイレクトする
-  cli.set_read_timeout(std::chrono::hours(1)); // 大きなモデルに備えて長めに
 
   auto url = "/" + model.repo + "/resolve/main/" + model.filename;
   auto path = get_models_dir() / model.filename;
@@ -538,10 +536,6 @@ int main() {
   }
   auto llm = llamalib::Llama{path};
   std::mutex llm_mutex; // モデル切り替え中のアクセスを保護する
-
-  // LLM推論は時間がかかるのでタイムアウトを長めに設定（デフォルトは5秒）
-  svr.set_read_timeout(300);
-  svr.set_write_timeout(300);
 
   svr.set_logger([](const auto &req, const auto &res) {
     std::cout << req.method << " " << req.path << " -> " << res.status

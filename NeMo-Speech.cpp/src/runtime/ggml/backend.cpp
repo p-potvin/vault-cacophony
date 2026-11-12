@@ -13,9 +13,39 @@
 
 namespace ggml_runtime {
 
+namespace {
+void
+set_environment_default(const char* name, const char* value) {
+    if (std::getenv(name) != nullptr) {
+        return;
+    }
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 0);
+#endif
+}
+}  // namespace
+
+void
+keep_cuda_graphs_resident() {
+    set_environment_default("GGML_CUDA_GRAPH_EVICT_AFTER_MS", "0");
+}
+
+void
+keep_skinny_q8_weights_separate() {
+    set_environment_default("GGML_SKINNY_Q8_INPLACE", "0");
+}
+
 BackendManager::BackendManager(Params params) {
     nemo_speech::common::ensure_ggml_logging();
     this->params = params;
+    init_backends();
+}
+
+BackendManager::BackendManager(Params params, ggml_backend_t borrowed_gpu_backend) {
+    this->params = params;
+    borrowed_gpu_backend_ = borrowed_gpu_backend;
     init_backends();
 }
 
@@ -24,12 +54,8 @@ void
 BackendManager::init_backends() {
 #if defined(GGML_USE_VULKAN)
     // Graph optimization is incompatible with in-place persistent cache tensors.
-    // Vulkan reads this setting during device initialization; respect user overrides.
-    // putenv retains the supplied storage, so the buffer must have static lifetime.
-    if (std::getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE") == nullptr) {
-        static char kv[] = "GGML_VK_DISABLE_GRAPH_OPTIMIZE=1";
-        putenv(kv);
-    }
+    // Vulkan reads this setting during device initialization.
+    set_environment_default("GGML_VK_DISABLE_GRAPH_OPTIMIZE", "1");
 #endif  // GGML_USE_VULKAN
 
     ggml_time_init();
@@ -45,7 +71,20 @@ BackendManager::init_backends() {
     GGMLF_LOG_INFO("Found %zu devices.\n", dev_count);
 
     ggml_backend_dev_t dev = nullptr;
-    if (params.use_gpu) {
+    if (borrowed_gpu_backend_ != nullptr) {
+        dev = ggml_backend_get_device(borrowed_gpu_backend_);
+        const auto dev_type = dev ? ggml_backend_dev_type(dev) : GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (dev == nullptr || (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU &&
+                               dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+            throw std::runtime_error("borrowed GPU backend is not a GPU device");
+        }
+        auto* buft = ggml_backend_dev_buffer_type(dev);
+        if (buft) {
+            buft_list.emplace_back(dev, buft);
+        }
+        gpu_backend = borrowed_gpu_backend_;
+        GGMLF_LOG_INFO("Using borrowed GPU backend: %s\n", ggml_backend_name(gpu_backend));
+    } else if (params.use_gpu) {
         int idx = 0;
         for (int i = 0; i < dev_count; i++) {
             ggml_backend_dev_t dev_cur = ggml_backend_dev_get(i);
@@ -126,7 +165,9 @@ BackendManager::init_backends() {
 std::vector<ggml_backend_t>
 BackendManager::get_backends() {
     std::vector<ggml_backend_t> handles;
-    handles.reserve(backends.size());
+    handles.reserve(backends.size() + (borrowed_gpu_backend_ ? 1 : 0));
+    if (borrowed_gpu_backend_)
+        handles.push_back(borrowed_gpu_backend_);
     for (const auto& b : backends) handles.push_back(b.get());
     return handles;
 }

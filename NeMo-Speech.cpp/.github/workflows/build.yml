@@ -1,0 +1,225 @@
+name: Build and Test
+
+# Builds ASR, diarization, and TTS on the GitHub-hosted runners, runs the
+# model-free ctest suite, then a CLI smoke test with real models.
+#
+# Coverage per job:
+#   Patch series - patches/ applies to the pinned llama.cpp in exported form
+#   Linux CPU    - build, ctest, CPU inference
+#   macOS Metal  - Metal backend COMPILE AND LINK only; inference runs on CPU.
+#                  The hosted macOS VM's paravirtual GPU cannot run ggml Metal.
+#   Windows CPU  - build, ctest, CPU inference
+# CUDA and Vulkan run on NVIDIA's self-hosted GPU runners in gpu.yml.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NEMO_SPEECH_MODEL_DIR: ${{ github.workspace }}/.ci-models
+
+jobs:
+  patch-series:
+    name: Patch series
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Initialize submodules
+        run: git submodule update --init --depth 1 llama.cpp
+
+      - name: Check patches/
+        # The series must apply to the pinned llama.cpp and be exactly what
+        # scripts/llama-patches.sh export produces.
+        run: scripts/llama-patches.sh check
+
+  linux-cpu:
+    name: Linux CPU
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Initialize submodules
+        # llama.cpp also provides ggml.
+        run: git submodule update --init --depth 1 llama.cpp
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config libsentencepiece-dev curl
+
+      - name: Configure
+        run: |
+          scripts/configure.sh cpu-speech \
+            -DNEMO_SPEECH_BUILD_NMT=OFF \
+            -DNEMO_SPEECH_BUILD_SPEECHLM=ON \
+            -DNEMO_SPEECH_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build --preset cpu-speech --parallel
+
+      - name: Unit tests
+        run: ctest --test-dir build/cpu-speech --output-on-failure --timeout 600
+
+      - name: Cache models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
+          key: models-${{ hashFiles('models/index.json') }}
+
+      - name: Model smoke test
+        run: |
+          python3 tests/ci/model_smoke.py \
+            --binary build/cpu-speech/bin/nemo-speech \
+            --backend cpu \
+            --audio test_files/asr/wav/test/jfk.wav
+
+  macos-metal:
+    name: macOS Metal (build + CPU smoke)
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Initialize submodules
+        run: git submodule update --init --depth 1 llama.cpp
+
+      - name: Install dependencies
+        # Homebrew's sentencepiece header includes abseil, which the formula
+        # does not pull in as a build-time dependency for consumers.
+        run: brew install bash ninja sentencepiece abseil
+
+      - name: Configure
+        # The runner's default shell is Apple's bash 3.2; configure.sh needs
+        # bash 4+, so run it under Homebrew bash.
+        shell: /opt/homebrew/bin/bash -e {0}
+        run: |
+          scripts/configure.sh metal-speech \
+            -DNEMO_SPEECH_BUILD_NMT=OFF \
+            -DNEMO_SPEECH_BUILD_SPEECHLM=ON \
+            -DNEMO_SPEECH_BUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build --preset metal-speech --parallel
+
+      - name: Unit tests
+        run: ctest --test-dir build/metal-speech --output-on-failure --timeout 600
+
+      - name: Cache models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
+          key: models-${{ hashFiles('models/index.json') }}
+
+      - name: Model smoke test
+        # The hosted macOS runner is a VM whose GPU is the "Apple Paravirtual
+        # device" (MTLGPUFamilyCommon3, no simdgroup matmul). ggml Metal
+        # inference on it is known to hang, produce garbage, or crash
+        # (ggml-org/llama.cpp#8617); llama.cpp's own CI builds Metal there but
+        # never runs GPU inference. So: build and link the Metal backend on
+        # this runner, run inference on CPU, and probe Metal non-blockingly
+        # below. Real Metal inference needs Apple hardware (nv-cpu-metal).
+        run: |
+          python3 tests/ci/model_smoke.py \
+            --binary build/metal-speech/bin/nemo-speech \
+            --backend cpu \
+            --audio test_files/asr/wav/test/jfk.wav
+
+      - name: Metal backend probe (non-blocking)
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          lldb --batch -o run -k "bt 30" -k quit -- \
+            build/metal-speech/bin/nemo-speech --verbose transcribe \
+              test_files/asr/wav/test/jfk.wav --backend metal
+
+  windows-cpu:
+    name: Windows CPU
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Initialize submodules
+        run: git submodule update --init --depth 1 llama.cpp
+
+      - name: Install Ninja
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install -y ninja --no-progress
+          }
+
+      - name: Restore vcpkg binaries
+        # actions/cache only saves in its post step when the job succeeds, so
+        # a failing test run threw away 30 minutes of dependency builds.
+        # Split restore/save and save right after a successful build.
+        id: vcpkg-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: vcpkg-windows-x64-${{ hashFiles('vcpkg.json', 'scripts/windows/build.ps1') }}
+          restore-keys: vcpkg-windows-x64-
+
+      - name: Configure and build
+        id: build
+        shell: pwsh
+        run: |
+          scripts\windows\build.ps1 -Backend cpu -Profile core -Speechlm -Tests `
+            -BuildDir "${{ github.workspace }}\build\windows-cpu"
+
+      - name: Save vcpkg binaries
+        # Keys are immutable, so only save a fully built dependency set. Test
+        # failures later in the job do not prevent the save.
+        if: steps.build.outcome == 'success' && steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~\AppData\Local\vcpkg\archives
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+
+      - name: Unit tests
+        shell: pwsh
+        run: ctest --test-dir build\windows-cpu --output-on-failure --timeout 600
+
+      - name: Cache models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.NEMO_SPEECH_MODEL_DIR }}
+          key: models-${{ hashFiles('models/index.json') }}
+
+      - name: Model smoke test
+        shell: pwsh
+        run: |
+          python tests\ci\model_smoke.py `
+            --binary build\windows-cpu\bin\nemo-speech.exe `
+            --backend cpu `
+            --audio test_files\asr\wav\test\jfk.wav

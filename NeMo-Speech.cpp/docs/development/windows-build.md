@@ -49,9 +49,8 @@ defaults.
 ## Get the sources
 
 ```powershell
-git submodule update --init ggml                            # required (all backends)
+git submodule update --init llama.cpp                       # required (also provides ggml)
 git submodule update --init proto/riva-common               # gRPC server
-git submodule update --init llama.cpp                       # ASR live capture or NMT
 git submodule update --init third_party/flashlight-text third_party/kenlm # only for LM-fused CTC decoding
 git submodule update --init third_party/open_jtalk          # optional TTS JA tokenizer (-TtsJa)
 git submodule update --init --recursive third_party/cppjieba  # optional TTS ZH tokenizer (-TtsZh)
@@ -105,15 +104,40 @@ Key parameters: `-Backend cuda|vulkan|cpu`,
 Binaries land in `build-<backend>[-<profile>][-<architecture>]\bin`; the default
 `core` and `auto` suffixes are omitted.
 
+### Cross-compiling CUDA for Windows on Arm
+
+An x64 machine can build the ARM64 CUDA binaries for Windows on Arm (RTX
+Spark); the build host needs no GPU. Requirements, besides the components above:
+
+- CUDA Toolkit 13.4 or newer: the x64 toolkit ships the Windows ARM64 target
+  libraries in `lib\arm64` and `bin\arm64`.
+- The Visual Studio `VC.Tools.ARM64` and `VC.Llvm.Clang` components (`clang-cl`).
+- An explicit `-CudaArch`; `native` would detect the build host's GPU.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\build.ps1 -Backend cuda -Profile server `
+    -Architecture arm64 -CudaArch 121a-real `
+    -CMakeArgs '-DGGML_NATIVE=OFF','-DGGML_CPU_ARM_ARCH=armv8.6-a+fp16'
+powershell -ExecutionPolicy Bypass -File scripts\windows\package-release.ps1 `
+    -BuildDir build-cuda-server-arm64 -Backend cuda -Architecture arm64
+```
+
+The driver imports the x64-hosted ARM64 environment (`vcvarsamd64_arm64.bat`),
+compiles C/C++ with `clang-cl`, and runs `nvcc` with the ARM64-targeting `cl.exe`
+and `--use-local-env`, so that `nvcc` does not set up its own x64 environment.
+`GGML_NATIVE` is off when cross-compiling, so set the CPU baseline with
+`GGML_CPU_ARM_ARCH`; `armv8.6-a+fp16` (dotprod, i8mm, bf16, fp16) matches RTX
+Spark, and without it the CPU backend targets plain ARMv8.0. ARM64 CUDA binaries
+cannot run on the x64 build host; test them on the target. CUDA
+cross-compilation is supported only from x64 to ARM64.
+
 ## Build with raw CMake
 
 If you prefer to drive CMake yourself, run from an **x64 Native Tools** prompt
 (or after `vcvars64.bat`), with CMake/Ninja/CUDA/Vulkan on `PATH`:
 
 ```powershell
-# CUDA: apply the CUDA-only ggml patches first
-powershell -ExecutionPolicy Bypass -File scripts\windows\apply-ggml-patches.ps1
-
+# CUDA: CMake applies patches/ itself (git must be on PATH).
 cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release `
     -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native `
     -DNEMO_SPEECH_BUILD_GRPC=ON `
@@ -121,7 +145,7 @@ cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release `
     -DVCPKG_TARGET_TRIPLET=x64-windows
 cmake --build build-cuda --parallel
 
-# Vulkan: stock ggml (the project's ggml patches are CUDA-only). ggml-vulkan requires the
+# Vulkan: stock ggml (the patches are applied for CUDA and CPU builds). ggml-vulkan requires the
 # SPIRV-Headers CMake package; the Vulkan SDK ships it under Lib\cmake.
 cmake -S . -B build-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release `
     -DGGML_VULKAN=ON -DNEMO_SPEECH_GGML_PATCHED=OFF `
@@ -135,25 +159,15 @@ cmake --build build-vulkan --parallel
 ### Windows-specific build behavior
 
 - **The cuBLAS shim is optional.** Pass `-CublasShim` to the build driver for an
-  app-local `cublas64_<major>.dll` that avoids shipping cuBLAS and cuBLASLt.
-- **ggml patches are CUDA-only.** A Vulkan/CPU build uses stock ggml; pass
-  `-DNEMO_SPEECH_GGML_PATCHED=OFF` (the encoder uses the portable op path).
+  app-local `cublas64_<major>.dll` that avoids shipping cuBLAS and cuBLASLt. Without
+  it, `package-release.ps1` bundles the toolkit's cuBLAS and cuBLASLt for the target
+  architecture (the release archives do).
+- **CUDA and CPU builds apply the patches.** A Vulkan build uses stock ggml;
+  pass `-DNEMO_SPEECH_GGML_PATCHED=OFF` (the build driver does this).
 - Dependent DLLs must be next to the executable or on `PATH`. Ninja places them
   together in `build-<backend>\bin`.
 - Flashlight builds install the replaceable `kenlm.dll` alongside the runtime
   libraries.
-
-### Reset a partially patched ggml checkout
-
-If `apply-ggml-patches` reports that a patch does not apply cleanly, reset the
-submodule and re-apply it:
-
-```powershell
-git -C ggml reset -q
-git -C ggml checkout -- .
-git -C ggml clean -fd src        # removes patch-created files
-powershell -ExecutionPolicy Bypass -File scripts\windows\apply-ggml-patches.ps1
-```
 
 ### Backend status
 

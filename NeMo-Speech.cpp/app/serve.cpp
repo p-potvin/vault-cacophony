@@ -220,6 +220,7 @@ run_server(int argc, char** argv) {
     parser.Register(
         "http.playground", &server_config.enable_playground,
         "Serve the embedded browser playground");
+    parser.Register("http", server_config.chat);  // http.chat.*
 #if defined(NEMO_SPEECH_CLI_ASR)
     parser.Register("asr", asr_config);
     parser.Register(
@@ -243,6 +244,9 @@ run_server(int argc, char** argv) {
         "tts.enabled",
         [&](const std::string& value) { tts_enabled = parse_enablement("tts.enabled", value); },
         "Enable TTS: auto, true, or false");
+    parser.Register(
+        "tts.preempt", &server_config.preempt_tts,
+        "Cancel older HTTP TTS synthesis when a newer request arrives");
 #endif
 #if defined(NEMO_SPEECH_CLI_S2S)
     parser.Register(
@@ -414,32 +418,49 @@ run_server(int argc, char** argv) {
         }
     };
 #if defined(NEMO_SPEECH_CLI_ASR)
-    const bool asr_requested = asr_enabled > 0 || !asr_model.empty() ||
+    // A SALM encoder selects ASR by itself. Its LLM path is checked by the backend, so a missing
+    // one fails with the same error as the other entrypoints instead of leaving ASR unloaded.
+    const bool salm_selected = asr_enabled != 0 && !asr_config.salm.encoder_path.empty();
+    const bool asr_requested = asr_enabled > 0 || salm_selected || !asr_model.empty() ||
                                !asr_config.model.path.empty() || !vad_model.empty() ||
                                !pnc_model.empty() || !itn_model.empty();
-    const auto asr_path = asr_enabled == 0 ? std::string() : resolve("ASR model", [&] {
-        return optional_model(
-            asr_model.empty() ? asr_config.model.path : asr_model, "asr", "ASR model",
-            asr_requested);
-    });
-    if (!asr_path.empty()) {
+    const std::string asr_reference = asr_model.empty() ? asr_config.model.path : asr_model;
+    const auto asr_path =
+        asr_enabled == 0 || (salm_selected && asr_reference.empty())
+            ? std::string()
+            : resolve("ASR model", [&] {
+                  return optional_model(asr_reference, "asr", "ASR model", asr_requested);
+              });
+    const bool start_asr = asr_enabled != 0 && (!asr_path.empty() || salm_selected);
+    if (start_asr) {
         if (device_set)
             asr_config.backend.gpu = gpu;
         asr_config.model.path = asr_path;
     }
+    // A speech-LLM decoder names its encoder file (GGUF headers only), so SALM is known here,
+    // before any model load, also from the decoder alone.
+    bool speech_llm = salm_selected;
+    if (start_asr && !speech_llm)
+        speech_llm = !resolve("ASR model", [&] {
+                          nemo_speech::asr::resolve_salm_encoder(asr_config);
+                          return asr_config.salm.encoder_path;
+                      }).empty();
     if (asr_enabled != 0 && (asr_requested || !asr_path.empty())) {
         asr_config.vad.model_path = resolve("VAD model", [&] {
             return optional_model(
                 vad_model.empty() ? asr_config.vad.model_path : vad_model, "", "VAD model", false);
         });
 #if defined(NEMO_SPEECH_CLI_DIAR)
-        if (asr_config.diar.model_path.empty() && !diar_config.model_path.empty())
-            asr_config.diar = diar_config;
-        asr_config.diar.model_path = resolve("diarization model", [&] {
-            return optional_model(
-                diar_model.empty() ? asr_config.diar.model_path : diar_model, "diarization",
-                "diarization model", false);
-        });
+        // SALM tags speakers itself; the top-level diarizer is served standalone instead.
+        if (!speech_llm) {
+            if (asr_config.diar.model_path.empty() && !diar_config.model_path.empty())
+                asr_config.diar = diar_config;
+            asr_config.diar.model_path = resolve("diarization model", [&] {
+                return optional_model(
+                    diar_model.empty() ? asr_config.diar.model_path : diar_model, "diarization",
+                    "diarization model", false);
+            });
+        }
 #endif
         asr_config.postproc.pnc_model_path = resolve("punctuation model", [&] {
             return optional_model(
@@ -456,7 +477,7 @@ run_server(int argc, char** argv) {
 #if defined(NEMO_SPEECH_CLI_DIAR)
     std::string standalone_diar;
 #if defined(NEMO_SPEECH_CLI_ASR)
-    if (asr_path.empty())
+    if (!start_asr || speech_llm)
 #endif
         standalone_diar = resolve("diarization model", [&] {
             return optional_model(
@@ -526,6 +547,27 @@ run_server(int argc, char** argv) {
         }
     }
 #endif
+#if defined(NEMO_SPEECH_CLI_ASR)
+    // HTTP workers block in recognize(), so the pool bounds concurrent SALM requests: the decode
+    // slots plus headroom for other routes, and at least kSalmMinWorkers. A keep-alive connection
+    // holds its worker for up to 100 requests (httplib), so clients beyond the workers would wait
+    // for whole connections to finish; with enough workers their requests wait in the engine's
+    // queue (asr.batching.max_queue_depth) in arrival order instead. httplib starts every worker up
+    // front.
+    if (start_asr && speech_llm) {
+        constexpr int kSalmMinWorkers = 256;
+        if (!http_threads_set) {
+            server_config.threads = std::max(
+                {server_config.threads, asr_config.salm.max_sequences + 8, kSalmMinWorkers});
+        } else if (server_config.threads < asr_config.salm.max_sequences) {
+            std::fprintf(
+                stderr,
+                "warning: HTTP worker count (%d) is below asr.salm.max_sequences (%d); "
+                "concurrent transcriptions will be limited by HTTP workers\n",
+                server_config.threads, asr_config.salm.max_sequences);
+        }
+    }
+#endif
     if (!server_config.tls_certificate.empty()) {
         if (!std::filesystem::is_regular_file(server_config.tls_certificate))
             validation_errors.push_back(
@@ -546,7 +588,7 @@ run_server(int argc, char** argv) {
     nemo_speech::EngineRegistryConfig registry_config;
 #if defined(NEMO_SPEECH_CLI_ASR)
     asr_config.log_status = !cli_quiet() && !cli_json();
-    registry_config.asr = !asr_path.empty();
+    registry_config.asr = start_asr;
 #endif
 #if defined(NEMO_SPEECH_CLI_NMT)
     registry_config.nmt = !nmt_path.empty();
@@ -562,7 +604,7 @@ run_server(int argc, char** argv) {
     }
 #endif
 #if defined(NEMO_SPEECH_CLI_ASR)
-    if (!asr_path.empty())
+    if (start_asr)
         engines.load_asr(std::move(asr_config));
 #endif
 #if defined(NEMO_SPEECH_CLI_DIAR)
@@ -592,8 +634,6 @@ run_server(int argc, char** argv) {
                 tts_config.runtime.codec_cpu = gpu < 0;
             } else {
                 tts_config.runtime.lt_backend = nemo_speech::tts::MagpieBackendPreference::Cuda;
-                tts_config.runtime.sampling_backend =
-                    nemo_speech::tts::MagpieBackendPreference::Cuda;
             }
         }
         tts_config.runtime.magpie_model = magpie_path;
@@ -607,6 +647,9 @@ run_server(int argc, char** argv) {
         config.default_voice_name = tts_config.default_voice_name;
         engines.load_tts(std::move(config));
     }
+    // The HTTP server owns request handling, so carry the existing TTS
+    // benchmark switch across from the TTS server configuration.
+    server_config.tts_benchmark = tts_config.benchmark;
 #endif
     if (!engines.ready())
         throw std::runtime_error(
@@ -677,9 +720,9 @@ run_server(int argc, char** argv) {
                 std::printf("%s\n", event.dump().c_str());
             } else if (!cli_quiet()) {
                 std::printf(
-                    "HTTP API listening on %s://%s:%d\n",
+                    "HTTP API listening on %s://%s:%d (%d workers)\n",
                     server_config.tls_certificate.empty() ? "http" : "https",
-                    server_config.address.c_str(), server_config.port);
+                    server_config.address.c_str(), server_config.port, server_config.threads);
                 if (server_config.enable_playground)
                     std::printf("Playground: %s\n", playground_url.c_str());
             }
@@ -702,7 +745,8 @@ print_serve_help(const char* program) {
         "Server:\n"
         "  --host ADDRESS          Bind address (default: 127.0.0.1)\n"
         "  --port N                HTTP port (default: 8080)\n"
-        "  --threads N             Bounded HTTP worker count (default: 4)\n"
+        "  --threads N             Bounded HTTP worker count (default: 4; with SALM,\n"
+        "                          asr.salm.max_sequences + 8, at least 256)\n"
         "  --max-upload-mb N       Maximum request body (default: 512)\n"
         "  --read-timeout SEC      Socket read timeout (default: 30)\n"
         "  --write-timeout SEC     Socket write timeout (default: 30)\n"
@@ -723,6 +767,8 @@ print_serve_help(const char* program) {
         "Models:\n"
 #if defined(NEMO_SPEECH_CLI_ASR)
         "  --asr-model MODEL       ASR GGUF path or indexed model\n"
+        "  --salm-encoder FILE     SALM encoder GGUF instead of the one the decoder names\n"
+        "  --asr.salm.* VALUE      SALM scheduling; complete-audio requests only\n"
         "  --vad-model MODEL       Optional VAD model\n"
         "  --pnc-model MODEL       Optional punctuation model\n"
         "  --itn-model-dir MODEL   Optional ITN grammar directory\n"
@@ -735,6 +781,7 @@ print_serve_help(const char* program) {
         "  --codec-model MODEL     NanoCodec path or indexed model\n"
         "  --tokenizer-dir MODEL   TTS tokenizer directory or indexed model\n"
         "  --tn-model-dir MODEL    Optional TTS text-normalization assets\n"
+        "  --tts.preempt           Cancel older HTTP TTS synthesis for the newest request\n"
 #endif
 #if defined(NEMO_SPEECH_CLI_NMT)
         "  --nmt-model MODEL       Optional translation model\n"

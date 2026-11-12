@@ -286,6 +286,21 @@ Session::dump_schedule(std::ostream& out, const std::string& session_label) cons
 
 
 void
+Session::bind_or_copy_tensor(ggml_bf_tensor t, const std::string& gguf_key) {
+    if (t.tensor->data == nullptr) {
+        // Left unbound for zero-copy (see
+        // TensorContainer::allocate_tensors_on_backend_buffers); bind directly.
+        ggml_backend_buffer_t buf = model_tensor_container->mmap_buffer_for(t.buft);
+        ggml_backend_tensor_alloc(
+            buf, t.tensor, gguf_loader->mapped_tensor_ptr(gguf_key, ggml_nbytes(t.tensor)));
+    } else {
+        const size_t mem_bytes = ggml_nbytes(t.tensor);
+        const char* data = gguf_loader->get_tensor_file_data(gguf_key, mem_bytes);
+        ggml_backend_tensor_set(t.tensor, data, 0, mem_bytes);
+    }
+}
+
+void
 Session::load_weight(const std::string& gguf_key) {
     ggml_bf_tensor t = model_tensor_container->get_tensor_by_name(gguf_key);
     const ggml_type mem = t.tensor->type;
@@ -302,8 +317,7 @@ Session::load_weight(const std::string& gguf_key) {
     if (mem == disk) {
         // Verbatim: tensor was declared at the on-disk dtype, so ggml_nbytes
         // matches the on-disk byte size for any format (F32/F16/BF16/Q*).
-        const char* data = gguf_loader->get_tensor_file_data(gguf_key, mem_bytes);
-        ggml_backend_tensor_set(t.tensor, data, 0, mem_bytes);
+        bind_or_copy_tensor(t, gguf_key);
     } else if (disk == GGML_TYPE_F32 && mem == GGML_TYPE_F16) {
         // Converter quirk: some Conv weights are F32 on disk but wanted F16 in
         // memory. On-disk is 2x the F16 byte size.
@@ -321,6 +335,14 @@ Session::load_weight(const std::string& gguf_key) {
     }
 }
 
+ggml_bf_tensor
+Session::import_model_tensor(const std::string& name, ggml_tensor* tensor) {
+    if (!model_tensor_container) {
+        throw std::logic_error("import_model_tensor must be called during Session::setup");
+    }
+    return model_tensor_container->import_tensor(name, tensor);
+}
+
 int
 Session::setup() {
     std::lock_guard<std::mutex> compute_lock(backend_manager_->compute_mutex());
@@ -331,6 +353,7 @@ Session::setup() {
     // two-pass sizing used for activation graphs.
     model_tensor_container =
         std::make_unique<TensorContainer>(buft_list, TensorContainer::ArenaSizes{});
+    model_tensor_container->set_mmap_loader(gguf_loader);
     // State tensors (declared via create_state_tensor_*) live in this sibling
     // container, which is deliberately NEVER allocate_tensors_on_backend_buffers()'d:
     // each per-stream SessionState supplies their device backing per run. The
@@ -437,6 +460,32 @@ backend_for_tensor(const std::vector<ggml_backend_t>& backends, const ggml_tenso
     return nullptr;
 }
 
+// Byte copy between two device ranges on `backend` (asynchronous where the backend supports it), or
+// a synchronous copy without one (host buffers, which no session backend claims in a CPU-only
+// build).
+void
+copy_device_range(
+    ggml_backend_t backend, const DeviceTensor& src, size_t src_offset, ggml_tensor* dst,
+    size_t dst_offset, size_t bytes) {
+    if (!src.valid() || src.byte_offset + src_offset + bytes > ggml_nbytes(src.tensor) ||
+        dst_offset + bytes > ggml_nbytes(dst))
+        throw std::runtime_error("Session::Input gather: range outside its tensors");
+    ggml_tensor from = {}, to = {};
+    from.type = to.type = GGML_TYPE_I8;
+    from.ne[0] = to.ne[0] = static_cast<int64_t>(bytes);
+    from.ne[1] = from.ne[2] = from.ne[3] = to.ne[1] = to.ne[2] = to.ne[3] = 1;
+    from.nb[0] = to.nb[0] = 1;
+    from.nb[1] = from.nb[2] = from.nb[3] = to.nb[1] = to.nb[2] = to.nb[3] = bytes;
+    from.buffer = src.tensor->buffer;
+    from.data = static_cast<char*>(src.tensor->data) + src.byte_offset + src_offset;
+    to.buffer = dst->buffer;
+    to.data = static_cast<char*>(dst->data) + dst_offset;
+    if (backend)
+        ggml_backend_tensor_copy_async(backend, backend, &from, &to);
+    else
+        ggml_backend_tensor_copy(&from, &to);
+}
+
 }  // namespace
 
 // Adapts Input and Output values to the callback-based implementation.
@@ -469,6 +518,14 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
             bool transferred_host_data = false;
             for (const auto& in : inputs) {
                 if (in.device_tensor != nullptr) {
+                    continue;
+                }
+                if (!in.gather.empty()) {
+                    auto t = tc->get_tensor_by_name(in.name);
+                    ggml_backend_t backend = backend_for_tensor(s->backends, t.tensor);
+                    for (const auto& r : in.gather)
+                        copy_device_range(
+                            backend, *r.src, r.src_offset, t.tensor, r.dst_offset, r.bytes);
                     continue;
                 }
                 if (!in.upload) {
@@ -510,7 +567,9 @@ Session::run(const std::vector<Input>& inputs, std::vector<Output>& outputs, Ses
                 }
                 ggml_bf_tensor t = (out.index >= 0) ? out_bag.get_tensor(out.index)
                                                     : tc->get_tensor_by_name(out.name);
-                const size_t want = ggml_nbytes(t.tensor);
+                const size_t want = out.download_bytes
+                                        ? std::min(out.download_bytes, ggml_nbytes(t.tensor))
+                                        : ggml_nbytes(t.tensor);
                 if (out.device_tensor != nullptr) {
                     // May reference scheduler-owned storage: valid only until
                     // the next run on this Session (async chaining contract).
@@ -679,6 +738,7 @@ Session::run_impl(
         // The shared scheduler pool grew after this entry was cached (a larger
         // shape resized a backend's compute buffer), so its device placements
         // are stale - re-running it raises CUDA invalid-argument. Rebuild.
+        ++run_cache_stale_;
         auto lru_it = std::find(run_cache_lru_.begin(), run_cache_lru_.end(), key);
         if (lru_it != run_cache_lru_.end())
             run_cache_lru_.erase(lru_it);
@@ -686,6 +746,7 @@ Session::run_impl(
         it = run_cache_.end();
     }
     if (it == run_cache_.end()) {
+        ++run_cache_misses_;
         // Evict before allocating the replacement so its device storage is available.
         while (run_cache_.size() >= run_cache_capacity_ && !run_cache_lru_.empty()) {
             uint64_t evict = run_cache_lru_.front();
@@ -713,6 +774,10 @@ Session::run_impl(
         // Scheduler-managed intermediates share storage by liveness. Pool
         // growth invalidates older cached placements through the generation check.
         fit_sizes.sched_managed = true;
+        if (share_named_) {
+            shared_named_.generation = &sched_pool_generation_;
+            fit_sizes.shared_named = &shared_named_;
+        }
         fit_sizes.temp_ctx_bytes = fit_size(measurement.temp_ctx_bytes);
         // Default for any buft the probe didn't touch but the real build
         // might create (shouldn't happen given idempotency, but be safe).
@@ -900,7 +965,8 @@ Session::run_impl(
         }
 
         auto _t2 = _clk::now();
-        if (!ggml_graph_compute_helper_async(sched.get(), cr.gf, 4)) {
+        if (!ggml_graph_compute_helper_async(
+                sched.get(), cr.gf, backend_manager_->get_params().n_threads)) {
             GGMLF_LOG_ERROR("Failed to compute graph\n");
             throw std::runtime_error("failed to compute graph");
         }
