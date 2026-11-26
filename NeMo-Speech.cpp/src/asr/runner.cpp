@@ -790,15 +790,35 @@ OfflineRunner::finalize() {
         decoder->set_request_options(opts_);
         const auto decode_begin = std::chrono::steady_clock::now();
         int64_t total_frames = 0;
+        const bool force_host_enc = [] {
+            const char* v = std::getenv("NEMO_SPEECH_OFFLINE_HOST_ENC");
+            return v != nullptr && *v != 0 && !(*v == '0' && v[1] == 0);
+        }();
+        const bool use_device_enc =
+            !force_host_enc &&
+            !std::getenv("NEMO_SPEECH_DEBUG_ENC") &&
+            transducer->head_kind() == HeadKind::Rnnt &&
+            transducer->backend_manager().get_params().use_gpu;
         for (size_t i = 0; i < segments.size(); ++i) {
             const auto [off, len] = segments[i];
             const int64_t frame_offset = seg_frame_offset(off);
             const bool has_next = (i + 1 < segments.size());
-            std::vector<float> enc;
             int T = 0;
-            transducer->infer_offline(audio_.data() + off, len, enc, T, prompt_index_);
-            auto seg_tokens =
-                decoder->step(enc.data(), transducer->rnnt_config().joint_dim, T, frame_offset);
+            std::vector<int> seg_tokens;
+            if (use_device_enc) {
+                RnntModel::OfflineDeviceEnc dev_enc;
+                transducer->infer_offline_device(
+                    audio_.data() + off, len, dev_enc, T, prompt_index_);
+                if (T > 0) {
+                    seg_tokens = decoder->step_device(
+                        dev_enc.tensor, transducer->rnnt_config().joint_dim, T, frame_offset);
+                }
+            } else {
+                std::vector<float> enc;
+                transducer->infer_offline(audio_.data() + off, len, enc, T, prompt_index_);
+                seg_tokens =
+                    decoder->step(enc.data(), transducer->rnnt_config().joint_dim, T, frame_offset);
+            }
             note_real_frames(off, len, frame_offset, has_next);
             total_frames += T;
             tokens.insert(tokens.end(), seg_tokens.begin(), seg_tokens.end());
@@ -861,6 +881,14 @@ CacheStreamRunner::CacheStreamRunner(
     // Session are owned by the model; the runner just drives them.
     const int left_ctx = enc_cfg_.cache_left_ctx;
     attn_mask_.assign(left_ctx + enc_cfg_.cache_chunk_frames, 0.0f);
+
+    if (const char* dbg = std::getenv("NEMO_SPEECH_DEBUG_RNNT"); dbg && *dbg && *dbg != '0') {
+        std::fprintf(
+            stderr,
+            "[rnnt] CacheStreamRunner geometry: right_ctx=%d chunk_enc=%d left_ctx=%d"
+            " (1 enc frame = 80 ms)\n",
+            enc_cfg_.cache_right_ctx, enc_cfg_.cache_chunk_frames, left_ctx);
+    }
 
     head_ = model->make_transducer_decoder(cfg.decoder);
 

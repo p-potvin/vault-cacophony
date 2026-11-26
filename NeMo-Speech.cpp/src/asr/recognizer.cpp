@@ -789,11 +789,14 @@ Recognizer::recognize(
     const bool supports_streaming =
         model_->head_kind() == HeadKind::Ctc ||
         static_cast<RnntModel*>(model_.get())->supports_cache_streaming();
-    // Vulkan RNNT support was originally validated on the cache-aware graph.
-    // Keep that compatibility route until the offline graph has Vulkan parity
-    // coverage; CTC and offline-only TDT remain offline.
+    // OfflineRunner already splits audio past max_offline_samples_() (default
+    // 90 s, always within pos_emb_max_len) at quiet boundaries, so CUDA RNNT
+    // stays on OfflineRunner for arbitrary-length files instead of dropping to
+    // chunk-by-chunk CacheStreamRunner. Keep Vulkan RNNT and long CTC on their
+    // existing streaming routes.
     const bool use_streaming =
-        (exceeds_offline_limit || (vulkan && model_->head_kind() != HeadKind::Ctc)) &&
+        ((exceeds_offline_limit && model_->head_kind() == HeadKind::Ctc) ||
+         (vulkan && model_->head_kind() != HeadKind::Ctc)) &&
         supports_streaming;
     std::unique_ptr<AsrRunner> runner;
     if (use_streaming) {

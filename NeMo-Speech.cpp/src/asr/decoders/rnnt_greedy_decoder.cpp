@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -129,6 +130,7 @@ RnntGreedyDecoder::reset() {
     late_punctuation_open_ = false;
     late_punctuation_pending_.clear();
     late_punctuation_.clear();
+    blank_run_ = 0;
     bias_node_ = ContextBiasingTree::kRoot;
 }
 
@@ -203,6 +205,51 @@ RnntGreedyDecoder::present_token(int token, int64_t frame) {
     return true;
 }
 
+static bool
+rnnt_trace_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NEMO_SPEECH_DEBUG_RNNT");
+        return v != nullptr && *v != 0 && !(*v == '0' && v[1] == 0);
+    }();
+    return on;
+}
+
+static int
+rnnt_blank_shadow_threshold() {
+    static const int n = [] {
+        const char* v = std::getenv("NEMO_SPEECH_DEBUG_BLANK_SHADOW");
+        if (v == nullptr || *v == 0 || (*v == '0' && v[1] == 0))
+            return 0;
+        const int parsed = std::atoi(v);
+        return parsed > 0 ? parsed : 3;
+    }();
+    return n;
+}
+
+static int
+rnnt_max_blank_run() {
+    static const int n = [] {
+        const char* v = std::getenv("NEMO_SPEECH_RNNT_MAX_BLANK");
+        if (v == nullptr || *v == 0)
+            return 0;
+        const int parsed = std::atoi(v);
+        return parsed > 0 ? parsed : 0;
+    }();
+    return n;
+}
+
+static int
+rnnt_lookahead_frames() {
+    static const int n = [] {
+        const char* v = std::getenv("NEMO_SPEECH_RNNT_LOOKAHEAD");
+        if (v == nullptr || *v == 0)
+            return 16;  // default speculative window; 0 = uncapped
+        const int parsed = std::atoi(v);
+        return parsed > 0 ? parsed : 0;
+    }();
+    return n;
+}
+
 std::vector<int>
 RnntGreedyDecoder::step(const float* enc_out, int d_model, int T, int64_t frame_offset) {
     return step_impl(enc_out, nullptr, d_model, T, frame_offset);
@@ -233,6 +280,15 @@ RnntGreedyDecoder::step_impl(
         return emitted;
     DecodeStepScope decode_scope(engine_);
     stats_.encoder_frames += static_cast<uint64_t>(T);
+    const auto& vocab = engine_->vocab();
+    if (rnnt_trace_enabled()) {
+        std::fprintf(
+            stderr,
+            "[rnnt] CHUNK enter frame_offset=%lld T=%d frames (%.0f ms) blank_id=%d"
+            " max_symbols_per_step=%d prev_token=%d boosting=%s\n",
+            static_cast<long long>(frame_offset), T, T * 80.0, blank_id, max_sym,
+            prev_token_, bias_on_ ? "on" : "off");
+    }
 
     // With a fixed predictor output, joint evaluations for all remaining
     // encoder frames are independent. Evaluate them in one graph and consume
@@ -244,6 +300,8 @@ RnntGreedyDecoder::step_impl(
     int symbols_at_frame = 0;
     while (t < T) {
         const int remaining = T - t;
+        const int lookahead = rnnt_lookahead_frames();
+        const int scan = (lookahead > 0) ? std::min(remaining, lookahead) : remaining;
         const float* boost_bias = nullptr;
         if (bias_on_) {
             // NeMo/riva semantics (rnnt_label_looping.py): blank vs non-blank is
@@ -267,11 +325,11 @@ RnntGreedyDecoder::step_impl(
         bool joint_complete = false;
         if (!predictor_valid_ && device_enc_out != nullptr && boost_bias == nullptr) {
             engine_->predict_and_joint_rnnt_argmax_device(
-                *stream_state_, prev_token_, active_bank_, *device_enc_out, t, d_model, remaining,
+                *stream_state_, prev_token_, active_bank_, *device_enc_out, t, d_model, scan,
                 token_ids_.data());
             ++stats_.predictor_calls;
             ++stats_.joint_calls;
-            stats_.joint_frames += static_cast<uint64_t>(remaining);
+            stats_.joint_frames += static_cast<uint64_t>(scan);
             predictor_valid_ = true;
             joint_complete = true;
         } else if (!predictor_valid_) {
@@ -285,52 +343,169 @@ RnntGreedyDecoder::step_impl(
         if (!joint_complete) {
             if (device_enc_out != nullptr) {
                 engine_->joint_argmax_device(
-                    *stream_state_, *device_enc_out, t, d_model, remaining, token_ids_.data());
+                    *stream_state_, *device_enc_out, t, d_model, scan, token_ids_.data());
             } else {
                 engine_->joint_argmax(
-                    *stream_state_, enc_out + static_cast<size_t>(t) * d_model, d_model, remaining,
+                    *stream_state_, enc_out + static_cast<size_t>(t) * d_model, d_model, scan,
                     token_ids_.data());
             }
             ++stats_.joint_calls;
-            stats_.joint_frames += static_cast<uint64_t>(remaining);
+            stats_.joint_frames += static_cast<uint64_t>(scan);
         }
         if (boost_bias != nullptr) {
-            boost_token_ids_.resize(static_cast<size_t>(remaining));
+            boost_token_ids_.resize(static_cast<size_t>(scan));
             if (device_enc_out != nullptr) {
                 engine_->joint_argmax_device(
-                    *stream_state_, *device_enc_out, t, d_model, remaining, boost_token_ids_.data(),
+                    *stream_state_, *device_enc_out, t, d_model, scan, boost_token_ids_.data(),
                     boost_bias);
             } else {
                 engine_->joint_argmax(
-                    *stream_state_, enc_out + static_cast<size_t>(t) * d_model, d_model, remaining,
+                    *stream_state_, enc_out + static_cast<size_t>(t) * d_model, d_model, scan,
                     boost_token_ids_.data(), boost_bias);
             }
             ++stats_.joint_calls;
-            stats_.joint_frames += static_cast<uint64_t>(remaining);
-            for (int i = 0; i < remaining; ++i) {
+            stats_.joint_frames += static_cast<uint64_t>(scan);
+            for (int i = 0; i < scan; ++i) {
                 if (token_ids_[static_cast<size_t>(i)] != blank_id)
                     token_ids_[static_cast<size_t>(i)] = boost_token_ids_[static_cast<size_t>(i)];
             }
         }
 
         int first_emit = -1;
-        for (int i = 0; i < remaining; ++i) {
+        for (int i = 0; i < scan; ++i) {
             if (token_ids_[static_cast<size_t>(i)] != blank_id) {
                 first_emit = i;
                 break;
             }
         }
+        const int blanks_here = (first_emit < 0) ? scan : first_emit;
+        const int shadow_thresh = rnnt_blank_shadow_threshold();
+        if (shadow_thresh > 0 && blanks_here >= shadow_thresh) {
+            const char* prev_piece = "?";
+            if (prev_token_ >= 0 && prev_token_ < static_cast<int>(vocab.size()))
+                prev_piece = vocab[static_cast<size_t>(prev_token_)].c_str();
+            std::fprintf(
+                stderr,
+                "[rnnt]   ~~ SHADOW: %d blank frames from t=%d, predictor FROZEN on"
+                " token=%d %s (every frame below is scored against that one state)\n",
+                blanks_here, t, prev_token_, prev_piece);
+            forced_scratch_.assign(static_cast<size_t>(cfg.vocab_size), 0.0f);
+            forced_scratch_[static_cast<size_t>(blank_id)] = -1e30f;
+            forced_ids_.resize(static_cast<size_t>(blanks_here));
+            if (device_enc_out != nullptr) {
+                engine_->joint_argmax_device(
+                    *stream_state_, *device_enc_out, t, d_model, blanks_here,
+                    forced_ids_.data(), forced_scratch_.data());
+            } else {
+                engine_->joint_argmax(
+                    *stream_state_, enc_out + static_cast<size_t>(t) * d_model, d_model,
+                    blanks_here, forced_ids_.data(), forced_scratch_.data());
+            }
+            ++stats_.joint_calls;
+            stats_.joint_frames += static_cast<uint64_t>(blanks_here);
+            std::string line;
+            for (int i = 0; i < blanks_here; ++i) {
+                const int sid = forced_ids_[static_cast<size_t>(i)];
+                const char* piece = "?";
+                if (sid >= 0 && sid < static_cast<int>(vocab.size()))
+                    piece = vocab[static_cast<size_t>(sid)].c_str();
+                char buf[128];
+                std::snprintf(
+                    buf, sizeof(buf), "%s%d:%s", line.empty() ? "" : "  ", t + i, piece);
+                line += buf;
+                if ((i + 1) % 8 == 0 || i + 1 == blanks_here) {
+                    std::fprintf(stderr, "[rnnt]      %s\n", line.c_str());
+                    line.clear();
+                }
+            }
+        }
+
+        const int max_blank = rnnt_max_blank_run();
+        if (max_blank > 0 && blanks_here > 0 && blank_run_ + blanks_here >= max_blank) {
+            const int k = std::max(0, max_blank - blank_run_);
+            if (k < blanks_here) {
+                forced_scratch_.assign(static_cast<size_t>(cfg.vocab_size), 0.0f);
+                forced_scratch_[static_cast<size_t>(blank_id)] = -1e30f;
+                const int forced_remaining = scan - k;
+                forced_ids_.resize(static_cast<size_t>(forced_remaining));
+                if (device_enc_out != nullptr) {
+                    engine_->joint_argmax_device(
+                        *stream_state_, *device_enc_out, t + k, d_model, forced_remaining,
+                        forced_ids_.data(), forced_scratch_.data());
+                } else {
+                    engine_->joint_argmax(
+                        *stream_state_, enc_out + static_cast<size_t>(t + k) * d_model, d_model,
+                        forced_remaining, forced_ids_.data(), forced_scratch_.data());
+                }
+                ++stats_.joint_calls;
+                stats_.joint_frames += static_cast<uint64_t>(forced_remaining);
+                const int forced = forced_ids_[0];
+                if (forced != blank_id) {
+                    if (rnnt_trace_enabled()) {
+                        const char* piece = "";
+                        if (forced >= 0 && forced < static_cast<int>(vocab.size()))
+                            piece = vocab[static_cast<size_t>(forced)].c_str();
+                        std::fprintf(
+                            stderr,
+                            "[rnnt]   !! BLANK CAP: %d consecutive blank frames"
+                            " (NEMO_SPEECH_RNNT_MAX_BLANK=%d, run would have been %d)."
+                            " Forcing best non-blank token=%d %s at t=%d to unfreeze"
+                            " the predictor.\n",
+                            blank_run_ + k, max_blank, blank_run_ + blanks_here, forced, piece,
+                            t + k);
+                    }
+                    t += k;
+                    symbols_at_frame = 0;
+                    blank_run_ = 0;
+                    ++stats_.emitted_tokens;
+                    last_emit_frame_ = frame_offset + t;
+                    if (present_token(forced, frame_offset + t))
+                        emitted.push_back(forced);
+                    prev_token_ = forced;
+                    active_bank_ ^= 1;
+                    predictor_valid_ = false;
+                    if (bias_on_)
+                        bias_node_ = bias_tree_.advance(bias_node_, forced);
+                    continue;
+                }
+            }
+        }
         if (first_emit < 0) {
-            // Every remaining frame is blank under this predictor state.
-            break;
+            t += scan;
+            symbols_at_frame = 0;
+            blank_run_ += scan;
+            if (t >= T) {
+                if (rnnt_trace_enabled()) {
+                    std::fprintf(
+                        stderr,
+                        "[rnnt] CHUNK exit  frame_offset=%lld: remaining=%d frames all BLANK"
+                        " (emitted=%zu total_tokens=%llu)\n",
+                        static_cast<long long>(frame_offset), scan, emitted.size(),
+                        static_cast<unsigned long long>(stats_.emitted_tokens));
+                }
+                break;
+            }
+            continue;
         }
 
         // A blank advances the encoder clock and ends any symbol run at the
         // previous frame. The first non-blank is handled at its own frame.
         if (first_emit > 0)
             symbols_at_frame = 0;
+        blank_run_ = 0;
         t += first_emit;
         const int token = token_ids_[static_cast<size_t>(first_emit)];
+
+        if (rnnt_trace_enabled()) {
+            const char* piece = "";
+            if (token >= 0 && token < static_cast<int>(vocab.size()))
+                piece = vocab[static_cast<size_t>(token)].c_str();
+            std::fprintf(
+                stderr,
+                "[rnnt]   t=%2d/%d EMIT token=%-6d %-14s (blank_run=%d before it,"
+                " symbols_at_frame=%d/%d)\n",
+                t, T, token, piece, first_emit, symbols_at_frame, max_sym);
+        }
 
         ++stats_.emitted_tokens;
         last_emit_frame_ = frame_offset + t;
@@ -349,6 +524,13 @@ RnntGreedyDecoder::step_impl(
             bias_node_ = bias_tree_.advance(bias_node_, token);
 
         if (++symbols_at_frame >= max_sym) {
+            if (rnnt_trace_enabled()) {
+                std::fprintf(
+                    stderr,
+                    "[rnnt]   !! SYMBOL CAP: %d symbols emitted on frame t=%d"
+                    " (max_symbols_per_step=%d). Force-advancing to t=%d.\n",
+                    symbols_at_frame, t, max_sym, t + 1);
+            }
             ++t;
             symbols_at_frame = 0;
         }
