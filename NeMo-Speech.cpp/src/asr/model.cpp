@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <future>
 #include <map>
@@ -201,6 +203,13 @@ class RnntModel::OfflineEncoderRoot : public ggml_runtime::Module {
 
 class RnntModel::OfflineEncoderBatcher {
    public:
+    struct Key {
+        int frames = 0;
+        bool device_output = false;
+        bool operator==(const Key& o) const {
+            return frames == o.frames && device_output == o.device_output;
+        }
+    };
     struct Request {
         std::vector<float> features;
         int prompt_index = -1;
@@ -208,11 +217,13 @@ class RnntModel::OfflineEncoderBatcher {
     struct Result {
         std::vector<float> enc;
         std::vector<float> s2s;
+        RnntModel::OfflineDeviceEnc device_enc;
         int T = 0;
     };
 
     OfflineEncoderBatcher(RnntModel* model, const BatchingConfig& cfg)
-        : model_(model), queue_(cfg, [this](const int& frames, std::vector<Request>&& requests) {
+        : model_(model), queue_(cfg, [this](const Key& key, std::vector<Request>&& requests) {
+              const int frames = key.frames;
               const int B = static_cast<int>(requests.size());
               const int F = model_->enc_cfg_.feat_in;
               const int J = model_->rnnt_cfg_.joint_dim;
@@ -244,6 +255,64 @@ class RnntModel::OfflineEncoderBatcher {
                   }
                   inputs.push_back(
                       {"encoder.offline.prompt", GGML_TYPE_F32, prompts.data(), {P, Tout, B}});
+              }
+
+              ggml_backend_t gpu = model_->backend_manager().gpu_backend_handle();
+              const bool device_only = key.device_output && S == 0 &&
+                                       model_->offline_encoder_session_->params.use_gpu &&
+                                       gpu != nullptr;
+              if (device_only) {
+                  for (auto& input : inputs) input.synchronous_upload = true;
+                  ggml_runtime::DeviceTensor batch_dev;
+                  std::vector<ggml_runtime::Session::Output> outputs = {{0, "", nullptr, 0}};
+                  outputs[0].device_tensor = &batch_dev;
+
+                  std::lock_guard<std::mutex> dev_lock(device_out_mu_);
+                  model_->offline_encoder_session_->run(inputs, outputs);
+                  const int out_j = static_cast<int>(outputs[0].out_shape[0]);
+                  const int out_t = static_cast<int>(outputs[0].out_shape[1]);
+                  const int out_b = static_cast<int>(outputs[0].out_shape[2]);
+                  if (out_j != J || out_b != B || !batch_dev.valid())
+                      throw std::runtime_error(
+                          "offline transducer device graph lost its batch dimension");
+                  const size_t item_bytes = static_cast<size_t>(J) * out_t * sizeof(float);
+                  std::vector<Result> results(static_cast<size_t>(B));
+                  for (int b = 0; b < B; ++b) {
+                      ggml_runtime::TensorContainer::ArenaSizes sizes;
+                      sizes.temp_ctx_bytes = 64 * 1024;
+                      sizes.default_buft_bytes = 64 * 1024;
+                      auto tc = std::make_unique<ggml_runtime::TensorContainer>(
+                          model_->backend_manager().get_buft_list(), sizes);
+                      auto dst = tc->create_tensor_2d("offline.enc", GGML_TYPE_F32, J, out_t);
+                      tc->free_temp_ctx();
+                      tc->allocate_tensors_on_backend_buffers();
+                      const size_t src_off = static_cast<size_t>(b) * item_bytes;
+                      if (src_off + item_bytes > ggml_nbytes(batch_dev.tensor) ||
+                          item_bytes > ggml_nbytes(dst.tensor)) {
+                          throw std::runtime_error(
+                              "offline encoder: device copy outside tensor bounds");
+                      }
+                      if (item_bytes > 0) {
+                          ggml_tensor from = {}, to = {};
+                          from.type = to.type = GGML_TYPE_I8;
+                          from.ne[0] = to.ne[0] = static_cast<int64_t>(item_bytes);
+                          from.ne[1] = from.ne[2] = from.ne[3] = 1;
+                          to.ne[1] = to.ne[2] = to.ne[3] = 1;
+                          from.nb[0] = to.nb[0] = 1;
+                          from.nb[1] = from.nb[2] = from.nb[3] = item_bytes;
+                          to.nb[1] = to.nb[2] = to.nb[3] = item_bytes;
+                          from.buffer = batch_dev.tensor->buffer;
+                          from.data = static_cast<char*>(batch_dev.tensor->data) +
+                                      batch_dev.byte_offset + src_off;
+                          to.buffer = dst.tensor->buffer;
+                          to.data = dst.tensor->data;
+                          ggml_backend_tensor_copy_async(gpu, gpu, &from, &to);
+                      }
+                      results[b].T = out_t;
+                      results[b].device_enc.storage = std::move(tc);
+                      results[b].device_enc.tensor = ggml_runtime::DeviceTensor{dst.tensor, dst.buft, 0};
+                  }
+                  return results;
               }
 
               std::vector<float> output(static_cast<size_t>(J) * Tout * B);
@@ -278,18 +347,19 @@ class RnntModel::OfflineEncoderBatcher {
               return results;
           }) {}
 
-    Result run(const float* features, int frames, int prompt_index) {
+    Result run(const float* features, int frames, int prompt_index, bool device_output = false) {
         Request request;
         request.features.assign(
             features, features + static_cast<size_t>(model_->enc_cfg_.feat_in) * frames);
         request.prompt_index = prompt_index;
-        return queue_.run(frames, std::move(request));
+        return queue_.run({frames, device_output}, std::move(request));
     }
     BatchMetrics metrics() const { return queue_.metrics(); }
 
    private:
     RnntModel* model_;
-    MicroBatcher<int, Request, Result> queue_;
+    std::mutex device_out_mu_;
+    MicroBatcher<Key, Request, Result> queue_;
 };
 
 // One decoder weight-owning root with two independently cached graph stages:
@@ -863,12 +933,11 @@ class RnntModel::DecoderBatchers {
         int vocab_size) {
         const ggml_nvtx::range nvtx("asr.joint.device");
         const int J = owner_->rnnt_cfg_.joint_dim;
-        ggml_runtime::DeviceTensor enc_slice = enc;
-        enc_slice.byte_offset += static_cast<size_t>(frame_offset) * J * sizeof(float);
-
         ggml_runtime::Session::Input enc_input{"rnnt.joint.enc", GGML_TYPE_F32, nullptr, {J, T}};
         enc_input.upload = false;
-        enc_input.device_tensor = &enc_slice;
+        enc_input.gather = {
+            {&enc, static_cast<size_t>(frame_offset) * J * sizeof(float), 0,
+             static_cast<size_t>(T) * J * sizeof(float)}};
         int32_t slot_id = slot;
         std::vector<ggml_runtime::Session::Input> inputs;
         inputs.push_back(enc_input);
@@ -900,11 +969,11 @@ class RnntModel::DecoderBatchers {
         if (reset)
             owner_->zero_decoder_slot(slot);
         const int J = owner_->rnnt_cfg_.joint_dim;
-        ggml_runtime::DeviceTensor enc_slice = enc;
-        enc_slice.byte_offset += static_cast<size_t>(frame_offset) * J * sizeof(float);
         ggml_runtime::Session::Input enc_input{"rnnt.joint.enc", GGML_TYPE_F32, nullptr, {J, T}};
         enc_input.upload = false;
-        enc_input.device_tensor = &enc_slice;
+        enc_input.gather = {
+            {&enc, static_cast<size_t>(frame_offset) * J * sizeof(float), 0,
+             static_cast<size_t>(T) * J * sizeof(float)}};
         int32_t slot_id = slot;
         std::vector<ggml_runtime::Session::Input> inputs = {
             {"rnnt.predict_joint_rnnt." + std::to_string(bank), GGML_TYPE_I32, &token, {1}},
@@ -1767,6 +1836,10 @@ RnntModel::ensure_offline_path() {
         if (offline_cfg.offline_right_ctx < 0)
             offline_cfg.offline_right_ctx = offline_cfg.cache_right_ctx;
     }
+    if (const char* e = std::getenv("NEMO_SPEECH_OFFLINE_LEFT_CTX"))
+        offline_cfg.offline_left_ctx = std::atoi(e);
+    if (const char* e = std::getenv("NEMO_SPEECH_OFFLINE_RIGHT_CTX"))
+        offline_cfg.offline_right_ctx = std::atoi(e);
     offline_encoder_ = std::make_unique<FastConformerEncoder>("encoder", offline_cfg);
     offline_encoder_root_ = std::make_unique<OfflineEncoderRoot>(
         offline_encoder_.get(), rnnt_encoder_tail_.get(), s2s_projection_.get());
@@ -1813,6 +1886,74 @@ RnntModel::infer_offline_from_mel(
     ensure_offline_path();
     auto result = offline_encoder_batcher_->run(feats, n_frames, prompt_index);
     enc_out = std::move(result.enc);
+    T_enc = result.T;
+    if (std::getenv("NEMO_SPEECH_DEBUG_ENC") && T_enc > 0) {
+        const int D = rnnt_cfg_.joint_dim;
+        std::fprintf(
+            stderr, "[enc ] OFFLINE OUT: T_enc=%d D=%d (mel_frames=%d)\n", T_enc, D, n_frames);
+        for (int t = 0; t < T_enc; ++t) {
+            const float* v = enc_out.data() + static_cast<size_t>(t) * D;
+            double sum = 0.0, sq = 0.0, dot = 0.0, prev_sq = 0.0;
+            float mn = v[0], mx = v[0];
+            const float* vp = (t > 0) ? (v - D) : nullptr;
+            for (int d = 0; d < D; ++d) {
+                const float x = v[d];
+                sum += x;
+                sq += static_cast<double>(x) * x;
+                if (x < mn) mn = x;
+                if (x > mx) mx = x;
+                if (vp) {
+                    dot += static_cast<double>(x) * vp[d];
+                    prev_sq += static_cast<double>(vp[d]) * vp[d];
+                }
+            }
+            const double l2 = std::sqrt(sq);
+            const double cos_prev = (vp && sq > 0.0 && prev_sq > 0.0)
+                                        ? dot / (std::sqrt(sq) * std::sqrt(prev_sq))
+                                        : 0.0;
+            std::fprintf(
+                stderr, "[enc ] frame=%4d  l2=%.3f  mean=%+.4f  [%.3f, %.3f]  cos_prev=%.3f\n",
+                t, l2, sum / D, mn, mx, cos_prev);
+        }
+    }
+}
+
+void
+RnntModel::infer_offline_device(
+    const float* audio, size_t n_samples, OfflineDeviceEnc& enc_out, int& T_enc,
+    int prompt_index) {
+    ensure_offline_path();
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<float> features;
+    int frames = 0;
+    offline_fe_->compute(audio, n_samples, features, frames);
+    const auto t1 = std::chrono::steady_clock::now();
+    infer_offline_device_from_mel(features.data(), frames, enc_out, T_enc, prompt_index);
+    if (std::getenv("NEMO_SPEECH_TIMING")) {
+        const auto t2 = std::chrono::steady_clock::now();
+        const auto elapsed_ms = [](auto a, auto b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        std::fprintf(
+            stderr,
+            "[timing] offline-transducer-device frames=%d enc_frames=%d fe=%.2f "
+            "encoder+encproj=%.2f ms\n",
+            frames, T_enc, elapsed_ms(t0, t1), elapsed_ms(t1, t2));
+    }
+}
+
+void
+RnntModel::infer_offline_device_from_mel(
+    const float* feats, int n_frames, OfflineDeviceEnc& enc_out, int& T_enc, int prompt_index) {
+    if (n_frames <= 0) {
+        enc_out = OfflineDeviceEnc{};
+        T_enc = 0;
+        return;
+    }
+    ensure_offline_path();
+    auto result = offline_encoder_batcher_->run(
+        feats, n_frames, prompt_index, /*device_output=*/true);
+    enc_out = std::move(result.device_enc);
     T_enc = result.T;
 }
 

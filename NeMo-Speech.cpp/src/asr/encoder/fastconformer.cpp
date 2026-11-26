@@ -10,6 +10,8 @@ using namespace nemo_speech::asr;
 
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "runtime.h"
@@ -1322,6 +1324,50 @@ FastConformerEncoder::build_graph_from_embeddings(
             const int L = (cfg_.offline_left_ctx < 0) ? T : cfg_.offline_left_ctx;
             const int R = (cfg_.offline_right_ctx < 0) ? T : cfg_.offline_right_ctx;
             auto bf_ctx = session_tensor_container->get_ctx_of_buffer_type(x.buft);
+
+            if (std::getenv("NEMO_SPEECH_DEBUG_ENC")) {
+                const bool chunked = cfg_.chunked_limited_attention && R >= 0;
+                std::fprintf(
+                    stderr, "[enc ] OFFLINE MASK: T=%d L=%d R=%d style=%s\n", T, L, R,
+                    chunked ? "chunked_limited" : "regular");
+                if (chunked) {
+                    const int chunk = R + 1;
+                    const int left_chunks = L / chunk;
+                    std::fprintf(
+                        stderr,
+                        "[enc ]   chunk=%d frames, left_chunks = L/chunk = %d/%d = %d"
+                        " (remainder %d frames dropped by integer division)\n"
+                        "[enc ]   max reach = (left_chunks+1)*chunk = %d keys\n",
+                        chunk, L, chunk, left_chunks, L % chunk, (left_chunks + 1) * chunk);
+                } else {
+                    std::fprintf(
+                        stderr, "[enc ]   band = [q-%d, q+%d] = %d keys\n", L, R, L + R + 1);
+                }
+                std::fprintf(
+                    stderr, "[enc ] %6s  %-13s %8s %7s\n", "q", "visible_keys", "n_keys",
+                    "lookahead");
+                for (int q = 0; q < T; ++q) {
+                    int lo = T, hi = -1, n = 0;
+                    for (int k = 0; k < T; ++k) {
+                        bool vis = false;
+                        if (chunked) {
+                            const int d = (q / (R + 1)) - (k / (R + 1));
+                            vis = (d >= 0 && d <= L / (R + 1));
+                        } else {
+                            const int d = k - q;
+                            vis = (d >= -L && d <= R);
+                        }
+                        if (vis) {
+                            lo = std::min(lo, k);
+                            hi = std::max(hi, k);
+                            ++n;
+                        }
+                    }
+                    std::fprintf(
+                        stderr, "[enc ] %6d  [%4d..%4d] %8d %7d%s\n", q, lo, hi, n,
+                        (hi > q) ? (hi - q) : 0, (n == 0) ? "   <-- SEES NOTHING" : "");
+                }
+            }
 
             // pos = arange(T): (T,) f32.
             ggml_tensor* pos = ggml_arange(bf_ctx.ctx, 0.0f, static_cast<float>(T), 1.0f);

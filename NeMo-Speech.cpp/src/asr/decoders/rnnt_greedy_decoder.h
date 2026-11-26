@@ -225,6 +225,9 @@ class RnntGreedyDecoder : public Decoder {
     // RNNT context biasing (word boosting), built per request from
     // speech_contexts. bias_node_ is the per-stream Aho-Corasick match state.
     ContextBiasingTree bias_tree_;
+    int blank_run_ = 0;
+    std::vector<float> forced_scratch_;
+    std::vector<int32_t> forced_ids_;
     int bias_node_ = ContextBiasingTree::kRoot;
     bool bias_on_ = false;
     // --boosting-tree-alpha: an extra global multiplier (default 1.0, i.e. no

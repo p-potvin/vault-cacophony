@@ -223,11 +223,22 @@ class RnntModel final : public AsrModel, public RnntEngine {
 
     // Full-utterance frontend + non-cache-aware encoder + joint encoder
     // projection. Compatible requests batch as [feature,time,batch].
+    struct OfflineDeviceEnc {
+        std::unique_ptr<ggml_runtime::TensorContainer> storage;
+        ggml_runtime::DeviceTensor tensor;
+        bool valid() const { return tensor.valid(); }
+    };
     void infer_offline(
         const float* audio, size_t n_samples, std::vector<float>& enc_out, int& T_enc,
         int prompt_index = -1);
     void infer_offline_from_mel(
         const float* feats, int n_frames, std::vector<float>& enc_out, int& T_enc,
+        int prompt_index = -1);
+    void infer_offline_device(
+        const float* audio, size_t n_samples, OfflineDeviceEnc& enc_out, int& T_enc,
+        int prompt_index = -1);
+    void infer_offline_device_from_mel(
+        const float* feats, int n_frames, OfflineDeviceEnc& enc_out, int& T_enc,
         int prompt_index = -1);
     // S2S models carry an additional encoder projection (`proj.*`) alongside
     // the RNNT joint encoder projection. Run both tails from one shared,
